@@ -4,6 +4,12 @@ ACTIVATED -> CREDENTIALED  mint parent token, publish sealed credentials
 READY     -> REVOKED       kill upload access, wipe the mailbox
 REVOKED   -> SUBMITTED     verify the frozen prefix, hand off a model submission
           -> FAILED        miner-fault verification failure (uploaded bytes retained)
+SUBMITTED + submission_id NULL   retry available: resubmit_terminal parks a TERMINAL_INVALID
+                                 attempt here without minting anything. This marker and FAILED
+                                 both accept the miner's next r2activate (intake), which claims
+                                 attempt n+1 and re-enters ACTIVATED. A hotkey whose validation
+                                 strikes are spent is never parked: it keeps submission_id (so
+                                 intake refuses its activate) and status.json says it is blocked.
 
 The linear state machine is the revoke-before-verify gate: verification only
 ever runs on rows whose parent token was successfully deleted.
@@ -17,7 +23,8 @@ never disturbs an earlier upload.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Collection, Mapping
 
@@ -28,12 +35,13 @@ from botocore.config import Config
 from loguru import logger as log
 from nacl.signing import SigningKey
 
-from albedo_config import get_chain_reader_settings
+from albedo_config import get_chain_reader_settings, get_model_validation_settings
 from chain_reader import db as chain_db
 from chain_reader.chain import Commit, _payload_hash
+from model_validation import db as mv_db
 from model_validation.validate.genesis_files import GENESIS_SHA256
 from private_store.cloudflare import CloudflareR2TokenGateway
-from private_store.contracts import mailbox_object_key, model_prefix
+from private_store.contracts import mailbox_object_key, mailbox_status_key, model_prefix
 from private_store.crypto import MailboxCipher
 from private_store.digests import ArtifactIntegrityError
 from private_store.r2_credentials import create_local_temporary_credentials
@@ -48,6 +56,7 @@ class Deps:
     mailbox: MailboxStore
     uploads: R2UploadController
     cipher: MailboxCipher
+    status_cache: dict[str, str] = field(default_factory=dict)  # rid -> last status published
 
 
 def build_deps(settings: PrivateStoreSettings) -> Deps:
@@ -83,7 +92,80 @@ def _prefix_of(row: Mapping[str, Any]) -> str:
     return row["model_prefix"] or model_prefix(row["registration_id"])
 
 
-async def _credential(conn: asyncpg.Connection, row: asyncpg.Record, deps: Deps) -> None:
+def _max_strikes() -> int:
+    return get_model_validation_settings().PREEVAL_MAX_FAILS
+
+
+async def _publish_status(
+    deps: Deps,
+    pool: asyncpg.Pool,
+    row: Mapping[str, Any],
+    *,
+    step: str,
+    reason: str = "",
+    deadline: datetime | None = None,
+    retryable: bool = False,
+    blocked: str = "",
+) -> None:
+    """Publish the plaintext status the miner's CLI reads while it polls the mailbox.
+
+    Two budgets, named apart because miners conflate them: upload attempts (this private
+    registration's activations, `max_attempts`) and validation strikes (pre-eval miner faults
+    over ALL the hotkey's submissions, public or private, `PREEVAL_MAX_FAILS`). A retry is
+    offered only while both remain. Carries no secrets — everything here except the counts is
+    already on the public dashboard. Never raises: a mailbox hiccup must not fail a credential
+    mint or a verification, so a failure is logged and swallowed. An unchanged status is not
+    re-put, so a blocked row reselected by every sweep does not churn the file.
+    """
+    rid = row["registration_id"]
+    try:
+        used, maximum = row["attempt_count"], deps.settings.max_attempts
+        left = max(0, maximum - used)
+        strikes = await mv_db.hotkey_preeval_fail_count(pool, row["hotkey"])
+        max_strikes = _max_strikes()
+        strikes_left = max(0, max_strikes - strikes)
+        if not blocked and strikes_left == 0:
+            blocked = "hotkey_preeval_blocked"
+        if not retryable:
+            nxt = ""  # nothing for them to do; an in-flight upload is not an exhausted hotkey
+        elif blocked:
+            nxt = f"hotkey is blocked from further validation ({blocked}) — no retry"
+        elif left:
+            nxt = f"run `albedo activate` to use upload attempt {used + 1} of {maximum}"
+        else:
+            nxt = "no upload attempts left for this hotkey"
+        body = {
+            "protocol_version": 1,
+            "registration_id": rid,
+            "upload_attempt": used,
+            "max_upload_attempts": maximum,
+            "upload_attempts_left": left,
+            "validation_strikes": strikes,
+            "max_validation_strikes": max_strikes,
+            "validation_strikes_left": strikes_left,
+            "blocked": blocked,
+            "step": step,
+            "reason": reason,
+            "deadline": deadline.isoformat() if deadline else None,
+            "next": nxt,
+        }
+        fingerprint = json.dumps(body, sort_keys=True)
+        if deps.status_cache.get(rid) == fingerprint:
+            return
+        body["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await asyncio.to_thread(
+            deps.mailbox.put_status,
+            mailbox_status_key(rid),
+            json.dumps(body, separators=(",", ":")).encode(),
+        )
+        deps.status_cache[rid] = fingerprint
+    except Exception as exc:
+        log.warning("[access-controller] status publish failed for {}: {}", rid, exc)
+
+
+async def _credential(
+    conn: asyncpg.Connection, row: asyncpg.Record, deps: Deps, pool: asyncpg.Pool
+) -> None:
     settings = deps.settings
     rid = row["registration_id"]
     prefix = model_prefix(rid, row["attempt_count"])
@@ -131,9 +213,18 @@ async def _credential(conn: asyncpg.Connection, row: asyncpg.Record, deps: Deps)
         prefix,
     )
     log.info("[access-controller] credentials published for {}", rid)
+    await _publish_status(
+        deps,
+        pool,
+        row,
+        step="credentials issued — upload now, then commit ready",
+        deadline=datetime.now(timezone.utc) + timedelta(seconds=settings.upload_window_seconds),
+    )
 
 
-async def _revoke(conn: asyncpg.Connection, row: asyncpg.Record, deps: Deps) -> None:
+async def _revoke(
+    conn: asyncpg.Connection, row: asyncpg.Record, deps: Deps, pool: asyncpg.Pool
+) -> None:
     rid = row["registration_id"]
     if row["parent_token_id"]:
         await asyncio.to_thread(deps.gateway.revoke_parent_token, row["parent_token_id"])
@@ -143,6 +234,7 @@ async def _revoke(conn: asyncpg.Connection, row: asyncpg.Record, deps: Deps) -> 
         row["id"],
     )
     log.info("[access-controller] upload access revoked for {}", rid)
+    await _publish_status(deps, pool, row, step="upload frozen — verifying your manifest")
 
 
 async def _verify(
@@ -172,11 +264,15 @@ async def _verify(
             str(exc),
         )
         log.warning("[access-controller] verification FAILED for {}: {}", rid, exc)
+        await _publish_status(
+            deps, pool, row, step="failed verification", reason=str(exc), retryable=True
+        )
         return
     digest = verified.manifest.model_digest
     payload = {
         "version": "r2",
         "registration_id": rid,
+        "attempt": row["attempt_count"],
         "digest": f"sha256:{digest}",
         "manifest_sha256": row["manifest_sha256"],
         "model_name": verified.manifest.model_name,
@@ -218,6 +314,7 @@ async def _verify(
         submission_id,
         commit.model_uri,
     )
+    await _publish_status(deps, pool, row, step="verified — queued for validation and evaluation")
 
 
 async def _close_upload_window(
@@ -244,6 +341,9 @@ async def _close_upload_window(
     log.warning(
         "[access-controller] upload window closed for {} — {}", row["registration_id"], reason
     )
+    await _publish_status(
+        deps, pool, row, step="failed — upload window closed", reason=reason, retryable=True
+    )
 
 
 async def sweep_credentialed(pool: asyncpg.Pool, deps: Deps) -> int:
@@ -255,7 +355,7 @@ async def sweep_credentialed(pool: asyncpg.Pool, deps: Deps) -> int:
     """
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, registration_id, parent_token_id, attempt_count, model_prefix,"
+            "SELECT id, registration_id, hotkey, parent_token_id, attempt_count, model_prefix,"
             " EXTRACT(EPOCH FROM (now() - updated_at)) AS age_s"
             " FROM private_registrations WHERE state = 'CREDENTIALED'"
         )
@@ -291,6 +391,7 @@ async def _protected_prefixes(pool: asyncpg.Pool) -> set[str]:
             FROM private_registrations pr
             LEFT JOIN model_submissions ms ON ms.id = pr.submission_id
             WHERE pr.state <> 'FAILED'
+              AND NOT (pr.state = 'SUBMITTED' AND pr.submission_id IS NULL)
               AND COALESCE(ms.state, '') <> ALL($1::text[])
             """,
             list(_REAPABLE_SUBMISSION_STATES),
@@ -349,21 +450,21 @@ async def _sanity_blocked(pool: asyncpg.Pool, hotkey: str) -> bool:
 
 
 async def _reset_for_retry(pool: asyncpg.Pool, deps: Deps, row: asyncpg.Record) -> None:
-    """Grant another attempt. The previous attempt's bytes are kept.
+    """Mark the registration as retry-available. The previous attempt's bytes are kept.
 
-    Bumping attempt_count moves the next upload to its own prefix, so nothing from
-    this attempt can be mistaken for part of the next one.
+    The row stays SUBMITTED with submission_id cleared, which `tick` ignores — so no
+    credentials are minted and no upload window opens until the miner commits r2activate
+    themselves. Clearing submission_id also makes this idempotent: resubmit_terminal joins
+    on it, so a marked row can never be selected again.
     """
     rid = row["registration_id"]
     async with pool.acquire() as conn:
         await conn.execute(
             """
             UPDATE private_registrations
-            SET state = 'ACTIVATED',
-                activation_block = GREATEST(
+            SET activation_block = GREATEST(
                     activation_block,
                     COALESCE((SELECT max(block_number) FROM chain_commits), activation_block)),
-                attempt_count = attempt_count + 1,
                 parent_token_id = NULL, credential_expires_at = NULL, model_prefix = NULL,
                 ready_block = NULL, ready_block_hash = NULL, manifest_sha256 = NULL,
                 model_digest = NULL, submission_id = NULL, fault_message = NULL,
@@ -373,9 +474,18 @@ async def _reset_for_retry(pool: asyncpg.Pool, deps: Deps, row: asyncpg.Record) 
             row["id"],
         )
     log.info(
-        "[access-controller] retry granted for {} — starting attempt {}",
+        "[access-controller] retry available for {} — {} of {} attempts used",
         rid,
-        row["attempt_count"] + 1,
+        row["attempt_count"],
+        deps.settings.max_attempts,
+    )
+    await _publish_status(
+        deps,
+        pool,
+        row,
+        step="last attempt did not pass validation",
+        reason=row["fault_code"] or "",
+        retryable=True,
     )
 
 
@@ -403,10 +513,25 @@ async def resubmit_terminal(pool: asyncpg.Pool, deps: Deps) -> int:
         )
     reset = 0
     for row in rows:
+        blocked = ""
         if row["fault_code"] in _BLOCKED_FAULT_CODES:
-            continue  # hotkey already blocked — a retry would just fail again
-        if await _sanity_blocked(pool, row["hotkey"]):
-            continue  # prompt-injection / low-vocab strike
+            blocked = row["fault_code"]  # hotkey already blocked — a retry would just fail again
+        elif await _sanity_blocked(pool, row["hotkey"]):
+            blocked = "hotkey_sanity_blocked"  # prompt-injection / low-vocab strike
+        elif await mv_db.hotkey_preeval_fail_count(pool, row["hotkey"]) >= _max_strikes():
+            blocked = "hotkey_preeval_blocked"  # strikes spent, possibly on public submissions
+        if blocked:
+            # not parked: the row keeps its submission_id, so intake refuses the miner's activate
+            await _publish_status(
+                deps,
+                pool,
+                row,
+                step="last attempt did not pass validation",
+                reason=row["fault_code"] or "",
+                retryable=True,
+                blocked=blocked,
+            )
+            continue
         await _reset_for_retry(pool, deps, row)
         reset += 1
     return reset
@@ -428,9 +553,9 @@ async def tick(pool: asyncpg.Pool, deps: Deps) -> bool:
                 return False
             try:
                 if row["state"] == "ACTIVATED":
-                    await _credential(conn, row, deps)
+                    await _credential(conn, row, deps, pool)
                 elif row["state"] == "READY":
-                    await _revoke(conn, row, deps)
+                    await _revoke(conn, row, deps, pool)
                 else:
                     await _verify(conn, row, deps, pool)
             except Exception as exc:

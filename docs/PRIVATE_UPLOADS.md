@@ -96,25 +96,52 @@ albedo upload-private --path ./my-model --name my-model-v1   # fetch creds, uplo
 albedo ready --manifest-sha256 <hash>             # commit r2ready (hash printed by upload-private)
 ```
 
-- `activate` is idempotent: re-running reuses the existing `submission-key` (it does **not**
-  generate a new one), so it's safe to retry.
+- `activate` reuses the existing `submission-key` (it does **not** generate a new one), so
+  it is safe to re-run. Note it **claims an upload attempt** when your previous one has come back
+  — the confirm prompt shows your current status before you agree.
 - `upload-private` polls the mailbox for up to ~15 minutes, then uploads. If it fails
   partway (network drop), just run it again — it re-uploads the files and writes
   `manifest.json` last.
 - `ready` needs the `manifest_sha256` that `upload-private` prints on success.
 
+## Knowing what happened
+
+The validator publishes a plaintext status for your registration next to the sealed
+credentials, in the same public mailbox:
+
+```
+<R2_MAILBOX_PUBLIC_BASE_URL>/mailbox/v1/<registration_id>/status.json
+```
+
+It carries no secrets — just your two budgets (upload attempts used and left; validation
+strikes used and left, see below), what the validator is doing or what went wrong, and the
+next command to run. The CLI reads it for you: while
+`upload-private` waits for credentials it prints one line whenever the status changes, and
+the confirm prompt before `r2activate` shows it so you can see what the commit will cost.
+Evaluation results are on [albedo.tech](https://albedo.tech) as usual.
+
 ## Constraints and failure modes
 
 - **24-hour window.** You must finish uploading and commit `r2ready` within 24h of
-  `activate`, or the submission is abandoned (credentials revoked, folder wiped) and you
-  start over.
-- **One submission per hotkey** (same as the public flow).
+  `activate`, or that attempt is abandoned (credentials revoked). Your uploaded bytes are
+  kept until the capacity reaper needs the room, and if you have upload attempts left you can
+  start another by running `albedo activate` again.
+- **Three upload attempts per hotkey.** The first is the one you start yourself. If a submission
+  comes back invalid, the attempt is returned to you — nothing is consumed until *you*
+  commit `r2activate` again. Once a model passes validation and gets evaluated, the hotkey
+  is finished whether it wins or loses.
+- **Three validation strikes per hotkey.** A separate budget: every model of yours that pre-eval
+  rejects as a miner fault — public or private submission alike — is one strike, and at three the
+  hotkey is banned from validation. No further upload attempt will be evaluated, and `status.json`
+  says so instead of offering a retry. Verification failures and expired windows cost an upload
+  attempt but no strike.
 - **Upload caps.** Total upload ≤ 100 GB and ≤ 4096 objects; exceeding either during the
   window abandons the submission. A normal checkpoint is far under both.
 - **Verification (after `ready`)** rejects the submission if the uploaded files don't match
   your committed manifest, if a genesis/contract file was altered, if there are undeclared
   or missing files, or if the model fails the standard Qwen3.6-35B-A3B checks in
-  [MINING.md](MINING.md). Fix locally and submit from a fresh hotkey.
+  [MINING.md](MINING.md). Fix it locally and run `albedo activate` again — a verification
+  failure does not consume the hotkey while upload attempts remain.
 - Your bytes stay private throughout. They are only copied to public HuggingFace if the
   model wins and becomes king; losing submissions are never exposed.
 
@@ -126,5 +153,7 @@ Validate the model locally before spending a submission:
 albedo check-model --path ./my-model
 ```
 
-This runs the same file-manifest and architecture checks the validator will, without
-uploading or committing anything.
+This runs every check the validator will except dedup, without uploading or committing
+anything. `submit-private` and `upload-private` run it for you before they touch the
+network, so this is only for checking a model ahead of time; pass `--skip-check` to
+publish without it.

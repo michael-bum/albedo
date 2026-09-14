@@ -1,6 +1,6 @@
 # Subnet constants for the SN97 (Albedo) config validator.
-# Mirrors the relevant pieces of albedo/chain.toml so the seed digest, arch-lock
-# keys, and the strict file allowlist live in one place.
+# Mirrors the relevant pieces of albedo/chain.toml so the seed digest and the strict
+# file allowlist live in one place.
 
 [chain]
 name         = "Albedo"
@@ -8,27 +8,9 @@ seed_repo    = "teutonic/qwen3.6-35b-a3b-genesis"
 # Challengers must be named albedo-qwen3.6-35b-<suffix> under any Hippius namespace.
 repo_pattern = "^[^/]+/albedo-qwen3\\.6-35b-.+$"
 
-[arch]
-# Qwen3.6-35B-A3B identity + capacity keys. A challenger's config.json must match the
-# genesis seed on `architectures` plus every key below.
-extra_lock_keys = [
-  "max_position_embeddings",
-  "tie_word_embeddings",
-  "rope_theta",
-  "hidden_size",
-  "num_hidden_layers",
-  "num_attention_heads",
-  "num_key_value_heads",
-  "intermediate_size",
-  "head_dim",
-  "moe_intermediate_size",
-  "shared_expert_intermediate_size",
-  "num_experts",
-  "num_experts_per_tok",
-]
-
 [seed]
-# Genesis Qwen3.6-35B-A3B reference; arch check compares challengers against this.
+# Genesis Qwen3.6-35B-A3B reference. Downloaded as the dedup bank root, and as the
+# source of the processor files the sanity workers inject.
 seed_digest = "sha256:efd5b8d0a1c1f472be56ff919419cdd0561bdecd9013d5c2a96dd0e23e89c165"
 
 [files]

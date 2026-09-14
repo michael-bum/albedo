@@ -14,7 +14,6 @@ with open(_TOML_PATH, "rb") as _fh:
     _T = tomllib.load(_fh)
 
 _c = _T.get("chain", {})
-_a = _T.get("arch", {})
 _s = _T.get("seed", {})
 _f = _T.get("files", {})
 
@@ -24,10 +23,6 @@ REPO_PATTERN: str = _c.get("repo_pattern", "")
 
 NETWORK: str = os.environ.get("CV_NETWORK", "finney")
 NETUID: int = int(os.environ.get("CV_NETUID", "97"))
-
-COMPAT_KEYS: tuple[str, ...] = ("vocab_size", "model_type")
-EXTRA_LOCK_KEYS: tuple[str, ...] = tuple(_a.get("extra_lock_keys", []))
-ALL_LOCK_KEYS: tuple[str, ...] = COMPAT_KEYS + EXTRA_LOCK_KEYS
 
 SEED_DIGEST: str = _s.get("seed_digest", "")
 if SEED_DIGEST and not SEED_DIGEST.startswith("sha256:"):

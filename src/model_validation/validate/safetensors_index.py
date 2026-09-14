@@ -15,7 +15,7 @@ def _shard_tensor_keys(path: Path) -> set[str]:
     return {k for k in header if k != "__metadata__"}
 
 
-def check(model_dir: str, files: list[str]) -> tuple[bool, str]:
+def check(model_dir: str) -> tuple[bool, str]:
     mdir = Path(model_dir)
     actual = {p.name for p in mdir.glob("*.safetensors")}
     index_path = mdir / INDEX_NAME

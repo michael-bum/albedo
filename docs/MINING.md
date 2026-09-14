@@ -14,9 +14,10 @@ Albedo is a **king-of-the-hill** subnet for **Qwen3.6-35B-A3B** language models.
 
 Validators detect the backend from the pin's format, download the model from the hub you
 used, run
-the **same validation checks you can run locally** (file manifest + architecture lock +
-near-duplicate dedup), and finally **evaluate** the model. A model that beats the current
-king earns weight/emissions. So your job is: produce a model that (a) passes validation and
+the **same validation checks you can run locally** — every one of them except the
+near-duplicate dedup, which needs the validator's fingerprint bank — and finally **evaluate**
+the model. A model that beats the current king earns weight/emissions. So your job is:
+produce a model that (a) passes validation and
 (b) scores higher than the incumbent by at least the **2.5% win margin**, in **two separate evals**.
 
 Evaluation is a multiturn duel: 100 sampled coding-trajectory prefixes drawn from four real-agent
@@ -79,15 +80,18 @@ The CLI builds this for you from `--namespace` + `--name`.
   `configuration.json`, `special_tokens_map.json`, `added_tokens.json` — delete them from the
   repo before committing (`tokenizer.json` already carries the tokenizer).
 
-**Architecture lock** (`[arch]` / `[seed]` in [chain.toml](../chain.toml)) — your `config.json`
-must match the genesis Qwen3.6-35B-A3B seed exactly on:
+**Architecture lock** — enforced by the byte-for-byte `config.json` hash below, not by a
+separate check: since your `config.json` must be the genesis file exactly, every architecture
+key is locked with it. In practice that means you cannot change:
 
-- `architectures` and `model_type`, `vocab_size`
+- `architectures`, `model_type`, `vocab_size`
 - capacity keys: `max_position_embeddings`, `tie_word_embeddings`, `rope_theta`, `hidden_size`,
   `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`, `intermediate_size`, `head_dim`
 - MoE keys: `moe_intermediate_size`, `shared_expert_intermediate_size`, `num_experts`,
   `num_experts_per_tok`
-- It must **not** contain `auto_map` (no remote code) or `quantization_config` (no quantized models).
+
+and you cannot add `auto_map` (no remote code) or `quantization_config` (no quantized models).
+A rejection here reports `metadata_hash`.
 
 **Metadata hash pinning** — every metadata file you ship must be **byte-for-byte identical** to
 the genesis repo (`dendriteholdings/albedo-qwen3.6-35b-king-genesis`). Validators compare sha256
@@ -101,8 +105,9 @@ changed byte (even whitespace or a re-serialized JSON) is a rejection. The only 
 differ is `model.safetensors.index.json` (re-sharding is legitimate; it's validated structurally
 instead).
 
-> ⚠️ The local CLI (`check-model --path`) does **not** run these hash checks — verify yourself
-> before uploading: `sha256sum` your metadata files against the genesis repo's copies.
+> `check-model --path` runs these hash checks locally, against hashes pinned in the CLI — no
+> genesis download needed. Keep your checkout current: if genesis ever rotates, a stale clone
+> checks against stale hashes.
 
 **Weight format** — every safetensors shard must be 16-bit (F16/BF16); quantized / F32 / F64
 weights are rejected (`weight_dtype`, checked header-only before the full download). A sharded
@@ -211,8 +216,11 @@ All commands default `--netuid 97` and `--network finney`, and read wallet/names
 albedo check-model --path /path/to/model
 ```
 
-Runs the file-manifest + architecture checks on a local directory — the same code validators run.
-Prints `[PASS]/[FAIL]` per check and `VALID`/`INVALID`. Note: dedup is **not** checked here.
+Runs all five checks on a local directory, using the same code validators run, in the same
+order, keyed by the same fault codes: `file_manifest`, `weight_dtype`, `chat_template_hash`,
+`metadata_hash`, `safetensors_index`. Prints `[PASS]/[FAIL]` per check and `VALID`/`INVALID`.
+Needs no network and no credentials. Only dedup is **not** checked here — it needs the
+validator's fingerprint bank.
 
 ### Validate an already-uploaded repo
 
@@ -276,6 +284,7 @@ Useful to confirm your own commit landed, or to see what others have submitted.
 albedo publish --path /path/to/model --name v1 --coldkey mine --hotkey hk1
 albedo publish --path ... --name v1 --yes            # no prompt
 albedo publish --path ... --name v1 --skip-commit    # stop after upload + checks
+albedo publish --path ... --name v1 --skip-check     # upload without validating first
 ```
 
 Runs all five steps and stops at the first failure. The pipeline is the recommended path for a
@@ -321,8 +330,11 @@ CHAIN_NETWORK=test albedo check-commit
 
 ## Notes & gotchas
 
-- **Validate before you upload.** `check-model --path` is free and catches the file-manifest and
-  architecture problems that would otherwise waste an upload + commit.
+- **The check runs automatically.** `upload`, `publish`, `submit-private` and `upload-private` all
+  validate the local model first and abort before uploading anything if it fails. Pass
+  `--skip-check` to publish anyway. Skipping only skips *your* copy of the checks — the validator
+  re-runs all of them, and a failure there costs one of three validation strikes (counted per hotkey
+  over all your submissions, separately from private upload attempts) before the hotkey is banned.
 - **The pin is immutable.** Each upload returns a pin — a `sha256:` content digest on Hippius, a
   git commit SHA on HF — and the commit binds to it, so re-uploading changed weights produces a
   new pin you must re-commit.

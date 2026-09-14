@@ -112,6 +112,16 @@ def parse_ready_signal(payload: str) -> str:
     return match.group("manifest_sha256")
 
 
+def mailbox_status_key(registration_id: str) -> str:
+    """Return the public mailbox key carrying this registration's plaintext status.
+
+    Deliberately outside CANONICAL mailbox key shape, so MailboxStore.delete refuses it and
+    revoke/window-close can never wipe the record the miner reads.
+    """
+    _require_hash(registration_id, "registration_id")
+    return f"mailbox/v1/{registration_id}/status.json"
+
+
 def mailbox_object_key(registration_id: str, generation: int) -> str:
     """Return the immutable public mailbox key for one credential generation."""
     _require_hash(registration_id, "registration_id")

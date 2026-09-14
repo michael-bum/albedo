@@ -351,8 +351,10 @@ class FakeS3:
         metadata = {"sha256": sha256 or hashlib.sha256(data).hexdigest()}
         self.objects[(bucket, key)] = (data, metadata)
 
-    def put_object(self, Bucket: str, Key: str, Body: bytes, Metadata: dict, **_: object):
-        self.objects[(Bucket, Key)] = (Body, dict(Metadata))
+    def put_object(
+        self, Bucket: str, Key: str, Body: bytes, Metadata: dict | None = None, **_: object
+    ):
+        self.objects[(Bucket, Key)] = (Body, dict(Metadata or {}))
         return {}
 
     def get_object(self, Bucket: str, Key: str):

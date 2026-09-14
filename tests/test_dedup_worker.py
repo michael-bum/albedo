@@ -21,10 +21,9 @@ def _patch_pipeline(monkeypatch, tmp_path):
     monkeypatch.setattr(worker, "download_config", lambda ref: str(tmp_path))
     monkeypatch.setattr(worker, "check_chat_template", lambda d, f: (True, ""))
     monkeypatch.setattr(worker, "check_genesis", lambda d, f: (True, ""))
-    monkeypatch.setattr(worker, "check_architecture", lambda d: (True, ""))
     monkeypatch.setattr(worker, "make_room", lambda ref, protected_repos=(): None)
     monkeypatch.setattr(worker, "download_full", lambda ref: str(tmp_path))
-    monkeypatch.setattr(worker, "check_index", lambda d, f: (True, ""))
+    monkeypatch.setattr(worker, "check_index", lambda d: (True, ""))
 
 
 def _run(monkeypatch, tmp_path, result, enforce, reasons="COPY,OWN-COPY"):

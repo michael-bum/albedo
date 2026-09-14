@@ -19,6 +19,12 @@ def _wallet_arg(parser, name: str, default, help_: str) -> None:
     parser.add_argument(f"--{name}", default=default, required=default is None, help=help_)
 
 
+def _skip_check_arg(parser) -> None:
+    parser.add_argument(
+        "--skip-check", action="store_true", help="publish without validating the model first"
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="albedo", description="Albedo miner: upload → validate → commit."
@@ -32,9 +38,10 @@ def _build_parser() -> argparse.ArgumentParser:
     up.add_argument("--namespace", default=_NAMESPACE)
     up.add_argument("--name", help="suffix appended after albedo-qwen3.6-35b-")
     up.add_argument("--repo", help="full repo override (ns/albedo-qwen3.6-35b-…)")
+    _skip_check_arg(up)
 
     ch = sub.add_parser(
-        "check-model", help="validate a model/repo (file manifest + architecture, no dedup)"
+        "check-model", help="validate a model/repo (every validator check except dedup)"
     )
     ch.add_argument("--path", help="local model directory")
     ch.add_argument("--repo")
@@ -75,6 +82,7 @@ def _build_parser() -> argparse.ArgumentParser:
     pub.add_argument("--network", default=_NETWORK)
     pub.add_argument("--yes", action="store_true")
     pub.add_argument("--skip-commit", action="store_true", help="stop after upload + checks")
+    _skip_check_arg(pub)
 
     sp = sub.add_parser(
         "submit-private", help="private R2 submit: activate → upload → ready (end to end)"
@@ -86,6 +94,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--netuid", type=int, default=_NETUID)
     sp.add_argument("--network", default=_NETWORK)
     sp.add_argument("--yes", action="store_true")
+    _skip_check_arg(sp)
 
     for name, help_ in (
         ("activate", "commit r2activate to request upload credentials"),
@@ -100,6 +109,7 @@ def _build_parser() -> argparse.ArgumentParser:
         if name == "upload-private":
             step.add_argument("--path", required=True)
             step.add_argument("--name", required=True)
+            _skip_check_arg(step)
 
     rd = sub.add_parser("ready", help="commit r2ready to freeze the upload and start verification")
     _wallet_arg(rd, "coldkey", _COLDKEY, "wallet (coldkey) name")
@@ -146,8 +156,10 @@ def _run(args, parser) -> int:
         return 0
 
     if args.cmd == "upload":
-        from miner import commit, upload
+        from miner import commit, upload, validate
 
+        if not validate.require_valid(args.path, skip=args.skip_check):
+            return 1
         repo = args.repo or upload.make_repo(args.namespace, args.name)
         ref = upload.upload_model(args.path, repo)
         print(ref.immutable_ref)
@@ -209,12 +221,17 @@ def _run(args, parser) -> int:
             log=print,
             assume_yes=args.yes,
             skip_commit=args.skip_commit,
+            skip_check=args.skip_check,
         )
         return 0 if ok else 1
 
     if args.cmd == "submit-private":
-        from miner import private_store
+        from miner import private_store, validate
 
+        if not validate.require_valid(
+            args.path, files=private_store.upload_paths(args.path), skip=args.skip_check
+        ):
+            return 1
         private_store.submit_private(
             coldkey=args.coldkey,
             hotkey=args.hotkey,
@@ -238,9 +255,13 @@ def _run(args, parser) -> int:
         return 0
 
     if args.cmd == "upload-private":
-        from miner import private_store
+        from miner import private_store, validate
         from miner.commit import build_wallet
 
+        if not validate.require_valid(
+            args.path, files=private_store.upload_paths(args.path), skip=args.skip_check
+        ):
+            return 1
         wallet = build_wallet(args.coldkey, args.hotkey)
         key = private_store.submission_key(wallet.hotkey.ss58_address)
         rid = private_store.registration_id(

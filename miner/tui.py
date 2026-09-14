@@ -19,7 +19,8 @@ _GLYPH = {
 _HELP = (
     "check-model (--path | --repo --digest) · upload --path --namespace --name · "
     "register --coldkey --hotkey · commit --repo --digest --coldkey --hotkey · "
-    "check-commit [--hotkey] · publish --path --namespace --name --coldkey --hotkey · help · off"
+    "check-commit [--hotkey] · publish --path --namespace --name --coldkey --hotkey · "
+    "upload/publish take --skip-check · help · off"
 )
 
 
@@ -112,6 +113,8 @@ def _dispatch(cmd, opts, state, log, confirm, refresh, netuid, network):
             log(f"  {k}: {'PASS' if v['ok'] else 'FAIL — ' + v['reason']}")
         log("VALID" if ok else "INVALID")
     elif cmd == "upload":
+        if not validate.require_valid(opts["path"], skip=bool(opts.get("skip-check")), log=log):
+            return
         repo = opts.get("repo") or upload.make_repo(opts["namespace"], opts["name"])
         ref = upload.upload_model(opts["path"], repo)
         log(f"uploaded {ref.immutable_ref}")
@@ -166,6 +169,7 @@ def _dispatch(cmd, opts, state, log, confirm, refresh, netuid, network):
             on_step=on_step,
             log=log,
             confirm=confirm,
+            skip_check=bool(opts.get("skip-check")),
         )
         log("PUBLISHED" if ok else "stopped")
     else:

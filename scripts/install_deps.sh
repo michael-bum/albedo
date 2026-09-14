@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install model_validation's extra runtime deps into the target venv:
 #   - opensearch-py (the dedup index client)
-#   - config_validation (editable; shared fingerprint/architecture/hippius logic)
+#   - config_validation (editable; shared model-ref + HF/Hippius/S3 storage logic)
 # The venv already provides bittensor, asyncpg, loguru, numpy, boto3, hippius_hub.
 set -euo pipefail
 

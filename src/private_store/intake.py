@@ -78,8 +78,9 @@ async def _apply_activate(pool: asyncpg.Pool, signal: PrivateSignal) -> int:
                 activation_block = $3, credential_expires_at = NULL, model_prefix = NULL,
                 updated_at = now()
             WHERE registration_id = $1
-              AND state IN ('ACTIVATED', 'CREDENTIALED')
-              AND submission_pubkey <> $2
+              AND ( (state IN ('ACTIVATED', 'CREDENTIALED') AND submission_pubkey <> $2)
+                    OR (state = 'SUBMITTED' AND submission_id IS NULL)
+                    OR state = 'FAILED' )
               AND $3 > activation_block
               AND attempt_count < $4
             RETURNING attempt_count

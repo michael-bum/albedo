@@ -6,7 +6,6 @@ from config_validation.models.ref import (
     cache_repo,
     detect_backend,
 )
-from config_validation.models.reveal import decode_raw, parse_reveal
 
 __all__ = [
     "ModelRef",
@@ -15,6 +14,4 @@ __all__ = [
     "BACKEND_HF",
     "BACKEND_HIPPIUS",
     "BACKEND_S3",
-    "decode_raw",
-    "parse_reveal",
 ]

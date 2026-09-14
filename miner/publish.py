@@ -37,19 +37,24 @@ def run(
     confirm=None,
     assume_yes: bool = False,
     skip_commit: bool = False,
+    skip_check: bool = False,
 ):
     on_step = on_step or (lambda *a: None)
     log = log or (lambda m: None)
     logger.info(f"publish pipeline: {namespace}/{name} on netuid {netuid} ({network})")
 
     logger.info("step 1/5 — validate local model")
-    on_step("validate_local", "running", "")
-    ok, res = validate.validate_local(path)
-    for k, v in res.items():
-        log(f"{k}: {'OK' if v['ok'] else v['reason']}")
-    on_step("validate_local", "ok" if ok else "fail", _why(res))
-    if not ok:
-        return False, None
+    if skip_check:
+        log("model check skipped (--skip-check)")
+        on_step("validate_local", "ok", "skipped")
+    else:
+        on_step("validate_local", "running", "")
+        ok, res = validate.validate_local(path)
+        for k, v in res.items():
+            log(f"{k}: {'OK' if v['ok'] else v['reason']}")
+        on_step("validate_local", "ok" if ok else "fail", _why(res))
+        if not ok:
+            return False, None
 
     logger.info("step 2/5 — upload model")
     repo = upload.make_repo(namespace, name)

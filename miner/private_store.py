@@ -28,6 +28,7 @@ from private_store.contracts import (
     ManifestFile,
     activation_signal_payload,
     mailbox_object_key,
+    mailbox_status_key,
     model_digest_from_inventory,
     ready_signal_payload,
     registration_id,
@@ -66,11 +67,58 @@ def submission_key(hotkey_ss58: str):
     return SigningKey(seed)
 
 
+def _fetch_status(registration_id: str) -> dict | None:
+    """Read the validator's plaintext status for this registration, or None if absent.
+
+    Same public bucket as the sealed credentials, so no extra config: the key is derived
+    from public chain data. Never raises — this is diagnostics, not control flow.
+    """
+    if not MAILBOX_BASE_URL:
+        return None
+    url = f"{MAILBOX_BASE_URL}/{mailbox_status_key(registration_id)}?t={int(time.time())}"
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "albedo-miner/1.0"})
+        with urllib.request.urlopen(request, timeout=10) as resp:
+            status = json.loads(resp.read())
+        return status if isinstance(status, dict) else None
+    except Exception:
+        return None
+
+
+def _status_line(status: dict) -> str:
+    """Everything the miner needs on one line: both budgets, then what happened, then what to do."""
+    parts = [
+        f"upload attempt {status.get('upload_attempt')}/{status.get('max_upload_attempts')}",
+        "validation strikes "
+        f"{status.get('validation_strikes')}/{status.get('max_validation_strikes')}",
+    ]
+    for key in ("step", "reason"):
+        if status.get(key):
+            parts.append(str(status[key]))
+    if status.get("deadline"):
+        parts.append(f"window closes {status['deadline']}")
+    else:
+        parts.append(f"{status.get('upload_attempts_left')} upload attempt(s) left")
+    if status.get("next"):
+        parts.append(f"next: {status['next']}")
+    return " · ".join(parts)
+
+
 def _reveal_commit(wallet, netuid: int, network: str, payload: str, *, assume_yes: bool) -> None:
     import bittensor as bt
 
     if not assume_yes:
         print(f"about to commit on netuid {netuid} ({network}): {payload}")
+        if payload.startswith("r2activate:"):
+            status = _fetch_status(
+                registration_id(
+                    netuid=netuid,
+                    hotkey=wallet.hotkey.ss58_address,
+                    chain_generation=CHAIN_GENERATION,
+                )
+            )
+            if status is not None:
+                print(f"  current status: {_status_line(status)}")
         if input("Proceed? [y/N] ").strip().lower() not in ("y", "yes"):
             raise SystemExit("aborted — nothing committed")
     st = bt.Subtensor(network=network)
@@ -99,6 +147,7 @@ def fetch_credentials(
     key = mailbox_object_key(registration_id, 1)
     deadline = time.time() + timeout_s
     attempt = 0
+    last_line: str | None = None
     logger.info("waiting for the validator to publish upload credentials…")
     while True:
         try:
@@ -123,18 +172,32 @@ def fetch_credentials(
         except SystemExit:
             raise
         except Exception:
+            status = _fetch_status(registration_id)
+            if status is not None:
+                line = _status_line(status)
+                if line != last_line:
+                    logger.info(line)
+                    last_line = line
             if time.time() > deadline:
-                raise SystemExit("timed out waiting for credentials; is activate finalized?")
+                raise SystemExit(
+                    "timed out waiting for credentials — "
+                    + (last_line or "the validator has not published a status for this hotkey yet")
+                )
             time.sleep(10)
             attempt += 1
 
 
-def plan_upload(local_dir: str) -> list[tuple[str, int, str, Path]]:
-    """Inventory a model dir as (relpath, size, sha256, absolute path)."""
+def upload_paths(local_dir: str) -> list[str]:
+    """Every relpath this uploader will send, in manifest order.
+
+    Dot-prefixed paths, __pycache__ and the manifest are excluded here and nowhere
+    else, so validation must be given this list rather than the raw directory —
+    otherwise it judges a file set that never reaches the bucket.
+    """
     root = Path(local_dir).resolve()
     if not root.is_dir():
         raise SystemExit(f"model path is not a directory: {local_dir}")
-    plan: list[tuple[str, int, str, Path]] = []
+    paths: list[str] = []
     skipped = 0
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
         relpath = path.relative_to(root)
@@ -144,15 +207,25 @@ def plan_upload(local_dir: str) -> list[tuple[str, int, str, Path]]:
         rel = relpath.as_posix()
         if rel == "manifest.json":
             continue
+        paths.append(rel)
+    if skipped:
+        logger.info("skipped {} hidden/junk file(s) not part of the model", skipped)
+    if not paths:
+        raise SystemExit("model directory has no files to upload")
+    return paths
+
+
+def plan_upload(local_dir: str) -> list[tuple[str, int, str, Path]]:
+    """Inventory a model dir as (relpath, size, sha256, absolute path)."""
+    root = Path(local_dir).resolve()
+    plan: list[tuple[str, int, str, Path]] = []
+    for rel in upload_paths(local_dir):
+        path = root / rel
         digest = hashlib.sha256()
         with path.open("rb") as handle:
             while chunk := handle.read(8 * 1024 * 1024):
                 digest.update(chunk)
         plan.append((rel, path.stat().st_size, digest.hexdigest(), path))
-    if skipped:
-        logger.info("skipped {} hidden/junk file(s) not part of the model", skipped)
-    if not plan:
-        raise SystemExit("model directory has no files to upload")
     return plan
 
 

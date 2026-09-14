@@ -421,9 +421,6 @@ def get_chain_reader_settings() -> ChainReaderSettings:
 
 
 _MV_DEFAULT_CACHE_DIR = str(Path.home() / ".cache" / "albedo_models")
-_MV_ARCH_SPEC_PATH = str(
-    Path(__file__).resolve().parents[1] / "model_validation" / "validate" / "architecture_spec.json"
-)
 
 
 class ModelValidationSettings(BaseSettings):
@@ -445,9 +442,6 @@ class ModelValidationSettings(BaseSettings):
     S3_ENDPOINT: str = "https://s3.hippius.com"
     S3_ACCESS_KEY: str = ""
     S3_SECRET_KEY: str = ""
-    ARCH_SPEC_PATH: str = Field(
-        _MV_ARCH_SPEC_PATH, validation_alias=AliasChoices("ALBEDO_ARCH_SPEC")
-    )
     DEDUP_SECRET: str = ""
     DEDUP_SECRET_FILE: str = ""
     DEDUP_REF_DIR: str = ""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -23,6 +24,7 @@ from private_store.cloudflare import ParentToken
 from private_store.contracts import (
     activation_signal_payload,
     mailbox_object_key,
+    mailbox_status_key,
     model_prefix,
     ready_signal_payload,
     registration_id,
@@ -70,6 +72,9 @@ class FakeConn:
         self.submission_id = None
         self.sanity_blocked = False
         self.protected: list[dict] = []  # rows the reaper's guard query returns
+        self.queries: list[str] = []  # every SQL the code under test issued
+        self.executed: list[str] = []  # every UPDATE the code under test issued
+        self.strikes = 0  # hotkey_preeval_fail_count over the hotkey's submissions
 
     def transaction(self):
         return _Ctx(self)
@@ -100,11 +105,22 @@ class FakeConn:
             return 1
         if "attempt_count = attempt_count + 1" in sql and "submission_pubkey = $2" in sql:  # re-key
             row = self.registration
+            live_rekey = (
+                (
+                    row["state"] in ("ACTIVATED", "CREDENTIALED")
+                    and row["submission_pubkey"] != args[1]
+                )
+                if row
+                else False
+            )
+            retry_marked = bool(row) and (
+                (row["state"] == "SUBMITTED" and row["submission_id"] is None)
+                or row["state"] == "FAILED"
+            )
             if not (
                 row
-                and row["state"] in ("ACTIVATED", "CREDENTIALED")
-                and row["submission_pubkey"] != args[1]
-                and args[2] > row["activation_block"]  # only a newer activate re-keys
+                and (live_rekey or retry_marked)
+                and args[2] > row["activation_block"]  # only a newer activate applies
                 and row["attempt_count"] < args[3]
             ):
                 return None
@@ -139,6 +155,8 @@ class FakeConn:
             return None
         if "SELECT submission_id FROM chain_commits" in sql:
             return self.submission_id
+        if "fault_class = 'MINER_FAULT'" in sql:  # hotkey_preeval_fail_count
+            return self.strikes
         raise AssertionError(f"unexpected fetchval: {sql}")
 
     async def fetchrow(self, sql, *args):
@@ -149,6 +167,7 @@ class FakeConn:
         return None
 
     async def fetch(self, sql, *args):
+        self.queries.append(sql)
         if "LEFT JOIN model_submissions" in sql:  # _protected_prefixes query
             return self.protected
         if "TERMINAL_INVALID" in sql:  # resubmit_terminal query
@@ -168,6 +187,7 @@ class FakeConn:
         return [{**row, "age_s": self.age_s}]
 
     async def execute(self, sql, *args):
+        self.executed.append(sql)
         if "SET state = 'CREDENTIALED'" in sql:
             self.registration.update(
                 state="CREDENTIALED", parent_token_id=args[1], model_prefix=args[3]
@@ -178,14 +198,13 @@ class FakeConn:
             self.registration.update(state="FAILED", fault_message=args[1])
         elif "SET state = 'SUBMITTED'" in sql:
             self.registration.update(state="SUBMITTED", model_digest=args[1], submission_id=args[2])
-        elif "SET state = 'ACTIVATED'" in sql:
+        elif "SET activation_block = GREATEST" in sql:  # _reset_for_retry: mark retry-available
             self.registration.update(
                 model_prefix=None,
-                state="ACTIVATED",
-                attempt_count=self.registration["attempt_count"] + 1,
                 submission_id=None,
                 ready_block=None,
                 manifest_sha256=None,
+                fault_message=None,
             )
         elif "SET updated_at" in sql:
             pass
@@ -303,19 +322,48 @@ def test_intake_ignores_replayed_older_activates():
     assert conn.registration["activation_block"] == 500
 
 
-def test_intake_ignores_a_new_key_once_ready_done_or_out_of_attempts():
+def test_intake_ignores_an_activate_while_an_upload_or_verification_is_live():
+    """READY/REVOKED mean bytes are frozen and verification is underway — not retryable."""
     new_key = bytes(SigningKey(b"k" * 32).verify_key)
-    for state in ("READY", "REVOKED", "SUBMITTED", "FAILED"):
+    for state in ("READY", "REVOKED"):
         row = _seeded_row()
         row.update(state=state)
         conn = FakeConn(row)
-        assert _apply(conn, [_activate_signal(activation_signal_payload(new_key))]) == 0
+        signal = _activate_signal(activation_signal_payload(new_key), block=200)
+        assert _apply(conn, [signal]) == 0
         assert conn.registration["state"] == state
-    capped = _seeded_row()
-    capped.update(state="CREDENTIALED", attempt_count=SETTINGS.max_attempts)
-    conn = FakeConn(capped)
-    assert _apply(conn, [_activate_signal(activation_signal_payload(new_key))]) == 0
-    assert conn.registration["attempt_count"] == SETTINGS.max_attempts
+
+
+def test_intake_ignores_an_activate_while_the_submission_is_still_in_flight():
+    """SUBMITTED with a submission_id means eval has not finished; retrying would waste it."""
+    row = _seeded_row()
+    row.update(state="SUBMITTED", submission_id=uuid.uuid4())
+    conn = FakeConn(row)
+    assert _apply(conn, [_activate_signal(block=200)]) == 0
+    assert conn.registration["attempt_count"] == 1
+
+
+def test_intake_accepts_the_same_key_from_a_retry_available_registration():
+    """resubmit_terminal clears submission_id; the miner's own activate claims the attempt."""
+    for state in ("SUBMITTED", "FAILED"):
+        row = _seeded_row()
+        row.update(state=state, submission_id=None)
+        conn = FakeConn(row)
+        # the SAME submission key — PRIVATE_UPLOADS.md tells miners to keep it
+        assert _apply(conn, [_activate_signal(block=200)]) == 1
+        assert conn.registration["state"] == "ACTIVATED"
+        assert conn.registration["attempt_count"] == 2
+
+
+def test_intake_refuses_a_retry_once_attempts_are_spent():
+    for state in ("CREDENTIALED", "SUBMITTED", "FAILED"):
+        capped = _seeded_row()
+        capped.update(state=state, submission_id=None, attempt_count=SETTINGS.max_attempts)
+        conn = FakeConn(capped)
+        new_key = bytes(SigningKey(b"k" * 32).verify_key)
+        signal = _activate_signal(activation_signal_payload(new_key), block=200)
+        assert _apply(conn, [signal]) == 0
+        assert conn.registration["attempt_count"] == SETTINGS.max_attempts
 
 
 def test_intake_rejects_malformed_used_hotkeys_and_unregistered():
@@ -441,6 +489,7 @@ def test_controller_runs_the_full_lifecycle(monkeypatch):
         f"s3://{BUCKET}/models/registrations/{RID}@sha256:{manifest.model_digest}"
     )
     assert commit.commit_payload["digest"] == f"sha256:{manifest.model_digest}"
+    assert commit.commit_payload["attempt"] == 1
     assert commit.uid == 5 and commit.hotkey == HOTKEY and commit.block_number == 200
     assert commit.block_hash == "0xabc200"  # same seed logic as public commits
 
@@ -488,8 +537,14 @@ def test_a_retry_uploads_beside_the_previous_attempt_and_both_survive(monkeypatc
     deps = make_deps(s3)
 
     assert asyncio.run(controller.resubmit_terminal(pool, deps)) == 1
-    assert conn.registration["attempt_count"] == 2
+    assert conn.registration["attempt_count"] == 1  # marked only
+    assert not asyncio.run(controller.tick(pool, deps))  # nothing minted yet
     assert [k for k in s3.objects if k[1].startswith(PREFIX)]  # attempt 1 retained
+
+    # the miner claims the next attempt with their own activate, reusing the same key
+    assert _apply(pool, [_activate_signal(block=200)]) == 1
+    assert conn.registration["state"] == "ACTIVATED"
+    assert conn.registration["attempt_count"] == 2
 
     # attempt 2 gets credentials for a prefix of its own
     retry_prefix = model_prefix(RID, 2)
@@ -633,6 +688,16 @@ def test_reaper_spares_uploads_a_live_registration_still_needs():
     assert not _held(s3, model_prefix(loser))
 
 
+def test_reaper_guard_excludes_retry_available_registrations():
+    """A row parked at SUBMITTED with no submission_id owns no live upload, so its old
+    bytes must stay reapable — otherwise a miner who never returns pins them forever."""
+    conn = FakeConn()
+    asyncio.run(controller.reap_expired(FakePool(conn), make_deps(FakeS3())))
+    guard = [q for q in conn.queries if "LEFT JOIN model_submissions" in q]
+    assert guard, "the reaper never issued its guard query"
+    assert "NOT (pr.state = 'SUBMITTED' AND pr.submission_id IS NULL)" in guard[0]
+
+
 def test_reaper_evicts_an_old_earlier_attempt_but_keeps_the_fresh_retry():
     s3 = FakeS3()
     rid, other = "a" * 64, "b" * 64
@@ -669,14 +734,60 @@ def _submitted_row(
     }
 
 
-def test_resubmit_terminal_grants_retry_on_invalid():
+def _status(s3) -> dict:
+    body, _meta = s3.objects[(SETTINGS.mailbox_bucket_name, mailbox_status_key(RID))]
+    return json.loads(body)
+
+
+def test_status_tells_the_miner_a_retry_is_theirs_to_claim():
+    """The plaintext status is the only channel the miner's CLI can read while it polls."""
+    s3 = FakeS3()
+    conn = FakeConn(_submitted_row(attempt=1, fault_code="failed"))
+    asyncio.run(controller.resubmit_terminal(FakePool(conn), make_deps(s3)))
+    st = _status(s3)
+    assert st["upload_attempt"] == 1 and st["max_upload_attempts"] == SETTINGS.max_attempts
+    assert st["upload_attempts_left"] == SETTINGS.max_attempts - 1
+    assert "albedo activate" in st["next"]  # the command, spelled out
+    assert st["reason"] == "failed"
+
+
+def test_status_says_nothing_is_left_once_attempts_are_spent():
+    s3 = FakeS3()
+    row = _seeded_row()
+    row.update(state="CREDENTIALED", attempt_count=SETTINGS.max_attempts)
+    conn = FakeConn(row)
+    conn.age_s = SETTINGS.upload_window_seconds + 1
+    asyncio.run(controller.sweep_credentialed(FakePool(conn), make_deps(s3)))
+    st = _status(s3)
+    assert st["upload_attempts_left"] == 0
+    assert st["next"] == "no upload attempts left for this hotkey"
+    assert "window" in st["step"]
+
+
+def test_status_write_failure_never_breaks_the_state_machine():
+    s3 = FakeS3()
+
+    def _boom(*a, **k):
+        raise RuntimeError("r2 down")
+
+    deps = make_deps(s3)
+    deps.mailbox.put_status = _boom
+    conn = FakeConn(_submitted_row(attempt=1))
+    assert asyncio.run(controller.resubmit_terminal(FakePool(conn), deps)) == 1
+    assert conn.registration["submission_id"] is None  # the retry mark still landed
+
+
+def test_resubmit_terminal_marks_retry_available_without_burning_an_attempt():
     s3 = FakeS3()
     s3.put(BUCKET, f"{PREFIX}model.safetensors", b"x" * 500)  # bytes from the failed attempt
     conn = FakeConn(_submitted_row(attempt=1))
-    assert asyncio.run(controller.resubmit_terminal(FakePool(conn), make_deps(s3))) == 1
-    assert conn.registration["state"] == "ACTIVATED"  # back for another attempt
-    assert conn.registration["attempt_count"] == 2
-    assert conn.registration["submission_id"] is None
+    deps = make_deps(s3)
+    assert asyncio.run(controller.resubmit_terminal(FakePool(conn), deps)) == 1
+    assert conn.registration["state"] == "SUBMITTED"  # tick ignores it: no mint, no window
+    assert conn.registration["attempt_count"] == 1  # nothing burned behind the miner's back
+    assert conn.registration["submission_id"] is None  # the retry-available marker
+    # and no credentials appear until the miner asks
+    assert not asyncio.run(controller.tick(FakePool(conn), deps))
     # the previous attempt is retained; the next one uploads to its own prefix
     assert [k for k in s3.objects if k[1].startswith(PREFIX)]
     assert model_prefix(RID, 2) != PREFIX
@@ -705,3 +816,43 @@ def test_resubmit_terminal_skips_already_blocked_hotkeys():
     conn = FakeConn(_submitted_row(attempt=1, fault_code="hotkey_preeval_blocked"))
     assert asyncio.run(controller.resubmit_terminal(FakePool(conn), make_deps(FakeS3()))) == 0
     assert conn.registration["state"] == "SUBMITTED"  # blocked hotkey — no churn
+
+
+def test_status_names_both_budgets_apart():
+    s3 = FakeS3()
+    conn = FakeConn(_submitted_row(attempt=1, fault_code="loop_check"))
+    conn.strikes = 1
+    asyncio.run(controller.resubmit_terminal(FakePool(conn), make_deps(s3)))
+    st = _status(s3)
+    assert (st["upload_attempt"], st["upload_attempts_left"]) == (1, SETTINGS.max_attempts - 1)
+    assert (st["validation_strikes"], st["validation_strikes_left"]) == (
+        1,
+        controller._max_strikes() - 1,
+    )
+    assert st["blocked"] == "" and "upload attempt 2" in st["next"]
+
+
+def test_resubmit_terminal_refuses_a_retry_to_a_strike_capped_hotkey():
+    """Strikes count over ALL the hotkey's submissions, so a hotkey can be banned with upload
+    attempts to spare; offering a retry would only burn an upload the validator refuses."""
+    s3 = FakeS3()
+    conn = FakeConn(_submitted_row(attempt=1, fault_code="loop_check"))
+    conn.strikes = controller._max_strikes()
+    assert asyncio.run(controller.resubmit_terminal(FakePool(conn), make_deps(s3))) == 0
+    assert not any("SET activation_block = GREATEST" in q for q in conn.executed)  # not parked
+    st = _status(s3)
+    assert st["blocked"] == "hotkey_preeval_blocked" and st["validation_strikes_left"] == 0
+    assert "no retry" in st["next"] and "albedo activate" not in st["next"]
+
+
+def test_unchanged_status_is_not_republished_every_sweep():
+    s3 = FakeS3()
+    conn = FakeConn(_submitted_row(attempt=1, fault_code="hotkey_preeval_blocked"))
+    deps = make_deps(s3)
+    puts: list[str] = []
+    real = deps.mailbox.put_status
+    deps.mailbox.put_status = lambda key, body: (puts.append(key), real(key, body))[1]
+    for _ in range(3):
+        assert asyncio.run(controller.resubmit_terminal(FakePool(conn), deps)) == 0
+    assert len(puts) == 1
+    assert _status(s3)["blocked"] == "hotkey_preeval_blocked"

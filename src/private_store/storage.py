@@ -78,6 +78,21 @@ class MailboxStore:
             Metadata={"sha256": self._digest(ciphertext)},
         )
 
+    def put_status(self, key: str, body: bytes) -> None:
+        """Overwrite a plaintext status object.
+
+        publish() is write-once by design (it raises when the bytes differ), and delete()
+        only accepts credential-generation keys, so a status that changes on every
+        transition needs its own plain put.
+        """
+        self.s3.put_object(
+            Bucket=self.bucket,
+            Key=key,
+            Body=body,
+            ContentType="application/json",
+            CacheControl="no-store, max-age=0",
+        )
+
     def delete(self, keys: Iterable[str]) -> int:
         selected = sorted(set(keys))
         if any(not self._KEY.fullmatch(key) for key in selected):

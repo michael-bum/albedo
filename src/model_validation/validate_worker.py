@@ -23,7 +23,6 @@ from model_validation.storage import (
 )
 from model_validation.uploads import put_fault
 from model_validation.validate import (
-    check_architecture,
     check_dtypes,
     check_genesis,
     check_index,
@@ -58,8 +57,8 @@ def _infra(code: str, msg: str) -> Outcome:
 def _ban_suffix(fails: int, max_fails: int) -> str:
     left = max(0, max_fails - fails)
     if left > 0:
-        return f" — hotkey has {left} attempt(s) left before ban"
-    return " — hotkey has 0 attempts left and is now banned from further submissions"
+        return f" — hotkey has {left} validation strike(s) left before ban"
+    return " — hotkey has 0 validation strikes left and is now banned from further submissions"
 
 
 _NOT_FOUND_MARKERS = (
@@ -129,15 +128,6 @@ def process_model(
         return _miner("metadata_hash", msg, {})
 
     try:
-        ok, msg = check_architecture(config_dir)
-    except FileNotFoundError as exc:
-        return _miner("architecture", f"config.json missing: {exc}", {})
-    except Exception as exc:
-        return _infra("architecture_read_failed", f"could not read config.json: {exc}")
-    if not ok:
-        return _miner("architecture", msg, {})
-
-    try:
         make_room(ref, protected_repos)
         model_dir = download_full(ref)
     except Exception as exc:
@@ -148,7 +138,7 @@ def process_model(
     if not any(mdir.glob("*.safetensors")):
         return _miner("incomplete_repo", "downloaded repo is missing *.safetensors", {})
 
-    ok, msg = check_index(model_dir, files)
+    ok, msg = check_index(model_dir)
     if not ok:
         return _miner("safetensors_index", msg, {})
 

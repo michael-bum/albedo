@@ -5,6 +5,7 @@ from model_validation.dedup.gate import (
     fault_code,
     public_message,
     public_summary,
+    ref_dir,
     run,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     "fault_code",
     "public_message",
     "public_summary",
+    "ref_dir",
     "run",
 ]

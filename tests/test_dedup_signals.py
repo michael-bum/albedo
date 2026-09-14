@@ -119,10 +119,9 @@ def test_combo_fit_recovers_merge_alpha():
     assert abs(fit["alpha"][0] - 0.35) < 0.01
     assert abs(fit["alpha"][1]) < 0.01
     assert fit["resid"] < 0.02
-    assert fit["z"][0] > 8
 
 
-def test_combo_fit_minimal_set_drops_the_partners_that_only_absorb_haze():
+def test_combo_fit_leaves_the_partners_that_only_absorb_haze_at_zero():
     rng = np.random.default_rng(5)
     root = base_mats(0)
     a = perturb(root, lambda n, s: s + lowrank(rng, 16, 0.1), lambda n, x: x)
@@ -130,29 +129,27 @@ def test_combo_fit_minimal_set_drops_the_partners_that_only_absorb_haze():
         name: perturb(root, lambda n, s: s + lowrank(rng, 16, 0.1), lambda n, x: x)
         for name in ("b", "c", "d")
     }
-    # A two-model merge plus a little genuinely new work, so the saturated fit hands the
-    # leftovers to b, c and d as small coefficients that explain almost none of the energy.
+    # A two-model merge plus a little genuinely new work.  A signed fit hands the leftovers to
+    # b, c and d as small coefficients; the non-negative fit has to zero most of them out.
     merged = perturb(
         {n: (0.65 * a[n][0] + 0.35 * root[n][0], 100.0, a[n][2]) for n in NAMES},
         lambda n, s: s + lowrank(rng, 16, 0.004),
         lambda n, x: x,
     )
     fit = signals.combo_fit(merged, {"a": a, "root": root, **others}, "a", ["root", "b", "c", "d"])
-    assert fit["used"] == ["root"]
-    assert 0 < fit["resid"] < fit["resid_min"] < 1.02 * fit["resid"]
-    assert max(abs(v) for v in fit["alpha"][1:]) < 0.05
+    assert abs(fit["alpha"][0] - 0.35) < 0.02
+    assert max(fit["alpha"][1:]) < 0.05
 
 
-def test_combo_fit_minimal_set_keeps_every_partner_of_a_real_mix():
+def test_combo_fit_keeps_every_partner_of_a_real_mix():
     rng = np.random.default_rng(7)
     root = base_mats(0)
     a = perturb(root, lambda n, s: s + lowrank(rng, 16, 0.1), lambda n, x: x)
     b = perturb(root, lambda n, s: s + lowrank(rng, 16, 0.1), lambda n, x: x)
-    # An even three-way mix: no proper subset of the partners can explain 95% of the fit.
     merged = {n: (0.4 * a[n][0] + 0.3 * b[n][0] + 0.3 * root[n][0], 100.0, a[n][2]) for n in NAMES}
     fit = signals.combo_fit(merged, {"a": a, "root": root, "b": b}, "a", ["root", "b"])
-    assert sorted(fit["used"]) == ["b", "root"]
-    assert fit["resid_min"] == fit["resid"]
+    assert min(fit["alpha"]) > 0.25
+    assert fit["resid"] < 0.02
 
 
 def test_combo_fit_independent_delta_has_large_residual():
@@ -162,6 +159,21 @@ def test_combo_fit_independent_delta_has_large_residual():
     cand = perturb(a, lambda n, s: s + lowrank(rng, 16, 0.1), lambda n, x: x)
     fit = signals.combo_fit(cand, {"a": a, "root": root}, "a", ["root"])
     assert fit["resid"] > 0.9
+
+
+def test_combo_fit_will_not_extrapolate_off_the_far_side_of_the_anchor():
+    """The bug this replaced: a signed fit explains an honest child of the king as a large
+    positive multiple of its anchor minus a large multiple of a sibling, because successive
+    kings are near-collinear.  A non-negative fit cannot reach there and has to say so."""
+    rng = np.random.default_rng(11)
+    root = base_mats(0)
+    a = perturb(root, lambda n, s: s + lowrank(rng, 16, 0.1), lambda n, x: x)
+    b = perturb(a, lambda n, s: s + lowrank(rng, 16, 0.1), lambda n, x: x)
+    # cand sits on the line through a and b, on the opposite side of a from b.
+    cand = {n: (a[n][0] - 2.4 * (b[n][0] - a[n][0]), 100.0, a[n][2]) for n in NAMES}
+    fit = signals.combo_fit(cand, {"a": a, "b": b, "root": root}, "a", ["b", "root"])
+    assert max(fit["alpha"]) == 0.0
+    assert fit["resid"] == 1.0
 
 
 def test_reuse_table_flags_moved_adapter():

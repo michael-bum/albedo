@@ -134,7 +134,8 @@ Evaluation results are on [albedo.tech](https://albedo.tech) as usual.
   rejects as a miner fault — public or private submission alike — is one strike, and at three the
   hotkey is banned from validation. No further upload attempt will be evaluated, and `status.json`
   says so instead of offering a retry. Verification failures and expired windows cost an upload
-  attempt but no strike.
+  attempt but no strike; a dedup rejection (see [MINING.md](MINING.md)) bans the hotkey outright,
+  strikes or not.
 - **Upload caps.** Total upload ≤ 100 GB and ≤ 4096 objects; exceeding either during the
   window abandons the submission. A normal checkpoint is far under both.
 - **Verification (after `ready`)** rejects the submission if the uploaded files don't match

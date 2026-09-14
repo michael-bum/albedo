@@ -12,7 +12,6 @@ from model_validation.dedup.signals import mats, rel_dist
 from model_validation.dedup.sketch import fingerprint
 from model_validation.dedup.verdict import (
     ALL_REASONS,
-    BLOCK_REASONS,
     Thresholds,
     Verdict,
     decide,
@@ -60,12 +59,12 @@ def enforces(reason: str | None) -> bool:
 
 
 def fault_code(reason: str | None) -> str:
-    """Only BLOCK_REASONS map to `duplicate`, the one code that permanently blocks a hotkey
-    (db.hotkey_duplicate_block_reason filters on it); anything else costs a strike instead."""
-    r = (reason or "").upper()
-    if r == "OWN-COPY":  # in BLOCK_REASONS, but carries its own code
+    """Every enforced reject maps to `duplicate`, the one code that permanently blocks a hotkey
+    (db.hotkey_duplicate_block_reason filters on it). OWN-COPY carries its own code so a miner
+    re-submitting their own accepted model is told so rather than banned as a copier."""
+    if (reason or "").upper() == "OWN-COPY":
         return "duplicate_own"
-    return "duplicate" if r in BLOCK_REASONS else "duplicate_heuristic"
+    return "duplicate"
 
 
 def device() -> torch.device:

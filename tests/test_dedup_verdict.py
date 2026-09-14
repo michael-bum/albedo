@@ -91,10 +91,8 @@ def test_merge_of_banked_models_is_linear_combo():
     lin = v.metrics["linear"]
     i = lin["partners"].index("root")
     assert abs(lin["alpha"][i] - 0.35) < 0.02
-    # The verdict is judged and worded on the minimal set, not the saturated fit.
-    assert lin["used"] == ["root"] and abs(lin["used_alpha"][0] - 0.35) < 0.02
-    assert lin["resid_min"] < TH.linear_resid
-    assert f"on {len(lin['used'])} of {len(lin['partners'])} partners" in v.message
+    assert lin["resid"] < TH.linear_resid
+    assert "+0.35*root" in v.message and f"of {len(lin['partners'])} partners" in v.message
 
 
 def test_rescaled_delta_is_linear_combo():

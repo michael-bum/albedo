@@ -19,7 +19,7 @@ from model_validation.storage import (
     list_files,
     make_ref,
     make_room,
-    safetensors_dtypes,
+    safetensors_headers,
 )
 from model_validation.uploads import put_fault
 from model_validation.validate import (
@@ -27,6 +27,10 @@ from model_validation.validate import (
     check_genesis,
     check_index,
     check_repo,
+    check_shapes,
+    dtypes_from_headers,
+    seed_shapes,
+    shapes_from_headers,
 )
 from model_validation.validate.chat_template import check as check_chat_template
 
@@ -79,6 +83,31 @@ def _is_not_found(exc: Exception) -> bool:
     return any(m in str(exc).lower() for m in _NOT_FOUND_MARKERS)
 
 
+def _shape_outcome(headers: dict[str, dict]) -> Outcome | None:
+    """Candidate tensor shapes against the seed's, from the headers the dtype preflight already
+    fetched.  Placed after the metadata_hash check (a byte-identical config.json already pins the
+    architecture and gives the clearer message when that is what is wrong) but before
+    download_full, so a rebuilt model costs one range request rather than a multi-GB download and
+    five dedup attempts that all die inside canonicalize().  In shadow mode it can never change the
+    outcome, failures included.
+    """
+    try:
+        ok, msg = check_shapes(shapes_from_headers(headers), seed_shapes(dedup.ref_dir()))
+    except Exception as exc:
+        if not config.SHAPE_ENFORCE:
+            log.warning("[shadow] tensor shape check unavailable: {}", exc)
+            return None
+        return _infra("seed_shapes_failed", f"could not read genesis seed tensor shapes: {exc}")
+    if ok:
+        return None
+    if not config.SHAPE_ENFORCE:
+        log.warning(
+            "[shadow] tensor shape mismatch — {} — not enforced (ALBEDO_SHAPE_ENFORCE)", msg
+        )
+        return None
+    return _miner("tensor_shape", msg, {})
+
+
 def process_model(
     model_uri: str,
     hotkey: str,
@@ -104,12 +133,12 @@ def process_model(
         return _miner("file_manifest", msg, {"files": sorted(files)[:50]})
 
     try:
-        shard_dtypes = safetensors_dtypes(ref)
+        headers = safetensors_headers(ref)
     except Exception as exc:
         if _is_not_found(exc):
             return _miner("repo_not_found", f"repo/revision not found on {ref.backend}: {exc}", {})
         return _infra("preflight_failed", f"could not read safetensors headers: {exc}")
-    ok, msg = check_dtypes(shard_dtypes)
+    ok, msg = check_dtypes(dtypes_from_headers(headers))
     if not ok:
         return _miner("weight_dtype", msg, {})
 
@@ -126,6 +155,10 @@ def process_model(
     ok, msg = check_genesis(config_dir, files)
     if not ok:
         return _miner("metadata_hash", msg, {})
+
+    shape_outcome = _shape_outcome(headers)
+    if shape_outcome is not None:
+        return shape_outcome
 
     try:
         make_room(ref, protected_repos)
@@ -200,7 +233,13 @@ async def _finalize(pool, attempt, outcome: Outcome) -> None:
             fault_code=outcome.fault_code,
             fault_message=outcome.fault_message,
         )
-        log.warning("infra fault [{}] {} → {}", outcome.fault_code, attempt["model_uri"], new_state)
+        log.warning(
+            "infra fault [{}] {} → {} — {}",
+            outcome.fault_code,
+            attempt["model_uri"],
+            new_state,
+            outcome.fault_message,
+        )
     else:
         if outcome.fault_code != "duplicate":
             fails = await db.hotkey_preeval_fail_count(pool, attempt["hotkey"]) + 1

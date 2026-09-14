@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import itertools
 import math
 from dataclasses import dataclass
 from functools import lru_cache
@@ -15,9 +16,6 @@ from model_validation.dedup.layout import BODY_TYPES, EMBED_TYPES, HEAD, ttype
 # the sketch is linear in W, so the difference of two sketches is the sketch of the weight
 # difference, and spectra, distances and merge fits follow from the fingerprints alone.
 Mats = dict[str, tuple[np.ndarray, float, np.ndarray]]
-
-# Fraction of the saturated fit's explained energy that combo_fit's minimal partner set must keep.
-COMBO_KEEP = 0.95
 
 
 def mats(doc: dict) -> Mats:
@@ -178,51 +176,41 @@ def spectral(cand: Mats, anc: Mats) -> dict:
     )
 
 
+def _nnls(gram: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    """argmin over alpha >= 0 of alpha'@gram@alpha/2 - rhs'@alpha."""
+    best = np.zeros(len(rhs))
+    best_gain = 0.0
+    for size in range(1, len(rhs) + 1):
+        for support in itertools.combinations(range(len(rhs)), size):
+            cols = np.ix_(support, support)
+            sub = np.linalg.lstsq(gram[cols], rhs[list(support)], rcond=None)[0]
+            if (sub < 0).any():
+                continue
+            gain = float(sub @ rhs[list(support)] - 0.5 * sub @ gram[cols] @ sub)
+            if gain > best_gain:
+                best_gain = gain
+                best = np.zeros(len(rhs))
+                best[list(support)] = sub
+    return best
+
+
 def combo_fit(cand: Mats, bank: dict[str, Mats], ancestor: str, partners: list[str]) -> dict | None:
-    """Fit the candidate's delta as a combination of banked deltas — a merge is linear in sketch
-    space.  `resid_min`/`used` refit on the fewest partners explaining COMBO_KEEP of `resid`."""
-    target = delta_vec(cand, bank[ancestor])
+    """Fit the candidate's delta as a blend of banked deltas — a merge is linear in sketch space.
+    Coefficients are held non-negative, so the fit has to land inside the hull the banked models
+    span."""
     if not partners:
         return None
-    design = np.stack([delta_vec(bank[p], bank[ancestor]) for p in partners], axis=1)
+    target = delta_vec(cand, bank[ancestor])
     target_energy = float(target @ target)
     if target_energy == 0:
         return None
-    alpha, *_ = np.linalg.lstsq(design, target, rcond=None)
-    residual = target - design @ alpha
-    residual_energy = float(residual @ residual)
-    resid = math.sqrt(residual_energy / target_energy)
-    sigma = math.sqrt(residual_energy / max(len(residual) - design.shape[1], 1))
-    try:
-        cov = np.linalg.inv(design.T @ design)
-        z = [
-            abs(coef) / (sigma * math.sqrt(cov[i, i])) if sigma > 0 else float("inf")
-            for i, coef in enumerate(alpha)
-        ]
-    except np.linalg.LinAlgError:
-        z = [0.0] * len(alpha)
-    resid_min, used = resid, list(partners)
-    used_alpha = [float(v) for v in alpha]
-    explained = target_energy - residual_energy
-    rank = sorted(range(len(alpha)), key=lambda i: -abs(alpha[i]))
-    if explained > 0:
-        for n in range(1, len(rank)):
-            cols = rank[:n]
-            sub, *_ = np.linalg.lstsq(design[:, cols], target, rcond=None)
-            sub_energy = float(np.square(target - design[:, cols] @ sub).sum())
-            if target_energy - sub_energy >= COMBO_KEEP * explained:
-                resid_min = math.sqrt(sub_energy / target_energy)
-                used = [partners[i] for i in cols]
-                used_alpha = [float(v) for v in sub]
-                break
+    design = np.stack([delta_vec(bank[p], bank[ancestor]) for p in partners], axis=1)
+    alpha = _nnls(design.T @ design, design.T @ target)
+    residual_energy = float(np.square(target - design @ alpha).sum())
     return dict(
         partners=list(partners),
         alpha=[float(v) for v in alpha],
-        z=z,
-        resid=resid,
-        resid_min=resid_min,
-        used=used,
-        used_alpha=used_alpha,
+        resid=math.sqrt(residual_energy / target_energy),
     )
 
 

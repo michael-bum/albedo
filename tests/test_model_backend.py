@@ -100,8 +100,8 @@ def test_hf_preflight_dtypes(monkeypatch):
         "_read_header",
         lambda client, url, headers: {"w": {"dtype": "BF16"}, "__metadata__": {}},
     )
-    out = pf.safetensors_dtypes(ModelRef("ns/m", _GIT_SHA1))
-    assert out == {"model.safetensors": {"BF16"}}
+    out = pf.safetensors_headers(ModelRef("ns/m", _GIT_SHA1))
+    assert out == {"model.safetensors": {"w": {"dtype": "BF16"}, "__metadata__": {}}}
 
 
 def test_manifest_uri_routing():

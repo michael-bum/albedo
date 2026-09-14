@@ -50,10 +50,6 @@ def _read_header(client: httpx.Client, url: str, headers: dict) -> dict:
     return json.loads(_ranged(client, url, headers, 8, 8 + hlen - 1))
 
 
-def _dtypes_from_header(header: dict) -> set[str]:
-    return {info["dtype"] for k, info in header.items() if k != "__metadata__"}
-
-
 def _fetch_blob(client: httpx.Client, url: str, headers: dict) -> bytes:
     resp = client.get(url, headers=headers)
     resp.raise_for_status()
@@ -87,12 +83,12 @@ def _read_header_chunked(client: httpx.Client, blobs_base: str, headers: dict, r
     return json.loads(read_range(8, 8 + hlen - 1))
 
 
-def _hippius_dtypes(ref: ModelRef) -> dict[str, set[str]]:
+def _hippius_headers(ref: ModelRef) -> dict[str, dict]:
     from hippius_hub._oci import group_files, parse_pointer_v2
 
     registry, oci_repo, auth, manifest = _oci_context(ref)
     blobs_base = f"{registry}/v2/{oci_repo}/blobs"
-    out: dict[str, set[str]] = {}
+    out: dict[str, dict] = {}
     with httpx.Client(timeout=_TIMEOUT, follow_redirects=True) as client:
         for group in group_files(manifest):
             if not group.title.endswith(".safetensors"):
@@ -100,36 +96,35 @@ def _hippius_dtypes(ref: ModelRef) -> dict[str, set[str]]:
             if group.is_chunked:
                 pointer_url = f"{blobs_base}/{group.pointer_digest}"
                 refs = parse_pointer_v2(_fetch_blob(client, pointer_url, auth))
-                out[group.title] = _dtypes_from_header(
-                    _read_header_chunked(client, blobs_base, auth, refs)
-                )
+                out[group.title] = _read_header_chunked(client, blobs_base, auth, refs)
                 continue
             blob_url = f"{blobs_base}/{group.digest}"
-            out[group.title] = _dtypes_from_header(_read_header(client, blob_url, auth))
+            out[group.title] = _read_header(client, blob_url, auth)
     return out
 
 
-def _hf_dtypes(ref: ModelRef) -> dict[str, set[str]]:
+def _hf_headers(ref: ModelRef) -> dict[str, dict]:
     from huggingface_hub import hf_hub_url, list_repo_files
 
     token = _hf_token()
     files = list_repo_files(repo_id=ref.repo, revision=ref.digest, token=token)
     auth = {"Authorization": f"Bearer {token}"} if token else {}
-    out: dict[str, set[str]] = {}
+    out: dict[str, dict] = {}
     with httpx.Client(timeout=_TIMEOUT, follow_redirects=True) as client:
         for name in files:
             if not name.endswith(".safetensors"):
                 continue
             url = hf_hub_url(repo_id=ref.repo, filename=name, revision=ref.digest)
-            out[name] = _dtypes_from_header(_read_header(client, url, auth))
+            out[name] = _read_header(client, url, auth)
     return out
 
 
-def safetensors_dtypes(ref: ModelRef) -> dict[str, set[str]]:
+def safetensors_headers(ref: ModelRef) -> dict[str, dict]:
+    """Shard name -> safetensors header, read over byte ranges without downloading weights."""
     if ref.backend == BACKEND_S3:
         from config_validation.storage import _s3
 
-        return _s3.safetensors_dtypes(ref)
+        return _s3.safetensors_headers(ref)
     if ref.backend == BACKEND_HF:
-        return _hf_dtypes(ref)
-    return _hippius_dtypes(ref)
+        return _hf_headers(ref)
+    return _hippius_headers(ref)

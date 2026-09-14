@@ -16,8 +16,10 @@ def _patch_pipeline(monkeypatch, tmp_path):
     monkeypatch.setattr(worker, "make_ref", lambda repo, digest: object())
     monkeypatch.setattr(worker, "list_files", lambda ref: ["config.json"])
     monkeypatch.setattr(worker, "check_repo", lambda files: (True, ""))
-    monkeypatch.setattr(worker, "safetensors_dtypes", lambda ref: {})
+    monkeypatch.setattr(worker, "safetensors_headers", lambda ref: {})
     monkeypatch.setattr(worker, "check_dtypes", lambda d: (True, ""))
+    monkeypatch.setattr(worker.dedup, "ref_dir", lambda: "")
+    monkeypatch.setattr(worker, "seed_shapes", lambda seed_dir: {})
     monkeypatch.setattr(worker, "download_config", lambda ref: str(tmp_path))
     monkeypatch.setattr(worker, "check_chat_template", lambda d, f: (True, ""))
     monkeypatch.setattr(worker, "check_genesis", lambda d, f: (True, ""))
@@ -68,8 +70,8 @@ def test_heuristic_reject_is_shadowed_under_the_default_allowlist(monkeypatch, t
     assert out.state == "done" and out.result_summary == {"dedup": "pass"}
 
 
-def test_heuristic_reject_is_a_strike_not_a_permanent_block_when_allowlisted(monkeypatch, tmp_path):
-    """Opting a heuristic in must not reuse `duplicate`, the code that blocks a hotkey forever."""
+def test_heuristic_reject_allowlisted_blocks_the_hotkey_permanently(monkeypatch, tmp_path):
+    """A merge is banned like a copy: `duplicate`, so hotkey_duplicate_blocked follows."""
     v = Verdict(
         "REJECT", "LINEAR-COMBO", "ns/king@b", "combo", [], {"F": 0.05, "ancestor_hotkey": "hk2"}
     )
@@ -80,8 +82,7 @@ def test_heuristic_reject_is_a_strike_not_a_permanent_block_when_allowlisted(mon
         enforce=True,
         reasons="COPY,OWN-COPY,LINEAR-COMBO",
     )
-    assert out.state == "failed" and out.fault_code == "duplicate_heuristic"
-    assert out.fault_code != "duplicate", "must not trigger hotkey_duplicate_blocked"
+    assert out.state == "failed" and out.fault_code == "duplicate" and not out.retryable
     assert out.result_summary["metrics"]["F"] == 0.05
 
 
@@ -102,7 +103,7 @@ def test_noise_reject_allowlisted_blocks_the_hotkey_permanently(monkeypatch, tmp
 def test_star_enforces_every_reason(monkeypatch, tmp_path):
     v = Verdict("REJECT", "TRIVIAL-EDIT", "ns/king@b", "tiny", [], {})
     out, _ = _run(monkeypatch, tmp_path, GateResult(verdict=v), enforce=True, reasons="*")
-    assert out.state == "failed" and out.fault_code == "duplicate_heuristic"
+    assert out.state == "failed" and out.fault_code == "duplicate"
 
 
 def test_own_copy_enforced_is_a_strike_not_a_duplicate_block(monkeypatch, tmp_path):

@@ -190,9 +190,8 @@ def test_reason_sets_partition_every_reason_the_gate_can_emit():
     }
     assert not (EXACT_REASONS & HEURISTIC_REASONS)
     assert ALL_REASONS == EXACT_REASONS | HEURISTIC_REASONS
-    # the penalty axis cuts across that partition rather than following it
-    assert EXACT_REASONS < BLOCK_REASONS <= ALL_REASONS
-    assert BLOCK_REASONS & HEURISTIC_REASONS == {"NOISE-COPY", "NOISED-COPY"}
+    # every reject bans the hotkey; the exact/heuristic split only describes how it was found
+    assert BLOCK_REASONS == ALL_REASONS
 
 
 def test_enforced_reasons_parses_the_list(monkeypatch):
@@ -235,10 +234,9 @@ def test_device_refuses_to_fingerprint_on_cpu(monkeypatch):
     assert gate.device() == torch.device("cuda:3")
 
 
-def test_fault_code_keeps_the_permanent_block_for_copies_and_noise():
-    for reason in ("COPY", "NOISE-COPY", "NOISED-COPY"):
+def test_fault_code_bans_the_hotkey_for_every_reason_but_own_copy():
+    from model_validation.dedup.verdict import ALL_REASONS
+
+    for reason in sorted(ALL_REASONS - {"OWN-COPY"}):
         assert gate.fault_code(reason) == "duplicate"  # the code that blocks a hotkey forever
     assert gate.fault_code("OWN-COPY") == "duplicate_own"
-    for reason in ("LINEAR-COMBO", "SPARSE-EDIT", "TRIVIAL-EDIT"):
-        assert gate.fault_code(reason) == "duplicate_heuristic"
-        assert gate.fault_code(reason) != "duplicate"

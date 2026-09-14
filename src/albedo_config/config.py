@@ -442,19 +442,23 @@ class ModelValidationSettings(BaseSettings):
     S3_ENDPOINT: str = "https://s3.hippius.com"
     S3_ACCESS_KEY: str = ""
     S3_SECRET_KEY: str = ""
+    # Tensor shapes must match the genesis seed. A mismatch is a MINER_FAULT and counts toward
+    # PREEVAL_MAX_FAILS like any other; false = shadow mode (logged, never enforced).
+    SHAPE_ENFORCE: bool = True
     DEDUP_SECRET: str = ""
     DEDUP_SECRET_FILE: str = ""
     DEDUP_REF_DIR: str = ""
     DEDUP_GPU: int = 6
-    DEDUP_ENFORCE: bool = False
+    DEDUP_ENFORCE: bool = True
     # Master switch above; this narrows WHICH reject reasons may actually fault a miner.
     # Everything not listed is logged and stored as audit, and the miner still gets done.
     # "*" (or "ALL") enforces every reason. Names are the Verdict.reason values.
-    DEDUP_ENFORCE_REASONS: str = "COPY,OWN-COPY"
+    DEDUP_ENFORCE_REASONS: str = (
+        "COPY,OWN-COPY,NOISE-COPY,NOISED-COPY,LINEAR-COMBO,SPARSE-EDIT,TRIVIAL-EDIT"
+    )
     DEDUP_NEAREST_K: int = 10
     DEDUP_COPY_REL: float = 1e-5
-    DEDUP_LINEAR_RESID: float = 0.05
-    DEDUP_ALPHA_Z: float = 8.0
+    DEDUP_LINEAR_RESID: float = 0.2
     DEDUP_ALPHA_MIN: float = 0.02
     DEDUP_F_NOISE: float = 0.10
     DEDUP_EMBED_RATIO_NOISE: float = 0.80

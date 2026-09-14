@@ -6,13 +6,19 @@ from loguru import logger
 
 from config_validation.models import ModelRef
 from config_validation.storage import download_config, list_files
+from model_validation.storage import safetensors_headers
 from model_validation.validate import (
     check_chat_template,
     check_dtype,
+    check_dtypes,
     check_genesis,
     check_index,
     check_repo,
+    check_shapes,
+    dtypes_from_headers,
+    shapes_from_headers,
 )
+from model_validation.validate.tensor_shapes import pinned_seed_shapes, read_headers
 
 
 def _result(checks: dict[str, tuple[bool, str]]) -> tuple[bool, dict]:
@@ -40,6 +46,8 @@ def validate_local(path: str, files: list[str] | None = None) -> tuple[bool, dic
     template_res = check_chat_template(path, files)
     logger.info("checking genesis metadata…")
     genesis_res = check_genesis(path, files)
+    logger.info("checking tensor shapes…")
+    shape_res = check_shapes(shapes_from_headers(read_headers(path)), pinned_seed_shapes())
     logger.info("checking safetensors index…")
     index_res = check_index(path)
     return _result(
@@ -48,6 +56,7 @@ def validate_local(path: str, files: list[str] | None = None) -> tuple[bool, dic
             "weight_dtype": dtype_res,
             "chat_template_hash": template_res,
             "metadata_hash": genesis_res,
+            "tensor_shape": shape_res,
             "safetensors_index": index_res,
         }
     )
@@ -96,16 +105,27 @@ def validate_remote(repo: str, digest: str) -> tuple[bool, dict]:
             }
         )
 
+    # Every check the validator runs before the full download, in its order (index needs the
+    # shards on disk, dedup needs the fingerprint bank).
     logger.info("checking file manifest…")
     checks = {"file_manifest": check_repo(files)}
+    try:
+        logger.info("reading safetensors headers…")
+        headers = safetensors_headers(ref)
+    except Exception as exc:
+        headers = None
+        checks["weight_dtype"] = (False, f"could not read safetensors headers: {exc}")
+    else:
+        checks["weight_dtype"] = check_dtypes(dtypes_from_headers(headers))
     try:
         logger.info("downloading config files…")
         cfg_dir = download_config(ref)
     except Exception as exc:
         failed = (False, f"could not download config files: {exc}")
-        return _result({**checks, "chat_template_hash": failed, "metadata_hash": failed})
-    logger.info("checking chat template…")
-    checks["chat_template_hash"] = check_chat_template(cfg_dir, files)
-    logger.info("checking genesis metadata…")
-    checks["metadata_hash"] = check_genesis(cfg_dir, files)
+        checks.update(chat_template_hash=failed, metadata_hash=failed)
+    else:
+        checks["chat_template_hash"] = check_chat_template(cfg_dir, files)
+        checks["metadata_hash"] = check_genesis(cfg_dir, files)
+    if headers is not None:
+        checks["tensor_shape"] = check_shapes(shapes_from_headers(headers), pinned_seed_shapes())
     return _result(checks)

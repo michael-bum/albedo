@@ -16,17 +16,19 @@ from model_validation.dedup.signals import (
 # (tensors_hash) or on rel_dist under DEDUP_COPY_REL.
 EXACT_REASONS = frozenset({"COPY", "OWN-COPY"})
 HEURISTIC_REASONS = frozenset(
-    {"LINEAR-COMBO", "NOISE-COPY", "NOISED-COPY", "SPARSE-EDIT", "TRIVIAL-EDIT"}
+    {"NOISE-COPY", "NOISED-COPY", "LINEAR-COMBO", "SPARSE-EDIT", "TRIVIAL-EDIT"}
 )
 ALL_REASONS = EXACT_REASONS | HEURISTIC_REASONS
-BLOCK_REASONS = EXACT_REASONS | {"NOISE-COPY", "NOISED-COPY"}
+
+# Every reject costs the hotkey permanently (fault_code "duplicate"; OWN-COPY carries its own code).
+# Kept as its own name so gate.fault_code and the tests can say which set they mean.
+BLOCK_REASONS = ALL_REASONS
 
 
 @dataclass(frozen=True)
 class Thresholds:
     copy_rel: float
     linear_resid: float
-    alpha_z: float
     alpha_min: float
     f_noise: float
     embed_ratio_noise: float
@@ -47,7 +49,6 @@ class Thresholds:
         return cls(
             copy_rel=cfg.DEDUP_COPY_REL,
             linear_resid=cfg.DEDUP_LINEAR_RESID,
-            alpha_z=cfg.DEDUP_ALPHA_Z,
             alpha_min=cfg.DEDUP_ALPHA_MIN,
             f_noise=cfg.DEDUP_F_NOISE,
             embed_ratio_noise=cfg.DEDUP_EMBED_RATIO_NOISE,
@@ -148,24 +149,15 @@ def decide(
             metrics,
         )
 
-    linear = (
-        cf is not None
-        and cf["resid_min"] < th.linear_resid
-        and any(
-            abs(al) > th.alpha_min and z > th.alpha_z
-            for b, al, z in zip(cf["partners"], cf["alpha"], cf["z"])
-            if b in cf["used"]
-        )
-    )
-    if linear:
-        terms = " ".join(f"{al:+.2f}*{b}" for b, al in zip(cf["used"], cf["used_alpha"]))
+    if cf and cf["resid"] < th.linear_resid and max(cf["alpha"]) > th.alpha_min:
+        used = [(b, al) for b, al in zip(cf["partners"], cf["alpha"]) if al > th.alpha_min]
+        terms = " ".join(f"+{al:.2f}*{b}" for b, al in used)
         return Verdict(
             "REJECT",
             "LINEAR-COMBO",
             a,
-            f"linear combination of banked models: {a} {terms} "
-            f"(resid {cf['resid_min']:.3f} on {len(cf['used'])} of {len(cf['partners'])} "
-            f"partners, {cf['resid']:.3f} on all)",
+            f"blend of banked models: {a} {terms} "
+            f"(resid {cf['resid']:.3f} on {len(used)} of {len(cf['partners'])} partners)",
             notes,
             metrics,
         )

@@ -15,6 +15,13 @@ def _shard_dtypes(path: Path) -> set[str]:
     return {info["dtype"] for k, info in header.items() if k != "__metadata__"}
 
 
+def dtypes_from_headers(headers: dict[str, dict]) -> dict[str, set[str]]:
+    return {
+        shard: {info["dtype"] for key, info in header.items() if key != "__metadata__"}
+        for shard, header in headers.items()
+    }
+
+
 def check_dtypes(shard_dtypes: dict[str, set[str]]) -> tuple[bool, str]:
     for name in sorted(shard_dtypes):
         bad = sorted(shard_dtypes[name] - ALLOWED_DTYPES)

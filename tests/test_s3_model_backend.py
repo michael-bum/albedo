@@ -14,7 +14,7 @@ from albedo_eval_service.modelstore.resolver import ModelArtifactResolver
 from config_validation.models import BACKEND_S3, ModelRef, cache_repo
 from config_validation.storage import _paths, _s3
 from model_validation.storage import download
-from model_validation.storage.preflight import safetensors_dtypes
+from model_validation.storage.preflight import safetensors_headers
 from private_store.digests import ArtifactIntegrityError, model_digest_from_inventory
 
 RID = "a" * 64
@@ -126,12 +126,21 @@ def test_download_config_fetches_only_config_files(s3_env):
     assert names == ["config.json", "model.safetensors.index.json"]
 
 
-def test_safetensors_dtypes_reads_headers_with_ranged_gets(s3_env):
+def test_safetensors_headers_reads_headers_with_ranged_gets(s3_env):
+    from model_validation.validate import dtypes_from_headers, shapes_from_headers
+
     _, _, ref, _ = s3_env
-    assert safetensors_dtypes(ref) == {
+    headers = safetensors_headers(ref)
+    assert sorted(headers) == [
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
+    ]
+    assert dtypes_from_headers(headers) == {
         "model-00001-of-00002.safetensors": {"BF16"},
         "model-00002-of-00002.safetensors": {"BF16"},
     }
+    # One ranged read now serves both the dtype rule and the shape gate.
+    assert shapes_from_headers(headers)
 
 
 def test_make_room_protects_private_store_models(s3_env, monkeypatch):

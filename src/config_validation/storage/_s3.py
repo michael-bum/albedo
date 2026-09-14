@@ -127,9 +127,9 @@ def download_full(ref: ModelRef) -> str:
     return str(dest)
 
 
-def safetensors_dtypes(ref: ModelRef) -> dict[str, set[str]]:
+def safetensors_headers(ref: ModelRef) -> dict[str, dict]:
     bucket, prefix = _location(ref)
-    out: dict[str, set[str]] = {}
+    out: dict[str, dict] = {}
     for name in list_files(ref):
         if not name.endswith(".safetensors"):
             continue
@@ -141,6 +141,5 @@ def safetensors_dtypes(ref: ModelRef) -> dict[str, set[str]]:
             return response["Body"].read()
 
         header_len = int.from_bytes(ranged(0, 7), "little")
-        header = json.loads(ranged(8, 8 + header_len - 1))
-        out[name] = {info["dtype"] for key, info in header.items() if key != "__metadata__"}
+        out[name] = json.loads(ranged(8, 8 + header_len - 1))
     return out

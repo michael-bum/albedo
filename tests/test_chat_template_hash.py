@@ -75,7 +75,11 @@ def test_process_model_rejects_template_before_full_download(tmp_path, monkeypat
             "model.safetensors",
         ],
     )
-    monkeypatch.setattr(worker, "safetensors_dtypes", lambda ref: {"model.safetensors": {"BF16"}})
+    monkeypatch.setattr(
+        worker,
+        "safetensors_headers",
+        lambda ref: {"model.safetensors": {"w": {"dtype": "BF16", "shape": [8, 8]}}},
+    )
     monkeypatch.setattr(
         worker, "download_config", lambda ref: calls.append("config") or str(tmp_path)
     )

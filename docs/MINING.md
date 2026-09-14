@@ -114,11 +114,20 @@ weights are rejected (`weight_dtype`, checked header-only before the full downlo
 checkpoint's `model.safetensors.index.json` weight_map must match the shards and tensors actually
 on disk (`safetensors_index`).
 
+**Tensor shapes** — your repo's tensor inventory must match the genesis seed exactly: same tensor
+names, same shapes (fault: `tensor_shape`, checked header-only before the full download). Every
+shape in this architecture follows from the locked `config.json` keys above, so there is no
+fine-tune that legitimately changes one — training updates weights in place. Note what this rules
+out: re-exporting the MoE experts in the per-expert split layout instead of the fused
+`mlp.experts.gate_up_proj` / `mlp.experts.down_proj` tensors, fusing or splitting q/k/v, resizing
+embeddings for added tokens, and shipping unmerged LoRA adapter tensors alongside the base
+weights. Merge your adapter and save with stock `transformers` and you will match.
+
 In short: fine-tune the weights, keep the Qwen3.6-35B-A3B architecture and tokenizer intact, don't add
 custom code or quantize.
 
 **Dedup** — validators fingerprint your weights and compare them against every model already
-accepted on the subnet. Four verdicts can fault a submission:
+accepted on the subnet. Seven verdicts can fault a submission:
 
 | verdict | what it means | fault code |
 |---|---|---|
@@ -126,11 +135,13 @@ accepted on the subnet. Four verdicts can fault a submission:
 | `OWN-COPY` | identical to a model you already had accepted | `duplicate_own` |
 | `NOISE-COPY` | the change from the nearest accepted model is spectral noise, not training | `duplicate` — **permanently blocks the hotkey** |
 | `NOISED-COPY` | dense noise, not training | `duplicate` — **permanently blocks the hotkey** |
+| `LINEAR-COMBO` | your weights are explained as a blend of models already accepted — a merge | `duplicate` — **permanently blocks the hotkey** |
+| `SPARSE-EDIT` | few weights moved, and those few moved a lot | `duplicate` — **permanently blocks the hotkey** |
+| `TRIVIAL-EDIT` | the change from the nearest accepted model is too small to be training | `duplicate` — **permanently blocks the hotkey** |
 
 Copying a model and perturbing the weights does not work: both noise verdicts exist to catch
-exactly that, and both cost the hotkey permanently rather than a single strike. Other
-near-duplicate signals (`LINEAR-COMBO`, `SPARSE-EDIT`, `TRIVIAL-EDIT`) are recorded but do
-**not** fault a submission yet.
+exactly that, and both cost the hotkey permanently rather than a single strike. Merging accepted
+models does not work either — that is `LINEAR-COMBO`.
 
 ---
 
@@ -216,9 +227,9 @@ All commands default `--netuid 97` and `--network finney`, and read wallet/names
 albedo check-model --path /path/to/model
 ```
 
-Runs all five checks on a local directory, using the same code validators run, in the same
+Runs all six checks on a local directory, using the same code validators run, in the same
 order, keyed by the same fault codes: `file_manifest`, `weight_dtype`, `chat_template_hash`,
-`metadata_hash`, `safetensors_index`. Prints `[PASS]/[FAIL]` per check and `VALID`/`INVALID`.
+`metadata_hash`, `tensor_shape`, `safetensors_index`. Prints `[PASS]/[FAIL]` per check and `VALID`/`INVALID`.
 Needs no network and no credentials. Only dedup is **not** checked here — it needs the
 validator's fingerprint bank.
 
@@ -228,8 +239,11 @@ validator's fingerprint bank.
 albedo check-model --repo <ns>/albedo-qwen3.6-35b-v1 --digest sha256:...
 ```
 
-Lists the repo's files on whichever hub the pin points at (HF or Hippius) and downloads only
-`config.json` to re-run the checks.
+Lists the repo's files on whichever hub the pin points at (HF, Hippius or the private store),
+reads the safetensors headers over byte ranges and downloads only the config files, then re-runs
+every check the validator runs before the full download: `file_manifest`, `weight_dtype`,
+`chat_template_hash`, `metadata_hash`, `tensor_shape`. `safetensors_index` needs the shards on
+disk and dedup needs the fingerprint bank, so neither runs here.
 
 ### Upload a model
 

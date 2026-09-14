@@ -6,7 +6,7 @@ from model_validation.storage.download import (
     make_ref,
     make_room,
 )
-from model_validation.storage.preflight import safetensors_dtypes
+from model_validation.storage.preflight import safetensors_headers
 
 __all__ = [
     "cache_dir",
@@ -15,5 +15,5 @@ __all__ = [
     "list_files",
     "make_ref",
     "make_room",
-    "safetensors_dtypes",
+    "safetensors_headers",
 ]

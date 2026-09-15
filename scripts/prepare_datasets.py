@@ -66,6 +66,15 @@ SOURCES: dict[str, dict] = {
     },
 }
 
+REVISIONS: dict[str, str] = {
+    "ricdomolm/mini-coder-trajs-400k": "c03c1fd5016d59be5f4acf6d4492d943d0633923",
+    "nvidia/Open-SWE-Traces": "9c0e4579a4ee0effa3e5f7a552494a045f29377d",
+    "nvidia/SWE-Hero-openhands-trajectories": "150bc119e52c647216fce285fd801f16b6fd745b",
+    "AlienKevin/SWE-smith-rs-minimax-m2.5-trajectories": "dfd98db8db1970d485d6897626648a90b54e453b",
+    "AlienKevin/SWE-smith-rs-gpt-5-mini-trajectories": "d4c902a41c7a73b230613932827e1908e06d162d",
+    "AlienKevin/SWE-smith-rs-gemini-3-flash-trajectories": "0b2f075e7f65670b5f284e5d4264c4eabe05d91e",  # noqa: E501
+}
+
 
 def _repo_of(name: str) -> str:
     return SOURCES[name]["repos"][0]
@@ -78,10 +87,10 @@ def _enable_fast_transfer() -> None:
         os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
 
-def _expected_parquet_shards(repo_id: str, shard_glob: str) -> set[str]:
+def _expected_parquet_shards(repo_id: str, shard_glob: str, revision: str) -> set[str]:
     from huggingface_hub import HfApi
 
-    files = HfApi().list_repo_files(repo_id, repo_type="dataset")
+    files = HfApi().list_repo_files(repo_id, repo_type="dataset", revision=revision)
     return {f for f in files if fnmatch.fnmatch(f, shard_glob)}
 
 
@@ -95,6 +104,7 @@ def download_source(
     shard_glob: str,
     root: Path,
     *,
+    revision: str,
     force: bool,
     max_workers: int,
     dest_name: str | None = None,
@@ -103,7 +113,7 @@ def download_source(
 
     dest = root / (dest_name or name)
 
-    expected = _expected_parquet_shards(repo_id, shard_glob)
+    expected = _expected_parquet_shards(repo_id, shard_glob, revision)
     if not expected:
         raise RuntimeError(f"{name}: no shards in repo {repo_id} matching {shard_glob!r}")
     present = _local_parquet_shards(dest, shard_glob)
@@ -115,13 +125,14 @@ def download_source(
         )
         return dest
     log.info(
-        "%s: %d/%d present, downloading %d missing -> %s (%d parallel workers)",
+        "%s: %d/%d present, downloading %d missing -> %s (%d workers) rev=%s",
         name,
         len(present),
         len(expected),
         len(to_fetch),
         dest,
         max_workers,
+        revision[:12],
     )
 
     def _one(rel: str) -> None:
@@ -129,6 +140,7 @@ def download_source(
             repo_id,
             rel,
             repo_type="dataset",
+            revision=revision,
             local_dir=str(dest),
             force_download=force,
             token=os.environ.get("HF_TOKEN"),
@@ -153,7 +165,7 @@ def download_source(
     return dest
 
 
-def _upload_manifest_to_hippius(manifest_path: Path, key: str) -> str:
+def _upload_manifest(manifest_path: Path, key: str) -> str:
     import boto3
     from botocore.config import Config
 
@@ -164,8 +176,10 @@ def _upload_manifest_to_hippius(manifest_path: Path, key: str) -> str:
 
     if not (hv.S3_BUCKET and hv.S3_ACCESS_KEY and hv.S3_SECRET_KEY):
         raise SystemExit(
-            "--upload needs Hippius S3 credentials: set ALBEDO_S3_BUCKET, ALBEDO_S3_ACCESS_KEY "
-            "and ALBEDO_S3_SECRET_KEY (in albedo/.env)."
+            "--upload needs S3 credentials: set ALBEDO_S3_BUCKET, ALBEDO_S3_ACCESS_KEY and "
+            "ALBEDO_S3_SECRET_KEY (in albedo/.env). ALBEDO_S3_ENDPOINT decides WHERE it lands: "
+            "prod points it at R2, served as https://albedo.tech/<key>. Left unset it defaults to "
+            "the legacy s3.hippius.com, which is not what anyone reads."
         )
 
     body = manifest_path.read_bytes()
@@ -186,7 +200,7 @@ def _upload_manifest_to_hippius(manifest_path: Path, key: str) -> str:
         ContentType="application/json",
         ACL="public-read",
     )
-    log.info("manifest sha256: %s", hashlib.sha256(body).hexdigest())
+    log.info("uploaded %s (%s) sha256 %s", key, hv.S3_ENDPOINT, hashlib.sha256(body).hexdigest())
     return f"s3://{hv.S3_BUCKET}/{key}"
 
 
@@ -227,12 +241,12 @@ def main() -> None:
     parser.add_argument(
         "--upload",
         action="store_true",
-        help="Upload only manifest.json to Hippius S3 (ALBEDO_S3_* creds); does not upload the datasets.",  # noqa: E501
+        help="Upload manifest.json and manifest.meta.json to the albedo bucket (ALBEDO_S3_* creds); does not upload the shards.",  # noqa: E501
     )
     parser.add_argument(
         "--upload-key",
         default="datasets/manifest.json",
-        help="Destination key in the Hippius bucket for --upload (default: datasets/manifest.json).",  # noqa: E501
+        help="Destination key for --upload (default: datasets/manifest.json). The meta is published beside it.",  # noqa: E501
     )
     args = parser.parse_args()
 
@@ -255,6 +269,7 @@ def main() -> None:
                 repo_id,
                 glob,
                 Path(args.raw_root) if args.raw_root and meta.get("render") else root,
+                revision=REVISIONS[repo_id],
                 force=args.force,
                 max_workers=args.max_workers,
                 dest_name=repo_id.split("/")[-1] if meta.get("render") else name,
@@ -289,7 +304,10 @@ def main() -> None:
             raise SystemExit(
                 f"--upload: no manifest at {out_path} (build one first, or drop --skip-manifest)."
             )
-        log.info("uploaded manifest -> %s", _upload_manifest_to_hippius(out_path, args.upload_key))
+        _upload_manifest(out_path, args.upload_key)
+        meta_path = out_path.with_name("manifest.meta.json")
+        if meta_path.exists():
+            _upload_manifest(meta_path, args.upload_key.removesuffix(".json") + ".meta.json")
 
 
 if __name__ == "__main__":

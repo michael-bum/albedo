@@ -10,7 +10,7 @@
 > **repo-context service**, which checks out the real repository at the sampled commit and *executes*
 > the command against it — so `git`, `grep`, `find`, `sed` and friends return real output, and the
 > model's own edits persist through a write overlay. Only what cannot be executed is simulated by an
-> LLM (`deepseek/deepseek-v4-flash-0731`, provider-rotating ladder with the evaluator model as the last
+> LLM (`deepseek/deepseek-v4.1-flash`, provider-rotating ladder with the evaluator model as the last
 > rung), always in whatever observation format that trajectory natively uses. For each task an
 > evaluator (GLM 5.2) rolls **three** GLM 5.2 reference trajectories, reduces them to the task's
 > **milestones** and writes a ladder of yes/no questions per milestone — generalized to the task, not
@@ -38,7 +38,7 @@
 albedo/
 │
 ├── pyproject.toml              All console entrypoints (see "Services" below) + deps (bittensor, fastapi, asyncpg, opensearch, vllm-via-remote)
-├── chain.toml                  Subnet constants for the config_validation commit-validator (seed digest, arch-lock keys, file allowlist). The `[files]` allowlist now matches the live one; the LIVE authority is albedo_config ModelValidationSettings + architecture_spec.json — see below.
+├── chain.toml                  Subnet constants (seed repo + digest, challenger repo pattern, file allowlist). The `[files]` allowlist matches the live one; the LIVE authority is albedo_config ModelValidationSettings (files) + the genesis pins in model_validation/validate (metadata hashes, tensor shapes) — see below.
 ├── schema.sql                  Canonical Postgres schema — the single source of truth for pipeline state
 ├── docker-compose.yml          Local Postgres (albedo-postgres) on a localhost-only port
 ├── .env.example                Full backend/GPU-host env reference
@@ -46,7 +46,7 @@ albedo/
 │
 ├── miner/                      ← the `albedo` miner CLI (entry point miner.cli:main)
 │   ├── cli.py                      arg parsing + dispatch for all subcommands
-│   ├── validate.py                 local file-manifest + arch + safetensors-index + 16-bit-dtype checks (same code validators run)
+│   ├── validate.py                 local run of every validator check except dedup: file manifest, 16-bit dtype, chat-template + metadata hashes, tensor shapes vs the pinned genesis inventory, safetensors index (same code validators run); `publish`/`upload`/`submit-private` call it first unless `--skip-check`
 │   ├── upload.py                   push model dir to HF (default) or Hippius, return repo@pin
 │   ├── publish.py                  full pipeline: validate→upload→check→registered?→commit
 │   ├── commit.py                   write v7 reveal on-chain (set_reveal_commitment)
@@ -62,7 +62,7 @@ albedo/
 │   │   │                           SANITY_REMOTE_ / ALBEDO_REPO_CONTEXT_ / CHAIN_ / ALBEDO_WEIGHT_ / …).
 │   │   │                           `.env` carries only secrets + topology; every tunable has a code default here.
 │   │   ├── config.py                   the settings classes (incl. the live file allowlist on ModelValidationSettings)
-│   │   ├── chain_spec.py               chain.toml → constants (seed digest, arch-lock keys, SIM_THRESHOLD)
+│   │   ├── chain_spec.py               chain.toml → constants (seed repo + digest, repo pattern, file allowlist)
 │   │   ├── models.py                   the model roster: JUDGE_MODELS, EVALUATOR_MODEL, SOTA_MODELS, SIMULATION_MODEL, ENGY_MODELS
 │   │   └── db.py                       shared DSN helpers
 │   │
@@ -71,17 +71,12 @@ albedo/
 │   │   ├── chain.py                    decode v7 payloads, resolve hotkey→uid via metagraph
 │   │   └── db.py                       upsert chain_commits / miners / model_submissions / events
 │   │
-│   ├── config_validation/          VALIDATION LIBRARY for the standalone commit-validator; also gives the miner CLI its Hippius download/list utils + ModelRef (the miner's actual checks come from model_validation, below)
-│   │   ├── pipeline.py                 ordered checks: revision → files → architecture
-│   │   ├── checks/revision.py          repo@digest resolves on Hippius (fast fail)
-│   │   ├── checks/files.py             strict allowlist from chain.toml [files]
-│   │   ├── checks/architecture.py      config.json matches seed on lock keys; no auto_map/quantization_config
-│   │   ├── checks/genesis_metadata.py  the metadata-hash pin against the genesis repo
-│   │   ├── repo_pattern.py             challenger repo-name rule from chain.toml
-│   │   ├── storage/                    the download layer shared with the miner CLI: dispatch.py picks the backend from the
-│   │   │                               pin (_hf.py / _hippius.py), _fastdl.py is the parallel fetcher, _supervise.py the
-│   │   │                               killable-subprocess + stall watchdog, s3.py the artifact store
-│   │   └── models/reveal.py            parse/build v7 reveal
+│   ├── config_validation/          MODEL-REF + STORAGE LIBRARY shared by the miner CLI and model_validation (no checks live here any more — they are all in model_validation/validate)
+│   │   ├── models/ref.py               ModelRef + backend detection from the pin's shape (hf / hippius / s3)
+│   │   └── storage/                    the download layer: dispatch.py picks the backend from the pin (_hf.py / _hippius.py /
+│   │                                   _s3.py for private R2 submissions), _fastdl.py is the parallel fetcher, _supervise.py the
+│   │                                   killable-subprocess + stall watchdog; every backend can read safetensors headers by HTTP
+│   │                                   Range, so dtype and tensor shapes are checked before any weights are downloaded
 │   │
 │   ├── chain_guard/                HOTKEY-REUSE GUARD (imported by chain_reader): a `used_hotkeys` ledger seeded from every hotkey committed before CHAIN_START_BLOCK (all reveal versions); a hotkey is burned into the ledger after its submission finishes eval, so a hotkey can't re-submit to game the duel
 │   │   ├── scan.py                     scan_all_raw(): iterate every RevealedCommitment on the netuid
@@ -89,20 +84,21 @@ albedo/
 │   │   ├── db.py                       seed ledger from DB + record a hotkey after eval; ledger swaps + registration blocks
 │   │   └── uploads.py                  publish the guard ledger for the dashboard
 │   │
-│   ├── model_validation/         VALIDATE WORKER: claim submissions → download → validate → dedup → persist (the live file/arch/index/dtype authority for miners + validators)
-│   │   ├── validate_worker.py          end-to-end per-model: files→hashes→dtype-preflight→download→index→arch→sketch fingerprint→dedup gate
+│   ├── model_validation/         VALIDATE WORKER: claim submissions → validate → download → dedup → persist (the live file/hash/shape/index/dtype authority for miners + validators)
+│   │   ├── validate_worker.py          end-to-end per-model: files→dtype preflight (headers only)→chat-template + metadata hashes→tensor shapes (headers only)→download→index→sketch fingerprint→dedup gate
 │   │   ├── validate/repo.py            the LIVE strict file allowlist — REQUIRED_FILES / ALLOWED_FILES / globs on
 │   │   │                               `albedo_config` ModelValidationSettings (there is no model_validation/config.py any more)
 │   │   ├── validate/genesis_files.py   sha256 of every metadata file pinned to the genesis repo revision (metadata_hash)
 │   │   ├── validate/chat_template.py   chat_template.jinja + the copy embedded in tokenizer_config.json (chat_template_hash)
-│   │   ├── validate/architecture.py    spec-driven arch lock (validate/architecture_spec.json — no hardcoded family)
+│   │   ├── validate/tensor_shapes.py   every tensor's name + shape must equal the genesis seed's (1045 tensors), read from the safetensors headers before the download (tensor_shape); genesis_tensor_shapes.json is the in-package pin `check-model` uses without the 72 GB seed
 │   │   ├── validate/dtype.py           16-bit weight check: every safetensors shard must be F16/BF16 (rejects quantized / F32 / F64)
 │   │   ├── validate/safetensors_index.py  shard/index consistency: model.safetensors.index.json weight_map vs on-disk shards + tensors
-│   │   ├── storage/preflight.py        header-only dtype preflight via HTTP Range (reject non-16-bit before the full download)
+│   │   ├── storage/preflight.py        header-only safetensors read via HTTP Range — feeds the dtype and tensor-shape checks before the full download
 │   │   ├── storage/download.py         backend-agnostic fetch (HF or Hippius, chosen by the pin's shape) with a stall watchdog
 │   │   ├── dedup/                      the similarity gate (see Hippius validation): sketch.py (secret-seeded per-tensor sketch ψ·W·ω + weights at
 │   │   │                               secret sample positions), signals.py (distances / spectra / merge fits, all computed on sketches), verdict.py
-│   │   │                               (COPY, OWN-COPY exact; LINEAR-COMBO, NOISE-COPY, NOISED-COPY, SPARSE-EDIT, TRIVIAL-EDIT heuristic), gate.py
+│   │   │                               (COPY, OWN-COPY exact; LINEAR-COMBO, NOISE-COPY, NOISED-COPY, SPARSE-EDIT, TRIVIAL-EDIT heuristic — all seven
+│   │   │                               enforced in production, and every enforced reject blocks the hotkey permanently), gate.py
 │   │   │                               (run + enforcement), bank.py (OpenSearch kNN bank of accepted fingerprints), canon.py / layout.py / secret.py
 │   │   ├── uploads/artifacts.py        publish fault.json to S3 (best-effort)
 │   │   └── db.py                        state machine + lease/heartbeat (SUBMITTED→HIPPIUS_VALIDATED / TERMINAL_INVALID)
@@ -180,7 +176,7 @@ albedo/
 │
 ├── scripts/
 │   ├── create_genesis_king.py      seed genesis king_version + reign + reign_members (UID 0)
-│   ├── generate_arch_spec.py       regenerate architecture_spec.json from the genesis config (handles nested multimodal MoE via text_config)
+│   ├── prepare_datasets.py / build_manifest.py   rebuild the pinned eval dataset byte-for-byte (upstream revisions + pyarrow pinned) and its manifest
 │   ├── dedup_seed_bank.py          seed the dedup bank from a manifest of accepted models (dedup_bank_manifest.example.json)
 │   ├── eval_cache_cleanup.py       king-aware model-cache GC (keep active kings + seed + in-flight, drop the rest) — PM2 loop
 │   ├── cleanup_models.sh           hourly disk reclaim: delete model snapshots older than 4h from ALBEDO_MODEL_CACHE_DIR — PM2 cron
@@ -196,6 +192,7 @@ albedo/
 │
 ├── docs/
 │   ├── MINING.md                   miner-facing guide for the `albedo` CLI
+│   ├── PRIVATE_UPLOADS.md          private R2 submissions: activate → upload → ready; retries are miner-claimed (`albedo activate` again) and the validator's plaintext status.json in the mailbox says why the last attempt failed
 │   ├── SCORING.md                  checklist construction, loop short-circuit, win margin, anti-gaming
 │   ├── DATASETS.md                 the four corpora, observation formats, grounding + simulator ladder, sampling, manifest pin
 │   ├── eval-service-status.md      eval-stack runbook (services, ports, PM2, smoke mode)
@@ -218,7 +215,7 @@ on-chain v7 commit
   ▼  chain_reader            poll chain → chain_commits + model_submissions(SUBMITTED)
 SUBMITTED
   │
-  ▼  model_validation      download → file manifest → arch lock → sketch fingerprint → dedup gate
+  ▼  model_validation      file manifest → header preflight (dtype, tensor shapes) → genesis hashes → download → index → fingerprint → dedup gate
 HIPPIUS_RUNNING → HIPPIUS_VALIDATED          (fail → TERMINAL_INVALID / HIPPIUS_RETRYABLE)
   │
   ▼  requeuer                HIPPIUS_VALIDATED → PRE_EVAL_QUEUED
@@ -245,7 +242,7 @@ WEIGHT_SET_RUNNING → COMPLETE_CORONATED
 ```
 
 **Terminal states:** `COMPLETE_CORONATED` (won + crowned), `COMPLETE_LOSS` (eval'd, didn't dethrone),
-`TERMINAL_INVALID` (miner fault — bad artifact/arch/dup/injection), `TERMINAL_INFRA_FAILED` (gave up after retries).
+`TERMINAL_INVALID` (miner fault — bad artifact/shapes/dup/injection), `TERMINAL_INFRA_FAILED` (gave up after retries).
 
 **Recovery pattern (every stage):** a *sweeper* marks expired leases `*_RETRYABLE`; a *requeuer* moves
 retryable rows back to the queued state; the *dispatcher* only ever claims the queued state. Crashes
@@ -255,28 +252,18 @@ mid-stage are recovered by lease expiry, not by in-memory state.
 
 ## chain.toml — subnet constants
 
-Mirrors the subnet rules for the standalone `config_validation` commit-validator. Arch-lock keys, seed
-digest and the `[files]` allowlist are all current, and the `[files]` block now agrees
+Seed repo + digest, the challenger repo pattern and the `[files]` allowlist; the `[files]` block agrees
 with what miners and the backend actually enforce (the one difference: the live allowlist also tolerates
 `LICENSE`). The live file-manifest authority is `ModelValidationSettings` in `albedo_config/config.py`,
-read through `model_validation/validate/repo.py`; the arch authority is `validate/architecture_spec.json`
-(see *Validation internals* below).
+read through `model_validation/validate/repo.py`. There is no separate architecture lock any more: the
+architecture is pinned by `metadata_hash` (config.json byte-identical to genesis) and `tensor_shape`
+(every tensor's shape equal to the seed's) — see *Validation internals* below.
 
 ```toml
 [chain]
 name         = "Albedo"
 seed_repo    = "teutonic/qwen3.6-35b-a3b-genesis"
 repo_pattern = "^[^/]+/albedo-qwen3\\.6-35b-.+$"     # challenger naming, any namespace
-
-[arch]                                                # capacity keys, must match genesis exactly
-extra_lock_keys = [
-  "max_position_embeddings", "tie_word_embeddings", "rope_theta",
-  "hidden_size", "num_hidden_layers", "num_attention_heads",
-  "num_key_value_heads", "intermediate_size", "head_dim",
-  "moe_intermediate_size", "shared_expert_intermediate_size",   # MoE capacity
-  "num_experts", "num_experts_per_tok",
-]
-# vocab_size + model_type are always locked (config_validation COMPAT_KEYS)
 
 [seed]
 seed_digest = "sha256:efd5b8d0a1c1f472be56ff919419cdd0561bdecd9013d5c2a96dd0e23e89c165"
@@ -297,11 +284,11 @@ forbidden_globs     = ["*.py"]                        # no custom modeling code
 > `chat_template.jinja`, `preprocessor_config.json`, `video_preprocessor_config.json`;
 > **allows** only `model.safetensors.index.json`, `.gitattributes`, `LICENSE`, `README.md`.
 > Anything else — including `merges.txt`, `vocab.json`, `configuration.json`,
-> `special_tokens_map.json` — is an unexpected extra → `file_manifest` rejection. The arch lock
-> compares against `architecture_spec.json` (regenerated from the genesis by `generate_arch_spec.py`),
-> which pins `architectures = ["Qwen3_5MoeForConditionalGeneration"]`, `model_type = "qwen3_5_moe"`,
-> `vocab_size = 248320`, the capacity keys above, and the MoE keys (`num_experts = 256`,
-> `num_experts_per_tok = 8`, `moe_intermediate_size = 512`, `shared_expert_intermediate_size = 512`).
+> `special_tokens_map.json` — is an unexpected extra → `file_manifest` rejection. The architecture is
+> pinned without a key list: `config.json` must be byte-identical to genesis (`metadata_hash`), and every
+> safetensors tensor must carry the genesis seed's name and shape (`tensor_shape`, 1045 tensors, checked
+> from the shard headers before anything is downloaded) — a fine-tune passes, a rebuilt, resized, pruned
+> or quantized model does not.
 
 ---
 
@@ -343,7 +330,9 @@ albedo on                                         # interactive TUI
 ```
 
 `publish` runs all five steps and prompts before writing on-chain (`--yes` to skip, `--skip-commit`
-to stop after upload). Individual steps also exist: `upload`, `commit`, `check-commit`.
+to stop after upload). `publish`, `upload`, `submit-private` and `upload-private` all run the local
+validation first and refuse to upload an INVALID model (`--skip-check` overrides). Individual steps also
+exist: `upload`, `commit`, `check-commit`.
 
 ### What gets a model rejected
 
@@ -367,20 +356,22 @@ except where noted. Each maps to a `fault_code`.
    rejected (`weight_dtype`)
 6. **Safetensors index inconsistent** — a sharded checkpoint's `model.safetensors.index.json`
    weight_map must match the shards + tensors actually on disk (`safetensors_index`)
-7. `config.json` doesn't match the genesis arch spec on the lock keys (incl. the MoE keys), or
-   contains `auto_map` (remote code) / `quantization_config` (quantized) (`architecture`)
-8. **Duplicate** — weights identical to an accepted model, byte for byte or up to float noise, fault
-   as `duplicate` (another miner's model — permanently blocks the hotkey) or `duplicate_own`; a copy
-   whose only change from an accepted model is noise faults as `duplicate_heuristic` (`NOISE-COPY` /
-   `NOISED-COPY`). *Not* checked locally — the sketch bank lives in `model_validation`. Make your
-   model genuinely trained, not perturbed
+7. **Tensor shapes differ from the genesis seed** — every tensor in the safetensors headers must match
+   the seed's name and shape; a rebuilt, resized, pruned or quantized model fails here, checked before the
+   download so it costs one range request (`tensor_shape`)
+8. **Duplicate** — weights identical to an accepted model (`COPY`), a copy plus noise (`NOISE-COPY` /
+   `NOISED-COPY`), a blend of accepted models (`LINEAR-COMBO`), or an edit too small or too sparse to be
+   training (`TRIVIAL-EDIT` / `SPARSE-EDIT`). All seven reasons are enforced and every one faults as
+   `duplicate`, which **permanently blocks the hotkey**; re-submitting your own accepted model is
+   `duplicate_own` instead. *Not* checked locally — the sketch bank lives in `model_validation`. Make
+   your model genuinely trained, not perturbed or merged
 
-> **Note:** local `check-model --path` runs the file manifest + arch + safetensors index +
-> 16-bit dtype checks, but **not** the metadata-hash checks (#4) and **not** dedup (#8) — both run
-> only in `model_validation`; the `--repo/--digest` remote check runs only the file manifest + arch
-> (it lists the repo files and fetches `config.json`). Passing locally does not guarantee
-> acceptance — in particular, verify your metadata files are byte-identical to genesis yourself
-> (`sha256sum` them against the genesis repo).
+> **Note:** local `check-model --path` runs every check above except dedup (#8) — file manifest,
+> 16-bit dtype, chat-template + metadata hashes, tensor shapes (against the in-package pin
+> `genesis_tensor_shapes.json`) and the safetensors index. The `--repo/--digest` remote check runs the
+> same minus the index (it lists the repo files, fetches the metadata files and reads the shard headers).
+> Passing locally does not guarantee acceptance: dedup runs only in `model_validation`, and the validator
+> reads shapes from the real seed snapshot rather than the pin.
 
 ---
 
@@ -559,32 +550,36 @@ claim model_submissions oldest-first  (SUBMITTED | HIPPIUS_RETRYABLE)  → HIPPI
                       structurally at step 4)
   3. dtype preflight  header-only HTTP Range read of each shard — must be F16/BF16, else weight_dtype
                       (rejects quantized / F32 / F64 BEFORE the full download)
-  3.5 download        full repo from the committed hub (HF or Hippius) → ALBEDO_MODEL_CACHE_DIR
-  4. safetensors index  model.safetensors.index.json weight_map vs on-disk shards + tensors
-  5. architecture     config.json vs validate/architecture_spec.json (architectures + expected + forbidden_keys)
+  3.7 tensor shapes   the same headers: every tensor's name + shape must equal the genesis seed's
+                      (validate/tensor_shapes.py, seed read from the cached genesis snapshot) → tensor_shape
+                      — a rebuilt model is refused for one range request, not a multi-GB download
+  4. download         full repo from the committed hub (HF, Hippius or private R2) → ALBEDO_MODEL_CACHE_DIR
+  5. safetensors index  model.safetensors.index.json weight_map vs on-disk shards + tensors
   6. fingerprint      per-tensor secret-seeded sketch ψ·W·ω (K=64) + the weights at secret sample positions,
                       computed on GPU ALBEDO_DEDUP_GPU (model_validation/dedup/sketch.py)
   7. dedup gate       nearest ALBEDO_DEDUP_NEAREST_K (10) bank entries by OpenSearch kNN → signals on the sketches
                       (distances, spectra, merge fits) → verdict:
                         COPY / OWN-COPY   identical bytes, or relative distance < ALBEDO_DEDUP_COPY_REL (1e-5) → always fault
-                        NOISE-COPY / NOISED-COPY / LINEAR-COMBO / SPARSE-EDIT / TRIVIAL-EDIT   heuristic — recorded; fault
-                                          only when listed in ALBEDO_DEDUP_ENFORCE_REASONS (gated by ALBEDO_DEDUP_ENFORCE)
+                        NOISE-COPY / NOISED-COPY / LINEAR-COMBO / SPARSE-EDIT / TRIVIAL-EDIT   heuristic — fault when listed in
+                                          ALBEDO_DEDUP_ENFORCE_REASONS (gated by ALBEDO_DEDUP_ENFORCE); production lists all seven.
+                                          Every enforced reject is `duplicate`, a permanent hotkey block (OWN-COPY → duplicate_own)
   success → HIPPIUS_VALIDATED ; fingerprint added to the bank
   miner fault → TERMINAL_INVALID + fault.json
                 (file_manifest | chat_template_hash | metadata_hash | weight_dtype | safetensors_index
-                 | architecture | duplicate | duplicate_own | duplicate_heuristic | hotkey_already_validated)
+                 | tensor_shape | duplicate | duplicate_own | hotkey_already_validated)
   infra fault → HIPPIUS_RETRYABLE (≤ 5 attempts) → TERMINAL_INFRA_FAILED
 ```
 
 - **One validated model per hotkey:** a later commit from an already-validated hotkey fails with
   `hotkey_already_validated`. Hotkey *reuse across submissions* is separately blocked by `chain_guard`
   (its ledger burns a hotkey after eval — see *Repository layout*).
-- **Spec-driven arch lock:** `architecture.py` reads a JSON spec, so changing the locked model family
-  needs no code change — regenerate with `scripts/generate_arch_spec.py`.
-- **Where the checks live:** the live file / arch / safetensors-index / dtype checks the miner CLI and
-  this worker both run come from `model_validation.validate`. `config_validation` backs the separate
-  commit-validator and supplies the miner's Hippius download/list utilities + `ModelRef`. The local
-  `check-model` skips only the dedup gate.
+- **No architecture key list:** the architecture follows from `config.json`, which `metadata_hash` already
+  pins byte-for-byte, so the shape check is what catches a rebuilt model whose config was copied over.
+  When the seed rotates, regenerate the in-package pin with
+  `python -m model_validation.validate.tensor_shapes <seed_dir>`.
+- **Where the checks live:** every check the miner CLI and this worker run comes from
+  `model_validation.validate`; `config_validation` is only the shared `ModelRef` + HF/Hippius/S3 download
+  layer. The local `check-model` skips only the dedup gate.
 
 ---
 
@@ -750,8 +745,8 @@ Full reference in [.env.example](../.env.example) (backend + GPU host) and [.env
 | `ALBEDO_JUDGE_SOTA_TRAJECTORY_TURNS` | reference-trajectory length (default 8) |
 | `ALBEDO_JUDGE_REFERENCE_RUNS` | reference trajectories generated per sample (default 3); below two usable runs the sample is dropped |
 | `ALBEDO_JUDGE_REFERENCE_PRUNE` | judge every reference run against the checklist and drop what none of them earns (default true); costs one judge call per run per sample at prep |
-| `ALBEDO_JUDGE_SIMULATION_MODEL` | observation-simulator model (default `deepseek/deepseek-v4-flash-0731`; empty → evaluator model) |
-| `ALBEDO_JUDGE_SIMULATION_PROVIDERS` | provider list for the simulator, tried as one rung each in rotation (default `deepseek,cloudflare`; empty → no pin) |
+| `ALBEDO_JUDGE_SIMULATION_MODEL` | observation-simulator model (default `deepseek/deepseek-v4.1-flash`; empty → evaluator model) |
+| `ALBEDO_JUDGE_SIMULATION_PROVIDERS` | provider list for the simulator, tried as one rung each in rotation (default `deepseek,siliconflow,novita,gmicloud`; empty → no pin) |
 | `ALBEDO_JUDGE_MILESTONE_READINGS` | independent extractor readings, merged by union into the milestone vector (default 4) |
 | `ALBEDO_JUDGE_QUESTION_READINGS` | independent ladder writers, merged by majority (default 3) |
 | `ALBEDO_JUDGE_JUDGE_REPEATS` | judgings per trajectory; a question's answer is the majority (default 3) |
@@ -772,7 +767,8 @@ Full reference in [.env.example](../.env.example) (backend + GPU host) and [.env
 | Variable | Purpose |
 |---|---|
 | `ALBEDO_OPENSEARCH_URL` / `_USER` / `_PASSWORD` / `_INDEX` | dedup bank (kNN index of accepted fingerprints) |
-| `ALBEDO_DEDUP_SECRET` / `_SECRET_FILE`, `_GPU`, `_NEAREST_K`, `_COPY_REL`, `_ENFORCE`, `_ENFORCE_REASONS` | sketch seed, GPU, neighbours checked, copy tolerance, enforcement switch and which verdicts fault (default `COPY,OWN-COPY`) |
+| `ALBEDO_DEDUP_SECRET` / `_SECRET_FILE`, `_GPU`, `_NEAREST_K`, `_COPY_REL`, `_ENFORCE`, `_ENFORCE_REASONS` | sketch seed, GPU, neighbours checked, copy tolerance, enforcement switch and which verdicts fault (default and production: all seven — `COPY,OWN-COPY,NOISE-COPY,NOISED-COPY,LINEAR-COMBO,SPARSE-EDIT,TRIVIAL-EDIT`) |
+| `ALBEDO_SHAPE_ENFORCE` | tensor-shape gate enforced (default `true`; `false` = shadow mode, mismatches logged only) |
 | `ALBEDO_MODEL_CACHE_DIR` | downloaded model cache |
 | `ALBEDO_S3_*`, `HIPPIUS_HUB_TOKEN` | artifact + model store auth |
 

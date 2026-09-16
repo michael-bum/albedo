@@ -448,6 +448,7 @@ CREATE TABLE IF NOT EXISTS private_registrations (
     credential_expires_at TIMESTAMPTZ,
     fault_message TEXT,
     attempt_count INT NOT NULL DEFAULT 1,
+    extra_attempts INT NOT NULL DEFAULT 0,  -- granted when a failed attempt was the validator's fault
     model_prefix TEXT,
     submission_id UUID REFERENCES model_submissions(id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -456,6 +457,8 @@ CREATE TABLE IF NOT EXISTS private_registrations (
         ('ACTIVATED', 'CREDENTIALED', 'READY', 'REVOKED', 'SUBMITTED', 'FAILED', 'REAPED')),
     CONSTRAINT private_registrations_hotkey_uk UNIQUE (netuid, hotkey)
 );
+
+ALTER TABLE private_registrations ADD COLUMN IF NOT EXISTS extra_attempts INT NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS private_registrations_state_updated_idx
     ON private_registrations (state, updated_at);

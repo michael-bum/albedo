@@ -82,7 +82,7 @@ async def _apply_activate(pool: asyncpg.Pool, signal: PrivateSignal) -> int:
                     OR (state = 'SUBMITTED' AND submission_id IS NULL)
                     OR state = 'FAILED' )
               AND $3 > activation_block
-              AND attempt_count < $4
+              AND attempt_count < $4 + extra_attempts
             RETURNING attempt_count
             """,
             rid,

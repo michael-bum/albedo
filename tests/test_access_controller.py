@@ -93,6 +93,7 @@ class FakeConn:
                 "submission_pubkey": args[5],
                 "state": "ACTIVATED",
                 "attempt_count": 1,  # schema default
+                "extra_attempts": 0,
                 "ready_block": None,
                 "ready_block_hash": None,
                 "manifest_sha256": None,
@@ -121,7 +122,7 @@ class FakeConn:
                 row
                 and (live_rekey or retry_marked)
                 and args[2] > row["activation_block"]  # only a newer activate applies
-                and row["attempt_count"] < args[3]
+                and row["attempt_count"] < args[3] + row.get("extra_attempts", 0)
             ):
                 return None
             row.update(
@@ -176,7 +177,7 @@ class FakeConn:
                 row
                 and row["state"] == "SUBMITTED"
                 and row.get("submission_state") == "TERMINAL_INVALID"
-                and row["attempt_count"] < args[0]
+                and row["attempt_count"] < args[0] + row.get("extra_attempts", 0)
             ):
                 return [row]
             return []
@@ -366,6 +367,15 @@ def test_intake_refuses_a_retry_once_attempts_are_spent():
         assert conn.registration["attempt_count"] == SETTINGS.max_attempts
 
 
+def test_a_granted_extra_attempt_lets_a_capped_registration_activate_again():
+    """An attempt lost to a validator fault is given back as one more, on a fresh prefix."""
+    capped = _seeded_row()
+    capped.update(state="FAILED", attempt_count=SETTINGS.max_attempts, extra_attempts=1)
+    conn = FakeConn(capped)
+    assert _apply(conn, [_activate_signal(block=200)]) == 1
+    assert conn.registration["attempt_count"] == SETTINGS.max_attempts + 1
+
+
 def test_intake_rejects_malformed_used_hotkeys_and_unregistered():
     malformed = _activate_signal(payload="r2activate:v1:not-a-valid-pubkey")
     assert _apply(FakeConn(), [malformed]) == 0
@@ -425,6 +435,7 @@ def _seeded_row() -> dict:
         "submission_pubkey": SUBMISSION_PUBKEY.hex(),
         "state": "ACTIVATED",
         "attempt_count": 1,  # decides which prefix this attempt owns
+        "extra_attempts": 0,
         "model_prefix": None,  # set by _credential; NULL rows fall back to attempt 1's prefix
         "ready_block": None,
         "ready_block_hash": None,
@@ -725,6 +736,7 @@ def _submitted_row(
         "hotkey": HOTKEY,
         "state": "SUBMITTED",
         "attempt_count": attempt,
+        "extra_attempts": 0,
         "model_prefix": None,
         "submission_state": sub_state,  # models the JOIN to model_submissions.state
         "fault_code": fault_code,
@@ -797,6 +809,18 @@ def test_resubmit_terminal_stops_at_max_attempts():
     conn = FakeConn(_submitted_row(attempt=SETTINGS.max_attempts))  # out of attempts
     assert asyncio.run(controller.resubmit_terminal(FakePool(conn), make_deps(FakeS3()))) == 0
     assert conn.registration["state"] == "SUBMITTED"  # not resurrected
+
+
+def test_resubmit_and_status_honour_a_granted_extra_attempt():
+    s3 = FakeS3()
+    row = _submitted_row(attempt=SETTINGS.max_attempts, fault_code="failed")
+    row["extra_attempts"] = 1
+    conn = FakeConn(row)
+    assert asyncio.run(controller.resubmit_terminal(FakePool(conn), make_deps(s3))) == 1
+    st = _status(s3)
+    assert st["max_upload_attempts"] == SETTINGS.max_attempts + 1
+    assert st["upload_attempts_left"] == 1
+    assert f"attempt {SETTINGS.max_attempts + 1} of {SETTINGS.max_attempts + 1}" in st["next"]
 
 
 def test_resubmit_terminal_skips_sanity_blocked_cheaters():

@@ -119,7 +119,7 @@ async def _publish_status(
     """
     rid = row["registration_id"]
     try:
-        used, maximum = row["attempt_count"], deps.settings.max_attempts
+        used, maximum = row["attempt_count"], deps.settings.max_attempts + row["extra_attempts"]
         left = max(0, maximum - used)
         strikes = await mv_db.hotkey_preeval_fail_count(pool, row["hotkey"])
         max_strikes = _max_strikes()
@@ -355,7 +355,8 @@ async def sweep_credentialed(pool: asyncpg.Pool, deps: Deps) -> int:
     """
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, registration_id, hotkey, parent_token_id, attempt_count, model_prefix,"
+            "SELECT id, registration_id, hotkey, parent_token_id, attempt_count, extra_attempts,"
+            " model_prefix,"
             " EXTRACT(EPOCH FROM (now() - updated_at)) AS age_s"
             " FROM private_registrations WHERE state = 'CREDENTIALED'"
         )
@@ -477,7 +478,7 @@ async def _reset_for_retry(pool: asyncpg.Pool, deps: Deps, row: asyncpg.Record) 
         "[access-controller] retry available for {} — {} of {} attempts used",
         rid,
         row["attempt_count"],
-        deps.settings.max_attempts,
+        deps.settings.max_attempts + row["extra_attempts"],
     )
     await _publish_status(
         deps,
@@ -503,11 +504,12 @@ async def resubmit_terminal(pool: asyncpg.Pool, deps: Deps) -> int:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT pr.id, pr.registration_id, pr.hotkey, pr.attempt_count, ms.fault_code
+            SELECT pr.id, pr.registration_id, pr.hotkey, pr.attempt_count, pr.extra_attempts,
+                   ms.fault_code
             FROM private_registrations pr
             JOIN model_submissions ms ON ms.id = pr.submission_id
             WHERE pr.state = 'SUBMITTED' AND ms.state = 'TERMINAL_INVALID'
-              AND pr.attempt_count < $1
+              AND pr.attempt_count < $1 + pr.extra_attempts
             """,
             deps.settings.max_attempts,
         )

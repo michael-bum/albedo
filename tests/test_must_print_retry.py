@@ -4,7 +4,11 @@ import asyncio
 
 from albedo_config import JudgeSettings
 from albedo_eval_service.judge_llm_client import JudgeRawResponse
-from albedo_eval_service.shared.observation_format import has_content, requires_output
+from albedo_eval_service.shared.observation_format import (
+    empty_output,
+    has_content,
+    requires_output,
+)
 from albedo_eval_service.simulator.prompt_simulator import MUST_PRINT_RETRY
 from sanity_service import dispatcher as D
 
@@ -771,3 +775,60 @@ def test_eval_accept_now_rejects_what_preeval_rejects():
     assert _usable_simulation_output(fabricated, "returncode", command="git diff"), (
         "a sed error under a non-sed command is not this check's business"
     )
+
+
+def test_a_grep_first_chain_ending_in_a_named_read_is_re_asked():
+    chain = "grep -n 'func Sanitize' pkg/codegen/utils.go && sed -n '58,90p' pkg/codegen/utils.go"
+    assert requires_output(chain)
+    client = _Client(_SILENT, _REAL)
+    assert _simulate(client, chain) == _REAL
+    assert len(client.calls) == 2
+
+
+def test_a_quiet_by_design_command_does_not_break_a_run_of_silence():
+    """A quiet edit between empty must-print reads must not rearm the INFRA guard from zero."""
+    import sanity_service.dispatcher as mod
+
+    state = _state()
+    state.submit_marker = "NEVER_MATCHES"
+    turns = [_READ, "sed -i 's/a/b/' src/style.rs"] * (mod.MAX_CONSECUTIVE_SILENT_OBSERVATIONS - 1)
+    turns += [_READ, _READ]
+
+    async def _silent(**_kwargs):
+        return _SILENT
+
+    original = mod._simulate_observation
+    mod._simulate_observation = _silent
+    try:
+        for index, command in enumerate(turns):
+            state.turns.append(
+                {"role": "assistant", "content": f"```bash\n{command}\n```", "score_target": True}
+            )
+            asyncio.run(mod._append_observations([state], "run", index))
+            if state.error:
+                break
+    finally:
+        mod._simulate_observation = original
+    assert "consecutive commands with no output" in state.error
+
+
+def test_a_leaked_turn_is_never_memoised():
+    leak = "The sed command didn't insert correctly. Let me verify.\n```bash\ncat -n a.yml\n```"
+    real = "<returncode>0</returncode>\n<output>\n1\tname: cache\n</output>"
+    state = _state()
+    client = _Client(leak, leak, leak, real)
+
+    def run(command: str) -> str:
+        return asyncio.run(
+            D._simulate_observation(
+                client=client,
+                settings=JudgeSettings(engy_api_key=""),
+                eval_run_id="run",
+                state=state,
+                assistant_output=f"THOUGHT: read it\n\n```bash\n{command}\n```",
+            )
+        )
+
+    first = run("cat -n a.yml")
+    assert first == empty_output("returncode") or "```" not in first
+    assert run("cat -n a.yml") == real, "the second identical read was asked again, not replayed"

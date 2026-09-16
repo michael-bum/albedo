@@ -87,6 +87,7 @@ from sanity_service.chain import (
     malformed_structure,
     micro_instruction,
     micro_target_touched,
+    same_request,
     segment_has_edit,
     should_reject,
     unread_edited_files,
@@ -1016,11 +1017,10 @@ async def _append_observations(
                 )
                 result = recovered
         _append_observation(state, result)
-        state.consecutive_silent_observations = (
-            state.consecutive_silent_observations + 1
-            if silent_observation(result) and not quiet_by_design
-            else 0
-        )
+        if silent_observation(result) and not quiet_by_design:
+            state.consecutive_silent_observations += 1
+        elif not quiet_by_design:
+            state.consecutive_silent_observations = 0
         if state.consecutive_silent_observations >= MAX_CONSECUTIVE_SILENT_OBSERVATIONS:
             state.error = (
                 f"simulator answered {state.consecutive_silent_observations} consecutive "
@@ -1089,7 +1089,7 @@ def _advance_segment(
     )
     first = state.segment == "micro"
     state.segment_index += not first
-    repeated = followup.strip() in state.asked
+    repeated = any(same_request(followup, asked, state.submit_clause) for asked in state.asked)
     state.asked.append(followup.strip())
     if not followup.strip() or repeated:
         state.stopped = True
@@ -1173,14 +1173,10 @@ async def _simulate_observation(
     assistant_output: str,
     repo_context: RepoContextClient | None = None,
 ) -> str:
+    command = first_bash_command(assistant_output)
+    fmt = detect_format(state.sample_id, state.messages)
     key = hashlib.sha1(
-        "\0".join(
-            (
-                state.sample_id,
-                _state_fingerprint(state),
-                first_bash_command(assistant_output),
-            )
-        ).encode("utf-8", "replace")
+        "\0".join((state.sample_id, _state_fingerprint(state), command)).encode("utf-8", "replace")
     ).hexdigest()
     return await state.observation_memo.observe(
         key,
@@ -1192,6 +1188,16 @@ async def _simulate_observation(
             assistant_output=assistant_output,
             repo_context=repo_context,
         ),
+        store=lambda observation: _cacheable_observation(observation, fmt, command),
+    )
+
+
+def _cacheable_observation(observation: str, fmt: str, command: str) -> bool:
+    """Only an answer the model can act on is worth serving again for the same read."""
+    return (
+        _usable_observation(observation, fmt, command)
+        and not leaked_turn(observation)
+        and not (silent_observation(observation) and not prints_nothing_on_success(command))
     )
 
 
@@ -1207,6 +1213,8 @@ def _unusable_observation_reason(raw: str, fmt: str, command: str) -> str:
     """Which check _usable_observation failed, for the retry log."""
     if not valid_output(raw, fmt):
         return "invalid_format"
+    if leaked_turn(raw):
+        return "leaked_turn"
     if degenerate_observation(raw):
         return "degenerate_lines"
     if narrated_observation(raw, fmt):

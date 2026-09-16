@@ -26,7 +26,13 @@ class ObservationMemo:
         while len(self._memo) > self._max_entries:
             self._memo.pop(next(iter(self._memo)))
 
-    async def observe(self, key: str, produce: Callable[[], Awaitable[str]]) -> str:
+    async def observe(
+        self,
+        key: str,
+        produce: Callable[[], Awaitable[str]],
+        *,
+        store: Callable[[str], bool] | None = None,
+    ) -> str:
         stored = self._memo.get(key)
         if stored is not None:
             return stored
@@ -36,5 +42,6 @@ class ObservationMemo:
             self._inflight[key] = task
             task.add_done_callback(lambda _: self._inflight.pop(key, None))
         observation = await asyncio.shield(task)
-        self.remember(key, observation)
+        if store is None or store(observation):
+            self.remember(key, observation)
         return observation

@@ -12,7 +12,7 @@ from .git_sim import GitState, apply_git
 _ENVELOPE = re.compile(r"</?returncode>\d*|<output>|</output>")
 _OUTPUT_BLOCK = re.compile(r"<output>\n?(.*?)\n?</output>", re.S)
 _TRAILER = re.compile(
-    r"^\s*\[(The command (completed|timed out)|Current working directory|"
+    r"^\s*\[(The command (completed|finished|timed out)|Current working directory|"
     r"Python interpreter|Command finished)\b.*\]\s*$"
 )
 _EMPTY_SENTENCE = "Your command ran successfully and did not produce any output."

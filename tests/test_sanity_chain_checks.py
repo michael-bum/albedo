@@ -404,3 +404,83 @@ def test_edit_regex_covers_write_redirects_but_not_lookalikes():
         "<p>a.b</p>",
     ]:
         assert not _EDIT_RE.search(cmd), cmd
+
+
+def test_same_request_ignores_the_submit_sentence_we_append():
+    from sanity_service.chain import followup_instruction, same_request
+
+    raw = "The `__deepcopy__` rename looks good, but `__copy__` still needs the same memo guard."
+    shown = followup_instruction(raw, CLAUSE, first=False)
+    assert same_request(raw, shown, CLAUSE)
+    assert same_request(shown, raw, CLAUSE)
+    assert same_request(raw, raw + "\n\n" + f"Submit the same way when done: {CLAUSE}", CLAUSE)
+    assert not same_request(raw, "Please also update the CHANGELOG entry for this fix.", CLAUSE)
+    assert not same_request("add a docstring", "add a test", CLAUSE)
+
+
+def test_a_followup_that_only_adds_our_submit_sentence_stops_the_session():
+    from sanity_service import dispatcher as D
+
+    state = D._TrajectoryState(
+        sample_id="s0", prompt="p", messages=[{"role": "user", "content": "task"}], turns=[]
+    )
+    state.submit_clause = CLAUSE
+    state.segment = "followup_3"
+    first = "The patch looks good — the `__deepcopy__` implementation is correct. One more thing: document `__bool__`."  # noqa: E501
+    state.turns.append({"role": "assistant", "content": _bash(CLAUSE), "score_target": True})
+    D._advance_segment(state, _bash(CLAUSE), first, turn_index=0)
+    assert not state.stopped
+    regurgitated = f"{first}\n\nSubmit the same way when done: {CLAUSE}"
+    state.turns.append({"role": "assistant", "content": _bash(CLAUSE), "score_target": True})
+    D._advance_segment(state, _bash(CLAUSE), regurgitated, turn_index=1)
+    assert state.stopped is True
+
+
+def test_a_microtask_naming_an_absent_function_loses_the_symbol_and_the_message():
+    state = _state(
+        [{"role": "user", "content": "repo has pkg/codegen/utils.go with ToCamelCase()"}]
+    )
+    bad = json.dumps(
+        {
+            "file": "pkg/codegen/utils.go",
+            "function": "SanitizeFieldName",
+            "request": "make the sanitizer keep leading underscores",
+            "message": f"Before the main issue, fix SanitizeFieldName in utils.go. Run exactly: {CLAUSE}",  # noqa: E501
+        }
+    )
+    micro = asyncio.run(
+        generate_microtask(_Judge([bad]), SimpleNamespace(evaluator_model="eval"), state, CLAUSE)
+    )
+    assert micro["request"] == "make the sanitizer keep leading underscores"
+    assert micro["function"] == "" and micro["message"] == ""
+
+
+def test_a_microtask_naming_a_function_present_in_context_keeps_it():
+    state = _state(
+        [{"role": "user", "content": "repo has pkg/codegen/utils.go with ToCamelCase()"}]
+    )
+    good = json.dumps(
+        {
+            "file": "pkg/codegen/utils.go",
+            "function": "ToCamelCase",
+            "request": "keep leading underscores",
+            "message": f"Fix ToCamelCase first. Run exactly: {CLAUSE}",
+        }
+    )
+    micro = asyncio.run(
+        generate_microtask(_Judge([good]), SimpleNamespace(evaluator_model="eval"), state, CLAUSE)
+    )
+    assert micro["function"] == "ToCamelCase" and micro["message"]
+
+
+def test_ungrounded_reason_flags_an_invented_symbol_like_an_invented_path():
+    ctx = "pkg/codegen/utils.go\nfunc ToCamelCase(s string) string {"
+    assert "symbols absent" in ungrounded_reason(
+        "Before you go on, make `SanitizeFieldName` keep leading underscores.", ctx, CLAUSE
+    )
+    assert "symbols absent" in ungrounded_reason(
+        "Also fix func RefPathToGoType please.", ctx, CLAUSE
+    )
+    # symbols the session showed, dotted attributes, and plain English in backticks pass
+    assert not ungrounded_reason("Please make `ToCamelCase` keep leading underscores.", ctx, CLAUSE)
+    assert not ungrounded_reason("The `true` branch and `utils.go` look fine, submit.", ctx, CLAUSE)

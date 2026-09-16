@@ -458,3 +458,67 @@ def test_narrated_observation_rejects_the_simulator_speaking_as_the_agent():
     assert not narrated_observation("README.md\nI_will_not_match.txt\nsetup.py", OPENHANDS)
     assert not narrated_observation("Looking at the logs, nothing failed.", OPENHANDS)
     assert not narrated_observation("", OPENHANDS)
+
+
+def test_a_finished_trailer_is_stripped_like_a_completed_one():
+    from albedo_eval_service.shared.observation_format import has_content, silent_observation
+
+    drifted = (
+        "[The command finished with exit code 0.]\n"
+        "[Current working directory: /workspace/getmoto__moto__1.0]\n"
+        "[Python interpreter: /usr/local/bin/python]\n"
+        "[Command finished with exit code 0]"
+    )
+    assert observation_body(drifted, OPENHANDS) == ""
+    assert silent_observation(drifted)
+    assert not has_content(drifted, OPENHANDS)
+    for verb in ("completed", "finished", "timed out"):
+        assert observation_body(f"x\n[The command {verb} with exit code 0.]", OPENHANDS) == "x"
+
+
+def test_prose_ending_in_a_bash_fence_is_a_leaked_turn():
+    from albedo_eval_service.shared.observation_format import leaked_turn
+
+    # the three real leaks that were served as shell output and then memoised
+    leaks = (
+        "The sed command didn't insert correctly. Let me verify the current state and use a "
+        "different approach to insert the new step.\n```bash\ncat -n action.yml | sed -n '32,45p'\n```",  # noqa: E501
+        "The user is pointing out that my `if` condition uses `inputs.runner_os == 'macOS'`.\n"
+        "```bash\ncat -n action.yml | sed -n '36,40p'\n```",
+        "<returncode>0</returncode>\n<output>\nThe `setup_serializers` function is the right place.\n"  # noqa: E501
+        "```bash\nsed -n '40,60p' app.py\n```\n</output>",
+    )
+    for leak in leaks:
+        assert leaked_turn(leak), leak[:60]
+    # a file view that merely contains a fence, real content after it: not a leak
+    assert not leaked_turn("# Install\n```bash\npip install x\n```\nThen run the tests.")
+    assert not leaked_turn(
+        "9:def check_symlinks(filename):\n[The command completed with exit code 0.]"
+    )
+    assert not leaked_turn("")
+
+
+def test_a_chain_ending_in_a_named_read_must_print():
+    from albedo_eval_service.shared.observation_format import (
+        MUST_PRINT,
+        is_file_read,
+        output_expectation,
+    )
+
+    chains = (
+        "grep -rn foo src && sed -n '1,20p' a.py",
+        "cd /workspace/repo && git checkout pkg/codegen/utils.go && sed -n '58,90p' pkg/codegen/utils.go",  # noqa: E501
+        "cd /workspace/repo; sed -n '1,5p' f.py",
+        "sed -n '58,85p' pkg/x.go && go build ./...",
+    )
+    for chain in chains:
+        assert output_expectation(chain) == MUST_PRINT, chain
+        assert is_file_read(chain), chain
+    # the single-stage answers are unchanged
+    assert output_expectation("sed -n '340,550p' src/style.rs") == MUST_PRINT
+    assert output_expectation("grep -n 'def x' a.py") != MUST_PRINT
+    assert output_expectation("git diff") != MUST_PRINT
+    assert output_expectation("sed -i 's/a/b/' a.py") != MUST_PRINT
+    # a redirect or heredoc anywhere still means the chain may be silent
+    assert output_expectation("grep x src && sed -n '1,5p' a.py > out.txt") != MUST_PRINT
+    assert output_expectation("python3 - <<'EOF'\nprint(1)\nEOF") != MUST_PRINT

@@ -33,6 +33,7 @@ from albedo_eval_service.shared.observation_format import (
     RETURNCODE,
     SWE_AGENT,
     abandonment_notice,
+    command_contract,
     empty_output,
     truncation_notice,
     valid_output,
@@ -1407,3 +1408,60 @@ def test_a_git_command_the_snapshot_can_compute_never_reaches_the_memo():
     assert first == second == "<returncode>0</returncode>\n<output>\nM app.py\n</output>"
     assert client.calls == 0
     assert service._observations._memo == {}
+
+
+def test_the_must_print_retry_rejects_a_pure_command_echo():
+    class _Echo:
+        async def complete(self, **kwargs):
+            return JudgeRawResponse(
+                model=kwargs["model"],
+                provider="fake",
+                raw="<returncode>0</returncode>\n<output>\nsed -n '1,5p' a.py\n</output>",
+            )
+
+    service = ObservationSimulationService(JudgeSettings(simulation_model=""), _Echo(), None)
+    silent = empty_output(RETURNCODE)
+    recovered = asyncio.run(
+        service._retry_for_output(
+            SimulateObservationRequest(
+                eval_run_id="run",
+                sample_id="mini-coder/x:0:0",
+                prompt="task",
+                messages=[{"role": "user", "content": "task"}],
+                assistant_output="```bash\nsed -n '1,5p' a.py\n```",
+            ),
+            "sed -n '1,5p' a.py",
+            RETURNCODE,
+            None,
+            "$ sed -n '1,5p' a.py",
+            command_contract("sed -n '1,5p' a.py"),
+            silent,
+        )
+    )
+    assert recovered == silent
+
+
+def test_a_leaked_turn_is_not_memoised_on_the_eval_side():
+    class _LeakThenReal:
+        def __init__(self):
+            self.calls = 0
+
+        async def complete(self, **kwargs):
+            self.calls += 1
+            raw = (
+                "<returncode>0</returncode>\n<output>\nLet me check the file first.\n"
+                "```bash\ncat -A app.py\n```\n</output>"
+                if self.calls < 6
+                else "<returncode>0</returncode>\n<output>\nreal content\n</output>"
+            )
+            return JudgeRawResponse(model=kwargs["model"], provider="fake", raw=raw)
+
+    client = _LeakThenReal()
+    service = ObservationSimulationService(
+        JudgeSettings(simulation_model=""), client, _StatefulRepoContext(["s0"] * 10)
+    )
+    first = _observe(service, "cat -A app.py")
+    assert "```" not in first, "a leaked turn is disposed of, not served"
+    calls_after_first = client.calls
+    _observe(service, "cat -A app.py")
+    assert client.calls > calls_after_first, "the identical read was asked again, not replayed"

@@ -157,3 +157,71 @@ def test_loop_check_sees_both_harness_syntaxes():
 
     mixed = fenced[:5] + tagged[:5]
     assert loop_stats(mixed)["max_cmd_run"] == 10
+
+
+_EMPTY_OH = (
+    "[The command finished with exit code 0.]\n[Current working directory: /w]\n"
+    "[Command finished with exit code 0]"
+)
+_CONTENT_OH = "   139\tdef cast_function_modin2pandas(func):\n   140\t    return func\n[Command finished with exit code 0]"  # noqa: E501
+
+
+def test_a_re_issue_after_a_silent_must_print_observation_is_not_counted():
+    from albedo_eval_service.shared.loop_check import unanswered
+
+    read = "sed -n '278,295p' moto/eks/models.py"
+    turns = [_turn("sed -i '1a x' moto/eks/models.py")] + [_turn(read)] * 13
+    observations = [_EMPTY_OH] * len(turns)
+    assert unanswered(read, _EMPTY_OH)
+    assert loop_verdict(turns).looped, "without observations the old verdict stands"
+    verdict = loop_verdict(turns, observations)
+    assert not verdict.looped
+    assert verdict.n_cmds == 2 and verdict.max_cmd_run == 1
+
+
+def test_a_re_issue_after_a_command_echo_or_a_leaked_turn_is_not_counted():
+    from albedo_eval_service.shared.loop_check import unanswered
+
+    read = "cat -n action.yml | sed -n '32,45p'"
+    echo = f"{read}\n[The command completed with exit code 0.]"
+    leak = f"The sed command didn't insert correctly. Let me verify.\n```bash\n{read}\n```"
+    assert unanswered(read, echo) and unanswered(read, leak)
+    turns = [_turn(read)] * 17
+    assert loop_verdict(turns, [leak] * 17).n_cmds == 1
+    assert not loop_verdict(turns, [echo] * 17).looped
+
+
+def test_fifteen_identical_reads_answered_with_real_content_still_loop():
+    read = "cat -n modin/pandas/utils.py | sed -n '139,160p'"
+    turns = [_turn(read)] * 15
+    verdict = loop_verdict(turns, [_CONTENT_OH] * 15)
+    assert verdict.looped and verdict.max_cmd_run == 15
+
+
+def test_a_re_issue_is_excused_only_for_the_same_command():
+    reads = ["cat a.py", "cat b.py"] * 10
+    verdict = loop_verdict([_turn(c) for c in reads], [_EMPTY_OH] * len(reads))
+    assert verdict.looped, "alternating reads after silence are still a loop, not a re-ask"
+
+
+def test_the_document_verdict_pairs_each_turn_with_its_observation():
+    parts = ["FULL CANDIDATE TRAJECTORY", "Score ONLY CANDIDATE OUTPUT 1."]
+    read = "sed -n '278,295p' models.py"
+    parts.append(f"\nCANDIDATE OUTPUT 1:\n------\n{_turn('sed -i 1a models.py')}\n------")
+    parts.append(
+        f"\nENVIRONMENT OBSERVATION (context only, do not score):\n------\n{_EMPTY_OH}\n------"
+    )
+    for index in range(2, 15):
+        parts.append(f"\nCANDIDATE OUTPUT {index}:\n------\n{_turn(read)}\n------")
+        parts.append(
+            f"\nENVIRONMENT OBSERVATION (context only, do not score):\n------\n{_EMPTY_OH}\n------"
+        )
+    document = "\n".join(parts)
+    assert loop_verdict(candidate_turns(document)).looped
+    assert not loop_verdict_for_document(document).looped
+
+
+def test_commands_of_without_observations_is_unchanged():
+    turns = [_turn("ls"), _turn("ls"), _turn("cat a.py")]
+    assert commands_of(turns) == ["ls", "ls", "cat a.py"]
+    assert commands_of(turns, [None, None, None]) == ["ls", "ls", "cat a.py"]

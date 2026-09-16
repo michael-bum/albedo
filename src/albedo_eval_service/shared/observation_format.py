@@ -123,7 +123,14 @@ def stuttered_lines(raw: str) -> str:
 
 
 def leaked_turn(raw: str) -> bool:
-    return bool(_ROLE_MARKER.match((raw or "").strip()))
+    """A transcript turn served as shell output: it opens with a role marker, or it is prose that
+    ends in a fenced command. A file view that merely contains a fence mid-way is not one."""
+    text = (raw or "").strip()
+    if _ROLE_MARKER.match(text):
+        return True
+    body = observation_body(raw, classify(raw))
+    blocks = list(_ACTION_BLOCK_RE.finditer(body))
+    return bool(blocks) and not body[blocks[-1].end() :].strip()
 
 
 def echoed_command(command: str, raw: str) -> bool:
@@ -359,8 +366,9 @@ def unmask_fenced_spans(text: str, spans: list[str]) -> str:
     return text
 
 
+# the simulator drifts "completed" to "finished"; unstripped, an empty observation reads as content
 _TRAILER_RE = re.compile(
-    r"^\s*\[(?:The command (?:completed|timed out)|Current working directory|"
+    r"^\s*\[(?:The command (?:completed|finished|timed out)|Current working directory|"
     r"Python interpreter|Command finished)\b.*\]\s*$"
 )
 _VIEW_HEADER_RE = re.compile(r"^\s*Here's the (?:result of running|files and directories)\b")
@@ -789,23 +797,30 @@ def absent_tool_output(command: str) -> tuple[str, int] | None:
     return None
 
 
+_NAMED_FILE_RE = re.compile(r"[\w./-]*[./][\w./-]+|\s[\w-]+\.\w{1,6}\b")
+
+
 def output_expectation(command: str) -> str:
     text = _CD_PREFIX_RE.sub("", (command or "").strip())
     if not text or _WRITE_RE.search(text) or _MAY_BE_EMPTY_TAIL_RE.search(text):
         return MAY_BE_SILENT
     if _ALWAYS_PRINTS_RE.match(text):
         return MUST_PRINT
-    if not _READ_HEAD_RE.match(text.split("&&")[0]):
+    stages = command_stages(text) or [text]
+    # a named read prints wherever it sits in an && chain, not only when it comes first
+    if any(_READ_HEAD_RE.match(s) and _NAMED_FILE_RE.search(s) for s in stages):
+        return MUST_PRINT
+    if not _READ_HEAD_RE.match(stages[0]):
         if _SILENT_RE.match(text) or _SEARCH_HEAD_RE.match(text):
             return MAY_BE_SILENT
         return NOT_DERIVABLE
-    named = re.search(r"[\w./-]*[./][\w./-]+|\s[\w-]+\.\w{1,6}\b", text.split("&&")[0])
-    return MUST_PRINT if named else MAY_BE_SILENT
+    return MAY_BE_SILENT
 
 
 def is_file_read(command: str) -> bool:
-    """A read of a named file, whose contents the prompt can actually supply."""
-    return bool(_READ_HEAD_RE.match(_CD_PREFIX_RE.sub("", (command or "").strip())))
+    """A read of a named file, whose contents the prompt can actually supply — in any stage."""
+    text = _CD_PREFIX_RE.sub("", (command or "").strip())
+    return any(_READ_HEAD_RE.match(stage) for stage in command_stages(text) or [text])
 
 
 def requires_output(command: str) -> bool:
@@ -865,7 +880,9 @@ def repair_to_contract(raw: str, fmt: str, contract: CommandContract) -> str:
     return raw if kept == lines else _replace_body(raw, fmt, kept)
 
 
-_OH_TRAILER_OPEN = re.compile(r"^\[The command (?:completed|timed out) with exit code -?\d+\.\]$")
+_OH_TRAILER_OPEN = re.compile(
+    r"^\[The command (?:completed|finished|timed out) with exit code -?\d+\.\]$"
+)
 _OH_TRAILER_CLOSE = re.compile(r"^\[Command finished with exit code -?\d+\]$")
 _OH_BRACKET_LINE = re.compile(r"^\[.*\]$")
 _OH_NUMBERED_READ = re.compile(r"^cat\s+-n\s+(\S+)$")

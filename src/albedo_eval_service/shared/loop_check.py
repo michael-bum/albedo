@@ -4,8 +4,14 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 
-from .observation_format import action_blocks
-from .submit_protocol import asked_submit
+from .observation_format import (
+    action_blocks,
+    echoed_command,
+    leaked_turn,
+    prints_nothing_on_success,
+    silent_observation,
+)
+from .submit_protocol import asked_submit, first_bash_command
 
 DUP_CMD_THRESHOLD = 0.61
 MAX_RUN_THRESHOLD = 5
@@ -15,6 +21,12 @@ MAX_COMMAND_CHARS = 120
 
 _CANDIDATE_RE = re.compile(
     r"^CANDIDATE OUTPUT(?: \d+)?:\n------\n(.*?)\n------"
+    r"(?=\n+(?:CANDIDATE OUTPUT|ENVIRONMENT OBSERVATION|CONTEXT )[^\n]*:\n------|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+_BLOCK_RE = re.compile(
+    r"^(CANDIDATE OUTPUT(?: \d+)?|ENVIRONMENT OBSERVATION[^\n]*|CONTEXT [^\n]*):"
+    r"\n------\n(.*?)\n------"
     r"(?=\n+(?:CANDIDATE OUTPUT|ENVIRONMENT OBSERVATION|CONTEXT )[^\n]*:\n------|\Z)",
     re.MULTILINE | re.DOTALL,
 )
@@ -44,15 +56,49 @@ def candidate_turns(document: str) -> list[str]:
     return [document] if document else []
 
 
-def commands_of(turns: list[str]) -> list[str]:
+def candidate_turns_with_observations(document: str) -> tuple[list[str], list[str | None]]:
+    """The scored turns and, index-aligned, the observation each received (None when none did)."""
+    turns: list[str] = []
+    observations: list[str | None] = []
+    for match in _BLOCK_RE.finditer(document or ""):
+        label, body = match.group(1), match.group(2).rstrip()
+        if label.startswith("CANDIDATE OUTPUT"):
+            turns.append(body)
+            observations.append(None)
+        elif label.startswith("ENVIRONMENT OBSERVATION") and turns and observations[-1] is None:
+            observations[-1] = body
+    if turns:
+        return turns, observations
+    return ([document], [None]) if document else ([], [])
+
+
+def unanswered(command: str, observation: str | None) -> bool:
+    """Nothing to act on: an echo, a leaked turn, or silence for a command that must print."""
+    if observation is None:
+        return False
+    if echoed_command(command, observation) or leaked_turn(observation):
+        return True
+    return silent_observation(observation) and not prints_nothing_on_success(command)
+
+
+def commands_of(turns: list[str], observations: list[str | None] | None = None) -> list[str]:
+    """With `observations` (index-aligned), an exact re-issue of the previous command after an
+    unanswered observation is not counted: re-asking a shell that said nothing is rational, and
+    dropping only duplicates keeps both statistics monotone."""
     cmds: list[str] = []
-    for turn in turns:
-        cmds += [c for c in action_blocks(turn) if not asked_submit(c)]
+    previous: tuple[list[str], str, str | None] = ([], "", None)
+    for index, turn in enumerate(turns):
+        blocks = [c for c in action_blocks(turn) if not asked_submit(c)]
+        seen = observations and index < len(observations)
+        observation = observations[index] if seen else None
+        if not (blocks and blocks == previous[0] and unanswered(previous[1], previous[2])):
+            cmds += blocks
+        previous = (blocks, first_bash_command(turn), observation)
     return cmds
 
 
-def loop_stats(turns: list[str]) -> dict:
-    cmds = commands_of(turns)
+def loop_stats(turns: list[str], observations: list[str | None] | None = None) -> dict:
+    cmds = commands_of(turns, observations)
     max_run = run = 1
     for prev, cur in zip(cmds, cmds[1:]):
         run = run + 1 if cur == prev else 1
@@ -74,9 +120,9 @@ def _longest_runs(cmds: list[str]) -> dict[str, int]:
     return longest
 
 
-def loop_verdict(turns: list[str]) -> LoopVerdict:
-    cmds = commands_of(turns)
-    stats = loop_stats(turns)
+def loop_verdict(turns: list[str], observations: list[str | None] | None = None) -> LoopVerdict:
+    cmds = commands_of(turns, observations)
+    stats = loop_stats(turns, observations)
     counts = Counter(cmds)
     longest = _longest_runs(cmds)
 
@@ -102,7 +148,8 @@ def loop_verdict(turns: list[str]) -> LoopVerdict:
 
 
 def loop_verdict_for_document(document: str) -> LoopVerdict:
-    return loop_verdict(candidate_turns(document))
+    turns, observations = candidate_turns_with_observations(document)
+    return loop_verdict(turns, observations)
 
 
 def _render_command(entry: LoopingCommand) -> str:

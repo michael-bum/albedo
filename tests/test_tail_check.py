@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from albedo_eval_service.simulator.prompt_simulator import simulation_system_prompt
 from sanity_service.tail_check import (
     DUP_CMD_THRESHOLD,
@@ -156,3 +158,88 @@ def test_a_sample_that_only_ever_submits_is_left_to_the_submit_checks():
         submit_clause=f"echo {marker}",
     )
     assert empty_submit_count(state, marker) >= 2
+
+
+def _state_with(turns: list[dict]):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        sample_id="s", prompt="task", turns=turns, error="", heuristic_reason="", submit_clause=""
+    )
+
+
+def _scored(command: str) -> dict:
+    return {"role": "assistant", "content": _turns([command])[0], "score_target": True}
+
+
+def _obs(text: str) -> dict:
+    return {"role": "user", "content": text, "environment_observation": True}
+
+
+def _asked(text: str) -> dict:
+    return {"role": "user", "content": text, "injected": True}
+
+
+_EMPTY = "[The command finished with exit code 0.]\n[Command finished with exit code 0]"
+
+
+def test_paired_turns_attach_the_result_and_the_requester_message():
+    from sanity_service.tail_check import paired_turns
+
+    turns = [
+        {"role": "user", "content": "task"},
+        _scored("cat a.py"),
+        _obs("1\tx = 1"),
+        _scored("echo DONE"),
+        _asked("Looks good, also add a docstring."),
+        _scored("sed -i '1i # doc' a.py"),
+    ]
+    assert paired_turns(turns) == [
+        (_turns(["cat a.py"])[0], "1\tx = 1", None),
+        (_turns(["echo DONE"])[0], None, "Looks good, also add a docstring."),
+        (_turns(["sed -i '1i # doc' a.py"])[0], None, None),
+    ]
+
+
+def test_the_judge_is_shown_results_requester_messages_and_the_submit_command():
+    from sanity_service.tail_check import TAIL_CUTOFF, _tail_user
+
+    paired = [(f"turn {i}", None, None) for i in range(TAIL_CUTOFF)]
+    paired.append(("THOUGHT: read\n```bash\ncat a.py\n```", _EMPTY, None))
+    paired.append(("```bash\necho DONE && cat patch.txt\n```", None, "Please submit again now."))
+    rendered = _tail_user("task", paired, submit_clause="echo DONE && cat patch.txt")
+    assert f"LATE TURN {TAIL_CUTOFF + 1}:" in rendered
+    assert f"RESULT {TAIL_CUTOFF + 1}" in rendered and _EMPTY in rendered
+    assert f"REQUESTER {TAIL_CUTOFF + 2}" in rendered and "Please submit again now." in rendered
+    assert "echo DONE && cat patch.txt" in rendered
+    assert "turn 3" not in rendered, "turns before the cutoff stay hidden"
+
+
+def test_a_memo_frozen_re_ask_no_longer_trips_the_mechanical_gate():
+    from sanity_service.tail_check import run_tail_check
+
+    read = "sed -n '278,295p' moto/eks/models.py"
+    turns = [
+        {"role": "user", "content": "task"},
+        _scored("sed -i '1a x' moto/eks/models.py"),
+        _obs(_EMPTY),
+    ]
+    for _ in range(13):
+        turns += [_scored(read), _obs(_EMPTY)]
+    state = _state_with(turns)
+    verdicts = asyncio.run(run_tail_check([state]))
+    assert not state.heuristic_reason, state.heuristic_reason
+    assert verdicts and verdicts[0].reason.startswith("finished in") or not verdicts[0].checked
+
+
+def test_a_real_loop_against_a_responsive_shell_still_trips_it():
+    from sanity_service.tail_check import run_tail_check
+
+    read = "cat -n modin/pandas/utils.py | sed -n '139,160p'"
+    content = "   139\tdef cast_function_modin2pandas(func):\n[Command finished with exit code 0]"
+    turns = [{"role": "user", "content": "task"}]
+    for _ in range(15):
+        turns += [_scored(read), _obs(content)]
+    state = _state_with(turns)
+    asyncio.run(run_tail_check([state]))
+    assert "looping" in state.heuristic_reason

@@ -92,14 +92,17 @@ from .shared.observation_format import (
     is_abandoned,
     is_file_read,
     is_truncated,
+    leaked_turn,
     narrated_observation,
     no_output_notice,
     output_expectation,
     pipeline_returncode_override,
+    prints_nothing_on_success,
     renumbered_view,
     repair_output,
     repair_to_contract,
     requires_output,
+    silent_observation,
     stuttered_lines,
     valid_output,
     with_body,
@@ -770,8 +773,9 @@ class ObservationSimulationService:
         self,
         key: str,
         produce: Callable[[], Awaitable[str]],
+        store: Callable[[str], bool] | None = None,
     ) -> str:
-        return await self._observations.observe(key, produce)
+        return await self._observations.observe(key, produce, store=store)
 
     async def _retry_for_output(
         self,
@@ -807,7 +811,10 @@ class ObservationSimulationService:
                 command,
             )
         )
-        recovered = valid_output(candidate, fmt) and has_content(candidate, fmt)
+        # the pre-eval twin's bar: a leaked turn or an echo of the command is not a recovered read
+        recovered = _usable_simulation_output(
+            candidate, fmt, require_content=True, contract=contract, command=command
+        ) and not echoed_command(command, candidate)
         logger.info(
             "observation_simulation_must_print_retry eval_run_id={} sample_id={} command={!r} "
             "recovered={}",
@@ -892,6 +899,7 @@ class ObservationSimulationService:
             lambda: self._simulate_uncached(
                 request, command, fmt, context_block, exact_output, exact_returncode
             ),
+            store=lambda observation: _cacheable_observation(observation, fmt, command),
         )
 
     async def _simulate_uncached(
@@ -1040,6 +1048,16 @@ class ObservationSimulationService:
         if echoed_command(command, observation):
             logger.warning(
                 "observation_simulation_echoed eval_run_id={} sample_id={} command={!r}",
+                request.eval_run_id,
+                request.sample_id,
+                command[:80],
+            )
+            observation = empty_output(fmt)
+        if leaked_turn(
+            observation
+        ):  # the rung ladder only ranks a leak; unanimous, it would be served
+            logger.warning(
+                "observation_simulation_leaked_turn eval_run_id={} sample_id={} command={!r}",
                 request.eval_run_id,
                 request.sample_id,
                 command[:80],
@@ -1422,6 +1440,15 @@ def _role_violation(raw: str) -> bool:
     return bool(ROLE_MARKER_RE.search(text)) or text.count("<returncode>") > 1
 
 
+def _cacheable_observation(observation: str, fmt: str, command: str) -> bool:
+    """Only an answer the model can act on is worth serving again for the same read."""
+    return (
+        _usable_simulation_output(observation, fmt, command=command)
+        and not leaked_turn(observation)
+        and not (silent_observation(observation) and not prints_nothing_on_success(command))
+    )
+
+
 _RANK_INVALID = 0
 _RANK_VALID = 1
 _RANK_HAS_CONTENT = 2
@@ -1461,6 +1488,7 @@ def _usable_simulation_output(
     return (
         valid_output(raw, fmt)
         and not _role_violation(raw)
+        and not leaked_turn(raw)
         and not _looping_output(raw)
         and not degenerate_observation(raw)
         and not narrated_observation(raw, fmt)
@@ -1485,6 +1513,8 @@ def _unusable_reason(
         return "invalid_format"
     if _role_violation(raw):
         return "role_violation"
+    if leaked_turn(raw):
+        return "leaked_turn"
     if _looping_output(raw):
         return "looping"
     if degenerate_observation(raw):

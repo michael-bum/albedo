@@ -22,8 +22,11 @@ TAIL_JUDGE_FAIL_ZEROS = 3
 TAIL_JUDGE_MIN_FAILED_SAMPLES = 2
 
 
-def loop_stats(assistant_turns: list[str]) -> dict:
-    cmds = commands_of(assistant_turns)
+Paired = tuple[str, str | None, str | None]  # assistant turn, its observation, requester message
+
+
+def loop_stats(assistant_turns: list[str], observations: list[str | None] | None = None) -> dict:
+    cmds = commands_of(assistant_turns, observations)
     max_run = run = 1
     for prev, cur in zip(cmds, cmds[1:]):
         run = run + 1 if cur == prev else 1
@@ -35,8 +38,8 @@ def loop_stats(assistant_turns: list[str]) -> dict:
     }
 
 
-def looping_reason(assistant_turns: list[str]) -> str:
-    stats = loop_stats(assistant_turns)
+def looping_reason(assistant_turns: list[str], observations: list[str | None] | None = None) -> str:
+    stats = loop_stats(assistant_turns, observations)
     if stats["dup_cmd_ratio"] >= DUP_CMD_THRESHOLD:
         return f"looping: duplicate command ratio {stats['dup_cmd_ratio']:.2f}"
     if stats["max_cmd_run"] >= MAX_RUN_THRESHOLD:
@@ -46,6 +49,7 @@ def looping_reason(assistant_turns: list[str]) -> str:
 
 _TASK_CHAR_CAP = 4000
 _TURN_CHAR_CAP = 2500
+_RESULT_CHAR_CAP = 1500
 
 
 @dataclass
@@ -57,18 +61,40 @@ class TailVerdict:
     answers: dict[str, int] | None = None
 
 
-def _tail_user(task: str, scored_turns: list[str]) -> str:
-    tail = scored_turns[TAIL_CUTOFF:]
-    blocks = [
-        f"LATE TURN {TAIL_CUTOFF + i + 1}:\n{turn[:_TURN_CHAR_CAP]}" for i, turn in enumerate(tail)
-    ]
+def paired_turns(turns: list[dict]) -> list[Paired]:
+    """Each scored assistant turn with the observation it got and any requester message injected
+    before the next assistant turn — the judge's questions presuppose both."""
+    paired: list[list] = []
+    current: list | None = None
+    for turn in turns:
+        content = str(turn.get("content") or "")
+        if turn.get("role") == "assistant":
+            current = [content, None, None] if turn.get("score_target") else None
+            if current:
+                paired.append(current)
+        elif current:
+            slot = 1 if turn.get("environment_observation") else 2
+            current[slot] = content if current[slot] is None else f"{current[slot]}\n\n{content}"
+    return [tuple(p) for p in paired]
+
+
+def _tail_user(task: str, paired: list[Paired], *, submit_clause: str = "") -> str:
+    blocks = []
+    for n, (turn, result, request) in enumerate(paired[TAIL_CUTOFF:], start=TAIL_CUTOFF + 1):
+        block = f"LATE TURN {n}:\n{turn[:_TURN_CHAR_CAP]}"
+        if result is not None:
+            block += f"\nRESULT {n} (environment output):\n{result[:_RESULT_CHAR_CAP] or '(empty)'}"
+        if request is not None:
+            block += f"\nREQUESTER {n} (from the task requester):\n{request[:_TURN_CHAR_CAP]}"
+        blocks.append(block)
     questions = "\n".join(f"{qid}: {text}" for qid, text in TAIL_JUDGE_QUESTIONS)
     return TAIL_JUDGE_USER.format(
         task=(task or "")[:_TASK_CHAR_CAP],
         start=TAIL_CUTOFF + 1,
-        total=len(scored_turns),
+        total=len(paired),
         tail="\n\n".join(blocks),
         questions=questions,
+        submit=submit_clause or "(not stated)",
     )
 
 
@@ -87,11 +113,13 @@ def _parse_tail_answers(raw: str) -> dict[str, int] | None:
     return answers if len(answers) == len(TAIL_JUDGE_QUESTIONS) else None
 
 
-async def judge_tail(client, task: str, scored_turns: list[str], *, sample_id: str) -> TailVerdict:
+async def judge_tail(
+    client, task: str, paired: list[Paired], *, sample_id: str, submit_clause: str = ""
+) -> TailVerdict:
     results = await query_panel(
         client,
         TAIL_JUDGE_SYSTEM.format(cutoff=TAIL_CUTOFF),
-        _tail_user(task, scored_turns),
+        _tail_user(task, paired, submit_clause=submit_clause),
         temperature=0.0,
     )
     usable = next((r for r in results if not r.error and r.raw.strip()), None)
@@ -123,12 +151,9 @@ async def run_tail_check(states, *, client=None) -> list[TailVerdict]:
     for state in states:
         if state.error or state.heuristic_reason:
             continue
-        scored = [
-            str(turn.get("content") or "")
-            for turn in state.turns
-            if turn.get("role") == "assistant" and turn.get("score_target")
-        ]
-        reason = looping_reason(scored)
+        paired = paired_turns(state.turns)
+        scored = [turn for turn, _, _ in paired]
+        reason = looping_reason(scored, [result for _, result, _ in paired])
         if reason:
             state.heuristic_reason = f"tail_check: {reason}"
             verdicts.append(TailVerdict(state.sample_id, checked=True, passed=False, reason=reason))
@@ -144,7 +169,7 @@ async def run_tail_check(states, *, client=None) -> list[TailVerdict]:
                 )
             )
             continue
-        needs_judge.append((state, scored))
+        needs_judge.append((state, paired))
 
     if not needs_judge:
         return verdicts
@@ -154,8 +179,14 @@ async def run_tail_check(states, *, client=None) -> list[TailVerdict]:
         client = make_client()
     judge_failed: list = []
     try:
-        for state, scored in needs_judge:
-            verdict = await judge_tail(client, state.prompt, scored, sample_id=state.sample_id)
+        for state, paired in needs_judge:
+            verdict = await judge_tail(
+                client,
+                state.prompt,
+                paired,
+                sample_id=state.sample_id,
+                submit_clause=state.submit_clause,
+            )
             verdicts.append(verdict)
             if not verdict.passed:
                 judge_failed.append((state, verdict))

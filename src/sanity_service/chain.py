@@ -80,6 +80,23 @@ AGENT'S SUBMISSION TURN:
 _EDIT_RE = WORK_EDIT_RE
 _MICRO_CONTEXT_CHARS = 24000
 
+_BOILERPLATE_RE = re.compile(
+    r"submit the same way when done:[^\n]*"
+    r"|when you are done with it, submit by running exactly:[^\n]*"
+    r"|also, please now continue with the original issue described earlier\.?",
+    re.IGNORECASE,
+)
+
+
+def _request_key(text: str, clause: str) -> str:
+    text = (text or "").replace(clause, " ") if clause else (text or "")
+    return " ".join(_BOILERPLATE_RE.sub(" ", text).lower().split())
+
+
+def same_request(a: str, b: str, clause: str = "") -> bool:
+    """Two requester messages that ask for the same thing, our appended submit sentence aside."""
+    return _request_key(a, clause) == _request_key(b, clause)
+
 
 def micro_instruction(micro: dict[str, str] | str, submit_clause: str) -> str:
     # prefer the LLM-written varied message (anti-fingerprinting); template is the fallback
@@ -103,6 +120,17 @@ def followup_instruction(followup: str, submit_clause: str, *, first: bool) -> s
             f"earlier. Submit the same way when done: {submit_clause}"
         )
     return f"{followup}\n\nSubmit the same way when done: {submit_clause}"
+
+
+def symbol_in_context(symbol: str, context: str) -> bool:
+    """Whether a named function or symbol appears anywhere the model has seen."""
+    name = (symbol or "").strip().rstrip("()").rsplit(".", 1)[-1]
+    return not name or name in (context or "")
+
+
+def _microtask_grounded(raw: str, context: str) -> bool:
+    obj = extract_json(raw or "", prefer_keys=("request",))
+    return isinstance(obj, dict) and symbol_in_context(str(obj.get("function") or ""), context)
 
 
 def _microtask_parsable(raw: str) -> bool:
@@ -144,12 +172,20 @@ async def generate_microtask(
             }
         ],
         temperature=0.7,
-        accept=_microtask_parsable,
+        accept=lambda raw: _microtask_parsable(raw) and _microtask_grounded(raw, context),
     )
     obj = extract_json(result.raw or "", prefer_keys=("request",))
     if not isinstance(obj, dict) or not obj.get("request"):
         raise ValueError(f"microtask generation unparsable for {state.sample_id}")
-    return {k: str(obj.get(k) or "") for k in ("file", "function", "request", "message")}
+    micro = {k: str(obj.get(k) or "") for k in ("file", "function", "request", "message")}
+    if micro["function"] and not symbol_in_context(micro["function"], context):
+        logger.warning(
+            "[sanity/chain] microtask for {} names {!r}, absent from the session; dropping it",
+            state.sample_id,
+            micro["function"],
+        )
+        micro["function"] = micro["message"] = ""
+    return micro
 
 
 META_LEAK_RE = re.compile(
@@ -224,7 +260,25 @@ def ungrounded_reason(message: str, context: str, clause: str = "") -> str:
     ]
     if invented:
         return f"references files absent from the session: {sorted(invented)[:3]}"
+    symbols = sorted(
+        {
+            name
+            for m in _MSG_SYMBOL_RE.finditer(text)
+            for name in [m.group(1) or m.group(2)]
+            if len(name) >= 4
+            and _CODE_SHAPE_RE.search(name)
+            and not symbol_in_context(name, context)
+        }
+    )
+    if symbols:
+        return f"names symbols absent from the session: {symbols[:3]}"
     return ""
+
+
+_MSG_SYMBOL_RE = re.compile(
+    r"`([A-Za-z_][\w.]*\w)(?:\(\))?`|\b(?:def|func|function)\s+([A-Za-z_]\w+)"
+)
+_CODE_SHAPE_RE = re.compile(r"_|\d|\.|[a-z][A-Z]")
 
 
 async def _generate_in_world(
@@ -245,7 +299,8 @@ async def _generate_in_world(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
             accept=lambda raw: (
-                raw.strip() not in asked and not ungrounded_reason(raw, context, clause)
+                not any(same_request(raw, a, clause) for a in asked)
+                and not ungrounded_reason(raw, context, clause)
             ),
         )
     except Exception as exc:
@@ -253,7 +308,9 @@ async def _generate_in_world(
         return fallback
     message = (result.raw or "").strip()
     reason = ungrounded_reason(message, context, clause) or (
-        "restates a request already made" if message in asked else ""
+        "restates a request already made"
+        if any(same_request(message, a, clause) for a in asked)
+        else ""
     )
     if reason:
         logger.warning(

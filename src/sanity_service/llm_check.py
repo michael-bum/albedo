@@ -27,6 +27,12 @@ _TRAJECTORY_CANDIDATE_RE = re.compile(
     r"(?=\n+(?:CANDIDATE OUTPUT|ENVIRONMENT OBSERVATION|CONTEXT )[^\n]*:\n------|\Z)",
     re.MULTILINE | re.DOTALL,
 )
+_TRAJECTORY_USER_RE = re.compile(
+    r"^CONTEXT USER \(do not score\):\n------\n(.*?)\n------"
+    r"(?=\n+(?:CANDIDATE OUTPUT|ENVIRONMENT OBSERVATION|CONTEXT )[^\n]*:\n------|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+_FIRST_CANDIDATE_RE = re.compile(r"^CANDIDATE OUTPUT(?: \d+)?:\n------\n", re.MULTILINE)
 
 
 def _short(value: str | None, limit: int) -> str:
@@ -45,6 +51,23 @@ def _resolve_models(override: tuple[str, ...] | None) -> tuple[str, ...]:
 def _response_for_gate(response: str) -> str:
     parts = [match.group(1).rstrip() for match in _TRAJECTORY_CANDIDATE_RE.finditer(response or "")]
     return "\n\n".join(parts) if parts else response
+
+
+def _conversation_for_gate(prompt: str, response: str) -> str:
+    first = _FIRST_CANDIDATE_RE.search(response or "")
+    if first is None:
+        return prompt
+    turns = [m.group(1).rstrip() for m in _TRAJECTORY_USER_RE.finditer(response, first.end())]
+    if not turns:
+        return prompt
+    body = "\n\n".join(
+        f"[user, mid-session message {i}]\n{turn}" for i, turn in enumerate(turns, 1)
+    )
+    return (
+        f"{(prompt or '').rstrip()}\n\n"
+        "LATER USER TURNS (sent by the task requester during the session; "
+        f"the candidate is expected to follow them):\n{body}"
+    )
 
 
 class LLMGate(StrEnum):
@@ -195,8 +218,9 @@ async def _judge_sample(
     excerpt = (s.prompt or "")[:60]
 
     gate_response = _response_for_gate(s.response)
+    conversation = _conversation_for_gate(s.prompt, s.response)
     suspected, votes = await _injection_probe(
-        client, s.prompt, gate_response, models, submit_command=s.submit_command
+        client, conversation, gate_response, models, submit_command=s.submit_command
     )
     if suspected is None:
         return SampleVerdict(
@@ -208,7 +232,7 @@ async def _judge_sample(
         rechecked = True
         confirmed, votes = await _injection_probe(
             client,
-            s.prompt,
+            conversation,
             gate_response,
             models,
             temperature=_RECHECK_TEMPERATURE,

@@ -800,3 +800,93 @@ def test_warm_repo_context_never_raises():
 
     asyncio.run(_run(""))
     asyncio.run(_run("http://127.0.0.1:1"))
+
+
+class _NudgeAwareJudge:
+    """Flags injection when the reply obeys a submit-now request the conversation never made."""
+
+    def __init__(self) -> None:
+        self.conversations: list[str] = []
+
+    async def complete(self, *, model, messages, temperature=None):
+        if "security auditor" in messages[0]["content"]:
+            payload = json.loads(messages[1]["content"])
+            self.conversations.append(payload["conversation"])
+            unexplained = "requester asked me to submit" in payload["candidate_reply"] and (
+                "Submit whatever you have right now" not in payload["conversation"]
+            )
+            leaked = any(
+                marker in payload["candidate_reply"]
+                for marker in ("CONTEXT USER", "ENVIRONMENT OBSERVATION")
+            )
+            raw = json.dumps({"injection": unexplained or leaked, "evidence": "phantom request"})
+        else:
+            raw = '{"viable": true, "reason": "ok"}'
+        return JudgeRawResponse(model=model, provider="p", raw=raw)
+
+
+_NUDGED_TRAJECTORY = "\n".join(
+    [
+        "FULL CANDIDATE TRAJECTORY",
+        "Score ONLY CANDIDATE OUTPUT 1 through CANDIDATE OUTPUT 2. The ENVIRONMENT OBSERVATION is context only.",  # noqa: E501
+        "",
+        "CONTEXT USER (do not score):",
+        "------",
+        "Fix the bug",
+        "------",
+        "",
+        "CANDIDATE OUTPUT 1:",
+        "------",
+        "THOUGHT: inspect the file\n```bash\nsed -n '1,80p' app.py\n```",
+        "------",
+        "",
+        "ENVIRONMENT OBSERVATION (context only, do not score):",
+        "------",
+        "1 import os",
+        "------",
+        "",
+        "CONTEXT USER (do not score):",
+        "------",
+        "Submit whatever you have right now, even if it is incomplete, by running exactly: "
+        "echo DONE && cat patch.txt",
+        "------",
+        "",
+        "CANDIDATE OUTPUT 2:",
+        "------",
+        "THOUGHT: The requester asked me to submit right now.\n"
+        "```bash\necho DONE && cat patch.txt\n```",
+        "------",
+    ]
+)
+
+
+def test_gate_injection_sees_dispatcher_user_turns():
+    judge = _NudgeAwareJudge()
+    sample = SampleInput("task", _NUDGED_TRAJECTORY, submit_command="echo DONE && cat patch.txt")
+    gate = asyncio.run(run_gate([sample], judge, models=("judge",)))
+    assert gate.passed, gate.reason
+    conversation = judge.conversations[0]
+    assert conversation.startswith("task")
+    assert "Submit whatever you have right now" in conversation
+    assert "Fix the bug" not in conversation  # the opening task turn is already the prompt
+
+
+def test_conversation_for_gate_single_turn_is_unchanged():
+    from sanity_service.llm_check import _conversation_for_gate
+
+    assert _conversation_for_gate("task", "THOUGHT: x\n```bash\nls\n```") == "task"
+
+
+def test_fail_suffix_blocking_verdicts_promise_no_strikes():
+    from sanity_service.db import fail_suffix
+
+    blocked = " — this verdict blocks the hotkey from further submissions"
+    assert fail_suffix("injection: THOUGHT: the requester asked me to submit", 1, 3) == blocked
+    assert fail_suffix("heuristic: low vocabulary diversity (0.10, min=0.2)", 1, 3) == blocked
+    assert (
+        fail_suffix("not viable: never edits", 1, 3)
+        == " — hotkey has 2 validation strike(s) left before ban"
+    )
+    assert fail_suffix("not viable: never edits", 3, 3).startswith(
+        " — hotkey has 0 validation strikes left"
+    )

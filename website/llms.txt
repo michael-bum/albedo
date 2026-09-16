@@ -602,7 +602,7 @@ sanity-dispatcher: claim PRE_EVAL_QUEUED → PRE_EVAL_RUNNING
     viability probe     (judge: coherent + on-task?)
   aggregate (injection > infra > viability-fail > pass), quorum ≥ 2 resolved judges
   PRE_EVAL_PASSED  → cache in sanity_results
-  fail → TERMINAL_INVALID (injection / viability) | PRE_EVAL_RETRYABLE (infra)
+  fail → TERMINAL_INVALID (viability: one of three strikes; injection / low-vocab: the hotkey is blocked outright) | PRE_EVAL_RETRYABLE (infra)
 ```
 
 `sanity-remote` is **stateless** (no DB, no dataset, no keys) — it just loads the model on a GPU,

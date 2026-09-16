@@ -13,6 +13,18 @@ from psycopg.types.json import Jsonb
 from albedo_config import get_model_validation_settings
 from albedo_eval_service.shared.models import RemoteHost
 
+_BLOCKING_REASONS = ("injection", "low vocab")
+
+
+def fail_suffix(fault_message: str, fails: int, max_fails: int) -> str:
+    lowered = fault_message.lower()
+    if any(word in lowered for word in _BLOCKING_REASONS):
+        return " — this verdict blocks the hotkey from further submissions"
+    left = max(0, max_fails - fails)
+    if left > 0:
+        return f" — hotkey has {left} validation strike(s) left before ban"
+    return " — hotkey has 0 validation strikes left and is now banned from further submissions"
+
 
 @dataclass(frozen=True)
 class ClaimedPreEval:
@@ -270,13 +282,7 @@ class PreEvalRepository:
                     + 1
                 )
                 max_fails = get_model_validation_settings().PREEVAL_MAX_FAILS
-                left = max(0, max_fails - fails)
-                if left > 0:
-                    fault_message += f" — hotkey has {left} attempt(s) left before ban"
-                else:
-                    fault_message += (
-                        " — hotkey has 0 attempts left and is now banned from further submissions"
-                    )
+                fault_message += fail_suffix(fault_message, fails, max_fails)
             if not retryable:
                 self._write_sanity_result(
                     conn, repo, digest, False, fault_message, responses or [], {}

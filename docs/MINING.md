@@ -349,6 +349,9 @@ CHAIN_NETWORK=test albedo check-commit
   `--skip-check` to publish anyway. Skipping only skips *your* copy of the checks — the validator
   re-runs all of them, and a failure there costs one of three validation strikes (counted per hotkey
   over all your submissions, separately from private upload attempts) before the hotkey is banned.
+  Two pre-eval verdicts skip the strike budget and block the hotkey outright, like a dedup
+  rejection: acting on an instruction that arrived inside command output (`injection`), and
+  degenerate low-vocabulary output.
 - **The pin is immutable.** Each upload returns a pin — a `sha256:` content digest on Hippius, a
   git commit SHA on HF — and the commit binds to it, so re-uploading changed weights produces a
   new pin you must re-commit.

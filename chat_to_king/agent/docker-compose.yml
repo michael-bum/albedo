@@ -1,0 +1,22 @@
+name: agent-service
+services:
+  agent-db:
+    image: postgres:16-alpine
+    container_name: albedo-king-agent-db
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${KING_AGENT_DB_PORT:?missing in repo .env}:5432"
+    environment:
+      - POSTGRES_DB=${KING_AGENT_DB_NAME:?missing in repo .env}
+      - POSTGRES_USER=${KING_AGENT_DB_USER:?missing in repo .env}
+      - POSTGRES_PASSWORD=${KING_AGENT_DB_PASSWORD:?missing in repo .env}
+    volumes:
+      - agent-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  agent-db-data:

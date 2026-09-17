@@ -38,3 +38,4 @@ src/sanity_service/prompts.json
 website/data/*
 eval-datasets
 sota_anchor_runs/
+chat_to_king/agent/setup_db.sh

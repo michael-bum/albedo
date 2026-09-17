@@ -83,6 +83,7 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 markers = [
     "integration: requires ALBEDO_TEST_DATABASE_URL and a Postgres database initialized from schema.sql",
+    "debug: build the king-agent test app with KING_AGENT_DEBUG on",
 ]
 
 [tool.ruff]
@@ -94,6 +95,20 @@ select = ["E", "W", "F", "I"]
 
 [tool.ruff.lint.per-file-ignores]
 # Judge prompts are long-form prose inside string literals; line length is not meaningful there.
+"tests/test_debug.py" = ["E501", "F811"]
+"tests/test_ide_keys.py" = ["E501"]
+"tests/test_king_engine.py" = ["E501"]
+"tests/test_web_gateway.py" = ["E501"]
+"chat_to_king/agent/devtools/trace.py" = ["E501"]
+"tests/test_agent_trace.py" = ["E501"]
+"tests/test_ide_agent_responses.py" = ["E501"]
+"tests/test_ide_agent_adapter.py" = ["E501"]
+"tests/test_ide_agent_route.py" = ["E501"]
+"chat_to_king/agent/protocols/*.py" = ["E501"]
+"chat_to_king/engine/vllm_process.py" = ["E501"]
+"chat_to_king/web/gateway.py" = ["E501"]
+"chat_to_king/common/token_meter.py" = ["E501"]
+"tests/test_token_meter.py" = ["E501"]
 "src/sanity_service/rubric.py" = ["E501"]
 "src/albedo_eval_service/judge/prompt_judge.py" = ["E501"]
 "src/albedo_eval_service/evaluator/reference/prompt_reference_split.py" = ["E501"]
@@ -111,7 +126,9 @@ select = ["E", "W", "F", "I"]
 # Imports deliberately follow sys.path / environment setup in these entry points.
 "scripts/dataset_creator/pipeline.py" = ["E402"]
 "scripts/manual_dedup_h2h.py" = ["E402"]
-"chat_to_king/supervisor.py" = ["E402"]
+"chat_to_king/engine/king_ctl.py" = ["E402"]
+"chat_to_king/token_report.py" = ["E402"]
+"chat_to_king/token_rollup.py" = ["E402"]
 "tests/test_sanity_gate.py" = ["E402"]
 # Availability probe: the import itself is the feature test, inside try/except ImportError.
 "src/albedo_eval_service/modelstore/resolver.py" = ["F401"]

@@ -5,7 +5,8 @@ import os
 import re
 
 import httpx
-from config import KingChatSettings
+
+from engine.config import KingEngineSettings
 
 _HF_API = "https://huggingface.co/api/models"
 _HF_RAW = "https://huggingface.co"
@@ -19,10 +20,10 @@ class MirrorNotReady(RuntimeError):
     pass
 
 
-def mirror_repo_id(roman: str, settings: KingChatSettings) -> str:
+def mirror_repo_id(roman: str, settings: KingEngineSettings) -> str:
     namespace = settings.hf_namespace.strip().strip("/")
     if not namespace or not settings.hf_repo_prefix:
-        raise MirrorNotReady("KING_CHAT_HF_NAMESPACE / KING_CHAT_HF_REPO_PREFIX is empty")
+        raise MirrorNotReady("KING_ENGINE_HF_NAMESPACE / KING_ENGINE_HF_REPO_PREFIX is empty")
     if not roman:
         raise MirrorNotReady("king has no roman numeral; cannot name its mirror repo")
     return f"{namespace}/{settings.hf_repo_prefix}-{roman}".lower()
@@ -93,3 +94,7 @@ def _token() -> str | None:
         if os.environ.get(env):
             return os.environ[env]
     return None
+
+
+def mirror_origin(repo_id: str, sha: str) -> tuple[str, str]:
+    return _origin(repo_id, sha, _token())

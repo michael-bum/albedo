@@ -52,6 +52,10 @@ export const REGISTRATION_ENDPOINTS = [
 
 export const SUBNET_NETUID = 97;
 
+// self-serve API keys for the agent service (api.albedo.tech); the portal shares the key store
+export const AGENT_API_BASE = "https://api.albedo.tech";
+export const KEYS_API_BASE = "https://api.albedo.tech/portal";
+
 // Runs render only the entries their artifact map actually has, so the two legacy types below
 // keep working for older runs while new runs simply show fewer links.
 export const ARTIFACT_TYPES = [

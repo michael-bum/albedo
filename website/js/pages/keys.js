@@ -4,24 +4,17 @@ import { fmtRelative, fmtCount } from "../format.js";
 
 const $ = id => document.getElementById(id);
 const params = new URLSearchParams(location.search);
-// the preview and staging portals live elsewhere than production; a page served from 127.0.0.1
-// talks to the local runner (local_harness/portal_dev.py) unless ?api=/?agent= say otherwise
-const LOCAL = location.hostname === "127.0.0.1" || location.hostname === "localhost";
-const defaultAgent = LOCAL ? "http://127.0.0.1:9213" : AGENT_API_BASE;
-const defaultKeys = LOCAL ? `${defaultAgent}/portal` : KEYS_API_BASE;
-// on the public site an override must stay on our own hosts, so a crafted link cannot point the page elsewhere
 function allowedBase(value) {
   if (!value) return null;
   try {
     const u = new URL(value);
-    if (LOCAL) return u.origin === location.origin || u.hostname === "127.0.0.1" || u.hostname === "localhost" ? value : null;
     return u.protocol === "https:" && (u.hostname === "albedo.tech" || u.hostname.endsWith(".albedo.tech")) ? value : null;
   } catch { return null; }
 }
-const stored = key => (LOCAL ? null : allowedBase(localStorage.getItem(key)));
-const keysBase = (allowedBase(params.get("api")) || stored("keysApiBase") || defaultKeys).replace(/\/$/, "");
+const stored = key => allowedBase(localStorage.getItem(key));
+const keysBase = (allowedBase(params.get("api")) || stored("keysApiBase") || KEYS_API_BASE).replace(/\/$/, "");
 if (allowedBase(params.get("api"))) localStorage.setItem("keysApiBase", params.get("api"));
-const agentBase = (allowedBase(params.get("agent")) || stored("agentApiBase") || defaultAgent).replace(/\/$/, "");
+const agentBase = (allowedBase(params.get("agent")) || stored("agentApiBase") || AGENT_API_BASE).replace(/\/$/, "");
 if (allowedBase(params.get("agent"))) localStorage.setItem("agentApiBase", params.get("agent"));
 
 const KEY_PLACEHOLDER = "<your key>";

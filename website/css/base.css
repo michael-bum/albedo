@@ -172,4 +172,11 @@ main {
 
 @media (max-width: 760px) {
   main { padding: 16px 12px 60px; gap: 32px; }
+  .top-header .row { padding: 0 12px; gap: 12px; }
+  .top-header .brand, .top-header .links { flex-shrink: 0; }
+  .top-header .updated { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+}
+@media (max-width: 560px) {
+  .top-header .links a.header-chat { width: 28px; padding: 0; justify-content: center; }
+  .top-header .links a.header-chat span { display: none; }
 }

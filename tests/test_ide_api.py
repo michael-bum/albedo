@@ -237,15 +237,15 @@ async def test_upstream_down_returns_notice(env):
     assert "resend" in r.json()["choices"][0]["message"]["content"].lower()
 
 
-def _limiter_key(key_hash: str, parallel: int) -> ApiKey:
+def _limiter_key(account_id: int, parallel: int) -> ApiKey:
     return ApiKey(
         id=1,
-        account_id=1,
-        key_hash=key_hash,
+        account_id=account_id,
+        key_hash=f"h{account_id}",
         hint="abcd",
         label=None,
         owner="o",
-        tier="beta",
+        tier="standard",
         rpm=100,
         parallel=parallel,
         daily_completion_tokens=1,
@@ -258,15 +258,33 @@ def _limiter_key(key_hash: str, parallel: int) -> ApiKey:
 
 
 def test_limiter_parallel_and_global():
-    key = _limiter_key("h", 1)
-    other = _limiter_key("h2", 5)
+    key = _limiter_key(1, 1)
+    other = _limiter_key(2, 5)
     lim = Limiter(global_parallel=2)
     assert lim.acquire(key, 0.0) is None
     assert lim.acquire(key, 0.0) == ("parallel", 0)
     assert lim.acquire(other, 0.0) is None
     assert lim.acquire(other, 0.0) == ("busy", 0)
-    lim.release("h")
+    lim.release(1)
     assert lim.acquire(other, 0.0) is None
+
+
+def test_limiter_is_per_account_not_per_key():
+    lim = Limiter(global_parallel=0)
+    first = _limiter_key(7, 1)
+    rotated = ApiKey(**{**first.__dict__, "id": 2, "key_hash": "fresh"})
+    assert lim.acquire(first, 0.0) is None
+    assert lim.acquire(rotated, 0.0) == ("parallel", 0)
+
+
+@pytest.mark.anyio
+async def test_rpm_window_shared_across_keys_of_one_account(env):
+    account_id = env.store.lookup(env.key).account_id
+    _key, shown = env.store.issue(account_id, rpm=2, parallel=2, daily_completion_tokens=1000)
+    assert (await _post(env, _chat(), key=env.key)).status_code == 200
+    assert (await _post(env, _chat(), key=shown["albedo"])).status_code == 200
+    r = await _post(env, _chat(), key=shown["albedo"])
+    assert r.status_code == 429 and "rpm" in r.json()["error"]["message"]
 
 
 @pytest.mark.anyio

@@ -278,7 +278,7 @@ def create_ide_app(
         started = time.monotonic()
 
         def _record(status: int, prompt_tokens: int, completion_tokens: int) -> None:
-            limiter.release(key.key_hash)
+            limiter.release(key.account_id)
             if prompt_tokens or completion_tokens:
                 meter.record(prompt_tokens, completion_tokens, stream)
             keys.record(

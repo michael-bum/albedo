@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ALBEDO · API keys</title>
+<link rel="icon" type="image/svg+xml" href="css/favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/base.css">
+<link rel="stylesheet" href="css/components.css">
+</head>
+<body>
+<header class="top-header">
+  <div class="row">
+    <a class="brand" href="./index.html">
+      <img src="css/favicon.svg" width="18" height="18" alt="" aria-hidden="true">
+      <span>Albedo</span>
+    </a>
+    <span class="updated" id="service-state"></span>
+    <div class="links">
+      <a href="https://github.com/unarbos/albedo" target="_blank" rel="noopener" aria-label="GitHub" title="GitHub">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.4 7.86 10.93.58.1.79-.25.79-.55v-1.96c-3.2.7-3.88-1.54-3.88-1.54-.52-1.32-1.27-1.68-1.27-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.03 1.76 2.7 1.25 3.36.96.1-.74.4-1.25.73-1.54-2.55-.29-5.24-1.27-5.24-5.66 0-1.25.45-2.28 1.18-3.08-.12-.29-.51-1.46.11-3.04 0 0 .97-.31 3.18 1.18.92-.26 1.91-.39 2.89-.4.98.01 1.97.14 2.89.4 2.2-1.49 3.17-1.18 3.17-1.18.63 1.58.24 2.75.12 3.04.74.8 1.18 1.83 1.18 3.08 0 4.4-2.7 5.36-5.27 5.65.41.36.78 1.06.78 2.13v3.16c0 .31.21.66.79.55C20.21 21.4 23.5 17.08 23.5 12 23.5 5.65 18.35.5 12 .5z"/></svg>
+      </a>
+      <a class="header-chat" href="https://chat.albedo.tech/" target="_blank" rel="noopener"
+         aria-label="Chat with the King" title="Chat with the King">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+        </svg>
+        <span>King Chat</span>
+      </a>
+    </div>
+  </div>
+</header>
+
+<main>
+  <a class="detail-back" href="./index.html">← back to albedo</a>
+  <div class="detail-head">
+    <div class="eyebrow">albedo agent · api keys</div>
+    <h1>Run the reigning king in your editor</h1>
+    <div class="sub">Named keys per GitHub account for <span class="mono" id="api-host">api.albedo.tech</span> · OpenAI, Anthropic and Responses wire formats · Claude Code, Codex, Copilot, Cursor, ACP</div>
+  </div>
+
+  <section class="section" id="account">
+    <div class="head"><span class="label">account</span><span class="meta" id="account-meta"></span></div>
+    <div id="account-wrap"><div class="empty">loading…</div></div>
+  </section>
+
+  <section class="section" id="key">
+    <div class="head"><span class="label">your keys</span><span class="meta" id="key-meta"></span></div>
+    <div id="key-wrap"><div class="empty">sign in to manage your keys</div></div>
+  </section>
+
+  <section class="section" id="setup">
+    <div class="head"><span class="label">setup</span><span class="meta">pick your client · the key is filled in while it is on screen</span></div>
+    <div id="setup-wrap"></div>
+  </section>
+
+  <section class="section" id="service">
+    <div class="head"><span class="label">service</span><span class="meta" id="service-meta"></span></div>
+    <div id="service-wrap"><div class="empty">loading…</div></div>
+  </section>
+
+  <section class="section" id="rules">
+    <div class="head"><span class="label">limits &amp; privacy</span></div>
+    <div class="note" id="rules-wrap"></div>
+  </section>
+</main>
+<script type="module" src="js/pages/keys.js"></script>
+</body>
+</html>

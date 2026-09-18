@@ -195,6 +195,7 @@ async def test_daily_quota(env):
     )
     r = await _post(env, _chat())
     assert r.status_code == 429 and r.json()["error"]["code"] == "quota_exceeded"
+    assert "Albedo channel on the Bittensor Discord" in r.json()["error"]["message"]
 
 
 @pytest.mark.anyio

@@ -282,9 +282,11 @@ def create_ide_app(
             keys.completion_tokens_since, key.account_id, now - 86400.0
         )
         if used_today >= key.daily_completion_tokens:
+            where = f" ({settings.support_url})" if settings.support_url else ""
             return _error(
                 429,
-                "Daily token quota exhausted.",
+                "Daily token quota exhausted. Need a higher limit? Ask in the Albedo channel on "
+                f"the Bittensor Discord{where} and tell us how the king is working for you.",
                 "quota_exceeded",
                 {"retry-after": "3600"},
             )

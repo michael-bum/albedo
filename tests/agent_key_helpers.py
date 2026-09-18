@@ -2,7 +2,7 @@ from __future__ import annotations
 
 
 def issue_key(store, owner: str, *, rpm: int, parallel: int, daily_tokens: int) -> str:
-    account_id = store.add_account(owner, tier="beta")
+    account_id = store.add_account(owner, tier="standard")
     _key, shown = store.issue(
         account_id, rpm=rpm, parallel=parallel, daily_completion_tokens=daily_tokens
     )

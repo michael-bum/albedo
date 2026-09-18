@@ -35,6 +35,8 @@ class ApiKey:
     revoked_at: float | None
     account_disabled_at: float | None
     format: str = ""
+    hint_head: str | None = None
+    origin: str = "cli"
 
     def active(self, now: float) -> bool:
         if self.revoked_at is not None or self.account_disabled_at is not None:
@@ -52,6 +54,7 @@ class Account:
     created_at: float
     disabled_at: float | None
     notes: str | None
+    identity_hash: str | None = None
 
 
 def hash_secret(secret: str) -> str:
@@ -100,4 +103,6 @@ def _to_key(row: Mapping, fmt: str) -> ApiKey:
         revoked_at=row["revoked_at"],
         account_disabled_at=row["account_disabled_at"],
         format=fmt,
+        hint_head=row.get("hint_head"),
+        origin=row.get("origin") or "cli",
     )

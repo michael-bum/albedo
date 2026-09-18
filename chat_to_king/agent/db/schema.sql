@@ -4,8 +4,10 @@ CREATE TABLE IF NOT EXISTS tiers (
     parallel INTEGER NOT NULL,
     daily_completion_tokens BIGINT NOT NULL,
     max_prompt_tokens INTEGER NOT NULL,
-    key_ttl_days INTEGER
+    key_ttl_days INTEGER,
+    max_keys INTEGER NOT NULL DEFAULT 5
 );
+ALTER TABLE tiers ADD COLUMN IF NOT EXISTS max_keys INTEGER NOT NULL DEFAULT 5;
 
 CREATE TABLE IF NOT EXISTS accounts (
     id BIGSERIAL PRIMARY KEY,
@@ -15,8 +17,11 @@ CREATE TABLE IF NOT EXISTS accounts (
     hotkey TEXT,
     created_at DOUBLE PRECISION NOT NULL,
     disabled_at DOUBLE PRECISION,
-    notes TEXT
+    notes TEXT,
+    identity_hash TEXT
 );
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS identity_hash TEXT;
+CREATE INDEX IF NOT EXISTS accounts_identity ON accounts (identity_hash);
 
 CREATE TABLE IF NOT EXISTS key_formats (
     format TEXT PRIMARY KEY,
@@ -37,10 +42,17 @@ CREATE TABLE IF NOT EXISTS api_keys (
     rpm INTEGER,
     parallel INTEGER,
     daily_completion_tokens BIGINT,
-    max_prompt_tokens INTEGER
+    max_prompt_tokens INTEGER,
+    hint_head TEXT,
+    origin TEXT NOT NULL DEFAULT 'cli'
 );
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS hint_head TEXT;
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'cli';
 CREATE INDEX IF NOT EXISTS api_keys_account ON api_keys (account_id);
 CREATE INDEX IF NOT EXISTS api_keys_hint ON api_keys (hint);
+DROP INDEX IF EXISTS api_keys_portal_name;
+CREATE UNIQUE INDEX IF NOT EXISTS api_keys_portal_name_ci
+    ON api_keys (account_id, lower(label)) WHERE origin = 'portal' AND revoked_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS usage (
     id BIGSERIAL PRIMARY KEY,
@@ -69,9 +81,10 @@ CREATE TABLE IF NOT EXISTS events (
     detail TEXT
 );
 
-INSERT INTO tiers (name, rpm, parallel, daily_completion_tokens, max_prompt_tokens, key_ttl_days) VALUES
-    ('internal', 600, 8, 1000000000, 262144, NULL),
-    ('beta', 30, 2, 200000, 131072, 90)
+INSERT INTO tiers (name, rpm, parallel, daily_completion_tokens, max_prompt_tokens, key_ttl_days, max_keys) VALUES
+    ('internal', 600, 8, 1000000000, 262144, NULL, 50),
+    ('standard', 30, 2, 200000, 131072, 90, 5),
+    ('miner', 120, 4, 1000000, 262144, 180, 10)
 ON CONFLICT (name) DO NOTHING;
 
 INSERT INTO key_formats (format, prefix, note) VALUES

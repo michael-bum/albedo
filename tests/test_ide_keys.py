@@ -17,7 +17,7 @@ def store(pg_url) -> KeyStore:
 
 
 def test_issue_gives_every_format_for_one_row(store):
-    acc = store.add_account("bob", tier="beta", contact="bob@x")
+    acc = store.add_account("bob", tier="standard", contact="bob@x")
     key, shown = store.issue(acc, label="laptop")
     assert set(shown) == {"albedo", "anthropic", "openai", "openai_project"}
     assert shown["albedo"].startswith("ak-") and shown["anthropic"].startswith("sk-ant-api03-")
@@ -29,10 +29,25 @@ def test_issue_gives_every_format_for_one_row(store):
     for fmt, value in shown.items():
         rec = store.lookup(value)
         assert rec is not None and rec.id == key.id and rec.format == fmt
-        assert rec.owner == "bob" and rec.tier == "beta" and rec.active(time.time())
+        assert rec.owner == "bob" and rec.tier == "standard" and rec.active(time.time())
     assert store.lookup("zz-" + secret) is None
     assert store.lookup("sk-") is None
     assert store.lookup("ak-missing") is None
+
+
+def test_secret_collision_draws_again_and_names_may_repeat_across_accounts(store, monkeypatch):
+    import agent.db.keystore as ks
+
+    fixed = "A" * 43
+    draws = iter([fixed, fixed, "B" * 43])
+    monkeypatch.setattr(ks.secrets, "token_urlsafe", lambda n: next(draws))
+    a = store.add_account("a", tier="standard")
+    b = store.add_account("b", tier="standard")
+    _, first = store.issue(a, label="laptop", origin="portal")
+    _, second = store.issue(b, label="laptop", origin="portal")
+    assert first["albedo"] == "ak-" + fixed and second["albedo"] == "ak-" + "B" * 43
+    assert store.lookup(first["albedo"]).account_id == a
+    assert store.lookup(second["albedo"]).account_id == b
 
 
 def test_longest_prefix_wins():
@@ -45,14 +60,14 @@ def test_longest_prefix_wins():
 
 
 def test_tier_defaults_and_key_overrides(store):
-    acc = store.add_account("carol", tier="beta")
+    acc = store.add_account("carol", tier="standard")
     key, _ = store.issue(acc)
     assert (key.rpm, key.parallel, key.daily_completion_tokens) == (30, 2, 200_000)
     assert key.max_prompt_tokens == 131_072 and key.expires_at is not None
     key2, _ = store.issue(acc, rpm=5, ttl_days=None)
     assert key2.rpm == 5 and key2.parallel == 2 and key2.expires_at is not None
     store.set_tier(
-        "beta",
+        "standard",
         rpm=40,
         parallel=3,
         daily_completion_tokens=1,

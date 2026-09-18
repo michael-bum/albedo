@@ -7,12 +7,15 @@ from collections.abc import Mapping
 
 from agent.db.connection import _Db
 from agent.db.models import Account, ApiKey, _ip_hash, _to_key, hash_secret, split_key
+from psycopg.errors import UniqueViolation
 
 SECRET_BYTES = 32
+SECRET_RETRIES = 3
 FORMAT_CACHE_S = 60.0
 
 _KEY_SELECT = """
-SELECT k.id, k.account_id, k.secret_hash, k.hint, k.label, k.created_at, k.expires_at, k.revoked_at,
+SELECT k.id, k.account_id, k.secret_hash, k.hint, k.hint_head, k.origin, k.label, k.created_at,
+       k.expires_at, k.revoked_at,
        a.owner, a.tier, a.disabled_at AS account_disabled_at,
        COALESCE(k.rpm, t.rpm) AS rpm,
        COALESCE(k.parallel, t.parallel) AS parallel,
@@ -22,6 +25,10 @@ FROM api_keys k
 JOIN accounts a ON a.id = k.account_id
 JOIN tiers t ON t.name = a.tier
 """
+
+
+class KeyNameTaken(ValueError):
+    pass
 
 
 class KeyStore:
@@ -118,16 +125,27 @@ class KeyStore:
         daily_completion_tokens: int,
         max_prompt_tokens: int,
         key_ttl_days: int | None,
+        max_keys: int = 5,
         actor: str,
     ) -> None:
         with self._lock:
             self._db.execute(
-                "INSERT INTO tiers VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT(name) DO UPDATE SET "
+                "INSERT INTO tiers (name, rpm, parallel, daily_completion_tokens, "
+                "max_prompt_tokens, key_ttl_days, max_keys) VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT(name) DO UPDATE SET "
                 "rpm = excluded.rpm, parallel = excluded.parallel, "
                 "daily_completion_tokens = excluded.daily_completion_tokens, "
                 "max_prompt_tokens = excluded.max_prompt_tokens, "
-                "key_ttl_days = excluded.key_ttl_days",
-                (name, rpm, parallel, daily_completion_tokens, max_prompt_tokens, key_ttl_days),
+                "key_ttl_days = excluded.key_ttl_days, max_keys = excluded.max_keys",
+                (
+                    name,
+                    rpm,
+                    parallel,
+                    daily_completion_tokens,
+                    max_prompt_tokens,
+                    key_ttl_days,
+                    max_keys,
+                ),
             )
             self._event(actor, "tier_set", detail=name)
             self._db.commit()
@@ -136,23 +154,33 @@ class KeyStore:
         self,
         owner: str,
         *,
-        tier: str = "beta",
+        tier: str = "standard",
         contact: str | None = None,
         hotkey: str | None = None,
         notes: str | None = None,
         actor: str = "cli",
+        identity_hash: str | None = None,
     ) -> int:
         with self._lock:
             if self._db.execute("SELECT 1 FROM tiers WHERE name = %s", (tier,)).fetchone() is None:
                 raise ValueError(f"unknown tier {tier!r}")
             account_id = self._db.insert_id(
-                "INSERT INTO accounts (owner, contact, tier, hotkey, created_at, notes) "
-                "VALUES (%s, %s, %s, %s, %s, %s)",
-                (owner, contact, tier, hotkey, time.time(), notes),
+                "INSERT INTO accounts (owner, contact, tier, hotkey, created_at, notes, "
+                "identity_hash) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (owner, contact, tier, hotkey, time.time(), notes, identity_hash),
             )
             self._event(actor, "account_add", account_id, detail=owner)
             self._db.commit()
         return account_id
+
+    def last_deleted_at(self, identity_hash: str) -> float | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT MAX(disabled_at) AS t FROM accounts "
+                "WHERE identity_hash = %s AND owner LIKE 'deleted:%%'",
+                (identity_hash,),
+            ).fetchone()
+        return row["t"] if row and row["t"] is not None else None
 
     def set_account_disabled(self, account_id: int, disabled: bool, *, actor: str) -> int:
         with self._lock:
@@ -161,6 +189,27 @@ class KeyStore:
                 (time.time() if disabled else None, account_id),
             )
             self._event(actor, "account_disable" if disabled else "account_enable", account_id)
+            self._db.commit()
+        return cur.rowcount
+
+    def delete_account(self, account_id: int, *, actor: str) -> int:
+        now = time.time()
+        with self._lock:
+            self._db.execute(
+                "UPDATE api_keys SET revoked_at = %s WHERE account_id = %s AND revoked_at IS NULL",
+                (now, account_id),
+            )
+            cur = self._db.execute(
+                "UPDATE accounts SET owner = 'deleted:' || id, contact = NULL, hotkey = NULL, "
+                "notes = NULL, disabled_at = %s WHERE id = %s AND disabled_at IS NULL",
+                (now, account_id),
+            )
+            self._event(actor, "account_delete", account_id)
+            self._db.execute(
+                "UPDATE events SET actor = 'portal:deleted', detail = NULL "
+                "WHERE account_id = %s AND (actor LIKE 'portal:%%' OR action = 'account_add')",
+                (account_id,),
+            )
             self._db.commit()
         return cur.rowcount
 
@@ -174,6 +223,38 @@ class KeyStore:
             self._event(actor, "tier_change", account_id, detail=tier)
             self._db.commit()
         return cur.rowcount
+
+    def find_account(self, owner: str) -> Account | None:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM accounts WHERE owner = %s", (owner,)).fetchone()
+        return Account(**dict(row)) if row else None
+
+    def get_account(self, account_id: int) -> Account | None:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM accounts WHERE id = %s", (account_id,)).fetchone()
+        return Account(**dict(row)) if row else None
+
+    def count_events(self, account_id: int, actions: tuple[str, ...], since: float) -> int:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COUNT(*) AS n FROM events "
+                "WHERE account_id = %s AND action = ANY(%s) AND ts >= %s",
+                (account_id, list(actions), since),
+            ).fetchone()
+        return int(row["n"])
+
+    def tier(self, name: str) -> Mapping | None:
+        with self._lock:
+            return self._db.execute("SELECT * FROM tiers WHERE name = %s", (name,)).fetchone()
+
+    def key_usage(self, key_id: int, since: float) -> Mapping:
+        with self._lock:
+            return self._db.execute(
+                "SELECT COUNT(*) AS requests, "
+                "COALESCE(SUM(completion_tokens), 0) AS completion_tokens, "
+                "MAX(ts) AS last_used_at FROM usage WHERE key_id = %s AND ts >= %s",
+                (key_id, since),
+            ).fetchone()
 
     def list_accounts(self) -> list[Account]:
         with self._lock:
@@ -191,8 +272,9 @@ class KeyStore:
         daily_completion_tokens: int | None = None,
         max_prompt_tokens: int | None = None,
         actor: str = "cli",
+        action: str = "issue",
+        origin: str = "cli",
     ) -> tuple[ApiKey, dict[str, str]]:
-        secret = secrets.token_urlsafe(SECRET_BYTES)
         now = time.time()
         with self._lock:
             account = self._db.execute(
@@ -205,24 +287,38 @@ class KeyStore:
             if ttl_days is None:
                 ttl_days = account["key_ttl_days"]
             expires_at = now + ttl_days * 86400 if ttl_days else None
-            key_id = self._db.insert_id(
-                "INSERT INTO api_keys (account_id, secret_hash, hint, label, created_at, "
-                "expires_at, rpm, parallel, daily_completion_tokens, max_prompt_tokens) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (
-                    account_id,
-                    hash_secret(secret),
-                    secret[-4:],
-                    label,
-                    now,
-                    expires_at,
-                    rpm,
-                    parallel,
-                    daily_completion_tokens,
-                    max_prompt_tokens,
-                ),
-            )
-            self._event(actor, "issue", account_id, key_id, detail=label)
+            for _attempt in range(SECRET_RETRIES):
+                secret = secrets.token_urlsafe(SECRET_BYTES)
+                try:
+                    key_id = self._db.insert_id(
+                        "INSERT INTO api_keys (account_id, secret_hash, hint, hint_head, "
+                        "origin, label, created_at, expires_at, rpm, parallel, "
+                        "daily_completion_tokens, max_prompt_tokens) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            account_id,
+                            hash_secret(secret),
+                            secret[-4:],
+                            secret[:3],
+                            origin,
+                            label,
+                            now,
+                            expires_at,
+                            rpm,
+                            parallel,
+                            daily_completion_tokens,
+                            max_prompt_tokens,
+                        ),
+                    )
+                    break
+                except UniqueViolation as exc:
+                    self._db.rollback()
+                    if "secret_hash" in (exc.diag.constraint_name or ""):
+                        continue
+                    raise KeyNameTaken(label or "") from exc
+            else:
+                raise RuntimeError("could not generate a unique key secret")
+            self._event(actor, action, account_id, key_id, detail=label)
             self._db.commit()
             row = self._db.execute(_KEY_SELECT + "WHERE k.id = %s", (key_id,)).fetchone()
         presentations = {fmt: prefix + secret for fmt, prefix in self.formats()}
@@ -241,9 +337,23 @@ class KeyStore:
             self._db.commit()
         return cur.rowcount
 
-    def list_keys(self, account_id: int | None = None) -> list[ApiKey]:
-        where = "WHERE k.account_id = %s" if account_id is not None else ""
-        args = (account_id,) if account_id is not None else ()
+    def get_key(self, key_id: int, account_id: int) -> ApiKey | None:
+        with self._lock:
+            row = self._db.execute(
+                _KEY_SELECT + "WHERE k.id = %s AND k.account_id = %s", (key_id, account_id)
+            ).fetchone()
+        return _to_key(row, "") if row else None
+
+    def list_keys(self, account_id: int | None = None, origin: str | None = None) -> list[ApiKey]:
+        clauses = []
+        args: tuple = ()
+        if account_id is not None:
+            clauses.append("k.account_id = %s")
+            args += (account_id,)
+        if origin is not None:
+            clauses.append("k.origin = %s")
+            args += (origin,)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         with self._lock:
             rows = self._db.execute(_KEY_SELECT + f"{where} ORDER BY k.created_at", args).fetchall()
         return [_to_key(r, "") for r in rows]

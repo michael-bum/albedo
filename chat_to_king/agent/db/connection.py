@@ -41,6 +41,9 @@ class _Db:
     def commit(self) -> None:
         self._conn.commit()
 
+    def rollback(self) -> None:
+        self._conn.rollback()
+
     def apply_schema(self) -> None:
         self._conn.execute((_HERE / "schema.sql").read_text(encoding="utf-8"))
         self._conn.commit()

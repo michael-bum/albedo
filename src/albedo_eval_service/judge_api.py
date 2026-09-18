@@ -750,7 +750,6 @@ class QuestionService:
             "pruned_unreachable": pruned_out,
             "milestones_thin": thin,
             "enforcement_drops": drops,
-            "reference_trajectory": references[0] if references else "",
             "reference_trajectories": references,
             "discarded_questions": discarded,
         }

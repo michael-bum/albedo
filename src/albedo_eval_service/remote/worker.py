@@ -47,7 +47,7 @@ from .generation import (
     GenerationResult,
     Generator,
     VllmServerGenerator,
-    format_scored_trajectory,
+    scored_output,
 )
 from .state import RemoteRun
 
@@ -733,8 +733,6 @@ class RemoteEvalWorker:
                     "submit_marker": sample.submit_marker,
                     "submit_command": sample.submit_command,
                     "rewrite_mode": sample.rewrite_mode,
-                    "previous_king_output": king.text if king else "",
-                    "challenger_output": challenger.text if challenger else "",
                     "previous_king_turns": king.turns if king else None,
                     "challenger_turns": challenger.turns if challenger else None,
                     "king_error": king.error if king else "missing_generation",
@@ -1022,9 +1020,7 @@ def _merge_trajectory_results(
             GenerationResult(
                 sample_id=sample.sample_id,
                 # judges never see the retry feedback; it stays in `turns` for the artifact
-                text=format_scored_trajectory(
-                    [turn for turn in turns if not turn.get("retry_feedback")]
-                ),
+                text=scored_output(turns),
                 error=None,
                 turns=turns,
                 truncated=truncated,

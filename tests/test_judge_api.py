@@ -791,7 +791,7 @@ def test_prepare_anchors_on_reference_and_filters_leaks():
     assert result.source["question_mode"] == "milestone_ladder"
     assert result.source["reference_runs"] == 3
     assert result.source["reference_models"] == ["z-ai/glm-5.2"] * 3
-    assert "REFERENCE STEP" in result.source["reference_trajectory"]
+    assert "REFERENCE STEP" in result.source["reference_trajectories"][0]
     assert result.source["milestones_kept"] == 2
     assert all("the reference" not in q["text"].casefold() for q in result.questions)
 

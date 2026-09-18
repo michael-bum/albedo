@@ -63,6 +63,10 @@ def format_scored_trajectory(turns: list[dict[str, Any]]) -> str:
     return "\n".join(parts).strip()
 
 
+def scored_output(turns: list[dict[str, Any]]) -> str:
+    return format_scored_trajectory([turn for turn in turns if not turn.get("retry_feedback")])
+
+
 _CONTEXT_SAFETY_MARGIN_TOKENS = 64
 _SERVED_MODEL_NAME = "candidate"
 

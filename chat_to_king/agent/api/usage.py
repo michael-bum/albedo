@@ -6,12 +6,17 @@ from common.usage import usage_from_bytes as _usage_from_bytes
 __all__ = ["_TAIL_BYTES", "_prompt_chars", "_usage_from_bytes"]
 
 
-_PROMPT_FIELDS = ("messages", "system", "input", "prompt", "instructions")
+_PROMPT_FIELDS = ("messages", "system", "input", "prompt", "instructions", "tools")
+_CHARS_PER_TOKEN_ID = 4
 
 
 def _text_len(obj) -> int:
     if isinstance(obj, str):
         return len(obj)
+    if isinstance(obj, bool):
+        return 0
+    if isinstance(obj, int):
+        return _CHARS_PER_TOKEN_ID
     if isinstance(obj, dict):
         return sum(_text_len(v) for v in obj.values())
     if isinstance(obj, list):

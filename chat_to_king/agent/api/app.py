@@ -34,7 +34,22 @@ _KIND_BY_PATH = {
     "/v1/messages": "anthropic",
     "/v1/responses": "responses",
 }
-_STRIPPED_FIELDS = ("best_of", "prompt_logprobs", "top_logprobs")
+_STRIPPED_FIELDS = (
+    "best_of",
+    "prompt_logprobs",
+    "top_logprobs",
+    "min_tokens",
+    "ignore_eos",
+    "guided_json",
+    "guided_regex",
+    "guided_grammar",
+    "guided_choice",
+    "guided_decoding_backend",
+    "guided_whitespace_pattern",
+    "structured_outputs",
+    "priority",
+)
+_REPLY_CAP_FIELDS = ("max_tokens", "max_completion_tokens", "max_output_tokens")
 _CHARS_PER_TOKEN = 4
 
 
@@ -243,9 +258,16 @@ def create_ide_app(
                 )
             return JSONResponse(body, headers={STATUS_HEADER: "serving"})
 
-        max_tokens = payload.get("max_tokens")
-        if not isinstance(max_tokens, int) or max_tokens > settings.max_tokens_cap:
-            payload["max_tokens"] = settings.max_tokens_cap
+        for field in _REPLY_CAP_FIELDS:
+            if field not in payload and field != "max_tokens":
+                continue
+            value = payload.get(field)
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value > settings.max_tokens_cap
+            ):
+                payload[field] = settings.max_tokens_cap
         if path in ("/v1/chat/completions", "/v1/messages"):
             kwargs = payload.get("chat_template_kwargs")
             kwargs = dict(kwargs) if isinstance(kwargs, dict) else {}

@@ -68,7 +68,7 @@ def _fake_vllm(seen: list[dict], reply: dict[str, object]) -> FastAPI:
 def env(pg_url):
     settings = KingAgentSettings(database_url=pg_url, max_body_bytes=2000)
     store = KeyStore(pg_url)
-    account = store.add_account("alice", tier="beta")
+    account = store.add_account("alice", tier="standard")
     _key, shown = store.issue(account, max_prompt_tokens=10)
     app = create_ide_app(FakeEngine(), settings, store, king=KingInfoSource(fixed=KING))
     seen: list[dict] = []
@@ -131,6 +131,69 @@ def test_prompt_chars_covers_every_protocol_field():
     )
     assert _prompt_chars({"prompt": "p" * 7}) == 7
     assert _prompt_chars({"messages": [{"role": "user", "content": 5}]}) < 10
+    assert _prompt_chars({"prompt": list(range(100))}) >= 400
+    assert _prompt_chars({"prompt": [list(range(50)), list(range(50))]}) >= 400
+    assert (
+        _prompt_chars({"messages": [], "tools": [{"function": {"description": "d" * 300}}]}) >= 300
+    )
+    assert _prompt_chars({"prompt": True}) == 0
+
+
+@pytest.mark.anyio
+async def test_every_reply_length_field_is_capped(env):
+    r = await _post(env, _chat(max_tokens=99999, max_completion_tokens=99999))
+    assert r.status_code == 200
+    sent = env.seen[0]
+    assert sent["max_tokens"] == 8192 and sent["max_completion_tokens"] == 8192
+    r = await env.client.post(
+        "/v1/responses",
+        json={"model": "albedo-king", "input": "hi", "max_output_tokens": 99999},
+        headers={"authorization": f"Bearer {env.key}"},
+    )
+    assert r.status_code in (200, 404, 500)
+    r = await _post(env, _chat(max_tokens=True))
+    assert env.seen[-1]["max_tokens"] == 8192
+
+
+@pytest.mark.anyio
+async def test_expensive_engine_extras_are_stripped(env):
+    r = await _post(
+        env,
+        _chat(
+            min_tokens=8000,
+            ignore_eos=True,
+            guided_regex="(a|b)*",
+            guided_json={"type": "object"},
+            structured_outputs={"x": 1},
+            priority=-100,
+            temperature=0.2,
+        ),
+    )
+    assert r.status_code == 200
+    sent = env.seen[0]
+    assert (
+        not {
+            "min_tokens",
+            "ignore_eos",
+            "guided_regex",
+            "guided_json",
+            "structured_outputs",
+            "priority",
+        }
+        & sent.keys()
+    )
+    assert sent["temperature"] == 0.2
+
+
+@pytest.mark.anyio
+async def test_token_id_prompt_hits_the_prompt_cap(env):
+    r = await env.client.post(
+        "/v1/completions",
+        json={"model": "albedo-king", "prompt": list(range(500))},
+        headers={"authorization": f"Bearer {env.key}"},
+    )
+    assert r.status_code == 400 and r.json()["error"]["code"] == "context_length_exceeded"
+    assert env.seen == []
 
 
 @pytest.mark.anyio

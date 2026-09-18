@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import httpx
 from agent.api.agent_step import agent_step
 from agent.api.limiter import STATUS_HEADER, Limiter, _error
+from agent.api.portal import GitHubOAuth, create_portal_app
 from agent.api.usage import _TAIL_BYTES, _prompt_chars, _usage_from_bytes
 from agent.config import KingAgentSettings
 from agent.db import ApiKey, KeyStore, client_family
@@ -78,6 +79,7 @@ def create_ide_app(
     store: KeyStore | None = None,
     king: KingInfoSource | None = None,
     meter: TokenMeter | None = None,
+    github: GitHubOAuth | None = None,
 ) -> FastAPI:
     king = king or KingInfoSource(settings.current_king_file)
     meter = meter or TokenMeter(settings.database_url, "agent")
@@ -388,16 +390,19 @@ def create_ide_app(
 
         return StreamingResponse(_relay(), status_code=upstream.status_code, headers=headers)
 
+    _public_headers = {"access-control-allow-origin": settings.portal_site_origin.rstrip("/")}
+
     @app.get("/health")
-    async def health() -> dict[str, object]:
+    async def health():
         info = king.get()
-        return {"status": "ok", "state": await _state(), "king": info.public() if info else None}
+        body = {"status": "ok", "state": await _state(), "king": info.public() if info else None}
+        return JSONResponse(body, headers=_public_headers)
 
     @app.get("/status")
-    async def status() -> dict[str, object]:
+    async def status():
         state = await _state()
         info = king.get()
-        return {
+        body = {
             "state": state,
             "model": settings.served_model_name,
             "king": info.public() if info else None,
@@ -405,6 +410,7 @@ def create_ide_app(
             "retry_after_s": settings.retry_after_s if state != "serving" else 0,
             "notice": None if state == "serving" else loading_text(info),
         }
+        return JSONResponse(body, headers=_public_headers)
 
     @app.get("/v1/models")
     async def models(request: Request):
@@ -439,5 +445,8 @@ def create_ide_app(
     @app.post("/v1/responses")
     async def responses(request: Request):
         return await _complete(request, "/v1/responses")
+
+    if settings.portal_enabled or github is not None:
+        app.mount("/portal", create_portal_app(settings, keys, github))
 
     return app

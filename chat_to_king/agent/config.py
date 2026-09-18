@@ -43,6 +43,31 @@ class KingAgentSettings(BaseSettings):
 
     trace_dir: str = "/root/king-agent-traces"
 
+    github_client_id: str = ""
+    github_client_secret: str = ""
+    portal_session_secret: str = ""
+    portal_public_url: str = "https://api.albedo.tech/portal"
+    portal_site_origin: str = "https://albedo.tech"
+    portal_cookie_name: str = "albedo_portal"
+    portal_cookie_secure: bool = True
+    portal_session_ttl_s: int = 7 * 86400
+    portal_account_min_age_days: int = 30
+    portal_creations_per_day: int = 5
+    portal_history_hours: int = 24
+    portal_history_rows: int = 50
+    portal_ip_rpm: int = 30
+    portal_tier: str = "standard"
+    portal_recreate_cooldown_hours: int = 24
+    support_url: str = ""
+
+    @property
+    def portal_enabled(self) -> bool:
+        return bool(
+            self.github_client_id
+            and self.github_client_secret
+            and len(self.portal_session_secret) >= 32
+        )
+
     @property
     def current_king_file(self) -> Path:
         return Path(self.models_dir) / CURRENT_FILE

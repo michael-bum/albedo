@@ -98,6 +98,16 @@ resolves each turn in this order:
    canonical refusal text with the right returncode. No model call.
 2. **Grounded execution** — the **repo-context service** (`src/repo_context_service/`) resolves the
    sample id to a repository + commit, fetches a snapshot, and *runs the command against it*:
+   - `core.py:_resolve_sha` picks the tree the agent actually worked on, which is **not** the commit
+     named in the id for three sources. `mini-coder*` ids name a branch of the swesmith mirror
+     (`github.com/swesmith/<owner>__<repo>.<short-commit>`, history `Initial commit` (clean) <-
+     `Bug Patch` [<- `Remove F2P Tests`]): Python/Go trajectories ran at the branch head (bug in
+     place, fail-to-pass test files deleted), the Rust ones (`mini-coder-rs`) at `Bug Patch`, because
+     a Rust "test file" is the whole source file and the head deletes it. `swe-hero` ids name the
+     R2E-Gym *fix* commit; the agent worked on its parent. Verified 2026-09-21 against real
+     trajectories: 40/40 pre-edit reads of the bug files match the chosen tree (upstream commit:
+     16/40; swe-hero fix commit: 383/722 lines vs 722/722 for the parent). Cached resolutions carry
+     `rule=_SHA_RULE`; bump it when this mapping changes and old entries are ignored.
    - `command_search.py` executes `find` / `grep` / `ls` / `sed` / `cat` and friends — BRE→Python
      translation, `-prune`/`-o` rewriting, `-name`/`-iname`/`-path`, POSIX classes, `2>/dev/null`.
    - `git_sim/` executes a subset of `git` (log, show, diff, status, branch…) against the snapshot,

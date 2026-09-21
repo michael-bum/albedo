@@ -15,6 +15,7 @@ from albedo_config import RepoContextSettings
 from repo_context_service.command_search import ParseFailure, parse_search, run_search
 from repo_context_service.core import (
     _NEGATIVE_TTL_SECONDS,
+    _SHA_RULE,
     _TRANSIENT_TTL_SECONDS,
     GroundingContext,
     RepoContextService,
@@ -23,7 +24,9 @@ from repo_context_service.core import (
     _is_permanent_github_error,
     _NotFound,
     _referenced_paths,
+    _safe_name,
     _sed_scripts,
+    _smith_mirror,
     _SnapshotTooLarge,
     parse_instance,
 )
@@ -1090,3 +1093,109 @@ def test_pwd_answers_from_the_session_root_and_declines_without_one():
     # would print - is no longer visible: answering from the session root would name the old one
     assert isinstance(parse_search("cd /elsewhere && pwd"), ParseFailure)
     assert isinstance(parse_search("pwd -P"), ParseFailure)
+
+
+HEAD_SHA = "1" * 40
+BUG_SHA = "2" * 40
+INITIAL_SHA = "3" * 40
+SMITH_ID = "BurntSushi__ripgrep.3b7fd442.func_pm_flip_operators__3m5orim"
+
+
+def _smith_head(*subjects: str) -> dict:
+    """The commits/<branch> payload for a swesmith branch whose history is `subjects`, newest
+    first."""
+    shas = [HEAD_SHA, BUG_SHA, INITIAL_SHA]
+    return {
+        "sha": shas[0],
+        "commit": {"message": subjects[0]},
+        "parents": [{"sha": shas[1]}] if len(subjects) > 1 else [],
+    }
+
+
+def test_smith_mirror_points_mini_coder_ids_at_the_swesmith_branch():
+    ref = parse_instance("mini-coder", SMITH_ID)
+    mirror = _smith_mirror(ref)
+    assert (mirror.owner, mirror.repo, mirror.commit) == (
+        "swesmith",
+        "BurntSushi__ripgrep.3b7fd442",
+        SMITH_ID,
+    )
+    assert mirror.instance_id == ref.instance_id  # the sha cache stays keyed by instance id
+    assert _smith_mirror(parse_instance("swe-hero", f"pandas-dev__pandas-{FULL_SHA}")) is None
+    assert _smith_mirror(parse_instance("open-swe-traces", "python-attrs__attrs-770")) is None
+
+
+@pytest.mark.parametrize(
+    ("source", "history", "expected"),
+    [
+        # Python/Go trajectories ran at the branch head: bug in place, F2P test files deleted.
+        ("mini-coder", ("Remove F2P Tests", "Bug Patch", "Initial commit"), HEAD_SHA),
+        ("mini-coder", ("Bug Patch", "Initial commit"), HEAD_SHA),
+        # The Rust harness ran at Bug Patch; there the head deletes whole source files.
+        ("mini-coder-rs", ("Remove F2P Tests", "Bug Patch", "Initial commit"), BUG_SHA),
+        # ...unless the branch never got a removal commit, so the head is Bug Patch itself.
+        ("mini-coder-rs", ("Bug Patch", "Initial commit"), HEAD_SHA),
+    ],
+)
+def test_resolve_sha_smith_mirror_picks_the_commit_the_agent_ran_on(
+    tmp_path, monkeypatch, source, history, expected
+):
+    service = make_service(tmp_path)
+    calls = []
+
+    def fake_github_json(path):
+        calls.append(path)
+        assert path == f"/repos/swesmith/BurntSushi__ripgrep.3b7fd442/commits/{SMITH_ID}"
+        return _smith_head(*history)
+
+    monkeypatch.setattr(service, "_github_json", fake_github_json)
+    ref = parse_instance(source, SMITH_ID)
+    assert service._resolve_sha(ref) == ("swesmith", "BurntSushi__ripgrep.3b7fd442", expected)
+    assert len(calls) == 1
+
+
+def test_resolve_sha_swe_hero_uses_the_parent_of_the_fix_commit(tmp_path, monkeypatch):
+    """R2E-Gym ids name the fix commit; the trajectory was recorded on its parent."""
+    service = make_service(tmp_path)
+    fix, parent = "4a" * 20, "5b" * 20  # an all-digit tail would parse as a PR number
+
+    def fake_github_json(path):
+        assert path == f"/repos/pandas-dev/pandas/commits/{fix}"
+        return {"sha": fix, "commit": {"message": "BUG: x (#1)"}, "parents": [{"sha": parent}]}
+
+    monkeypatch.setattr(service, "_github_json", fake_github_json)
+    ref = parse_instance("swe-hero", f"pandas-dev__pandas-{fix}")
+    assert service._resolve_sha(ref) == ("pandas-dev", "pandas", parent)
+
+
+def test_resolve_sha_plain_commit_ids_keep_using_the_commit_itself(tmp_path, monkeypatch):
+    service = make_service(tmp_path)
+
+    def fake_github_json(path):
+        assert path == f"/repos/own/repo/commits/{FULL_SHA}"
+        return {"sha": FULL_SHA, "commit": {"message": "x"}, "parents": [{"sha": "6" * 40}]}
+
+    monkeypatch.setattr(service, "_github_json", fake_github_json)
+    ref = parse_instance("open-swe-traces", f"own__repo-{FULL_SHA}")
+    assert service._resolve_sha(ref) == ("own", "repo", FULL_SHA)
+
+
+def test_resolve_sha_ignores_cache_entries_written_under_an_older_rule(tmp_path, monkeypatch):
+    """Entries from before the swesmith/swe-hero rules point at the clean upstream tree. They
+    must be resolved again rather than served, so a deploy needs no manual cache purge."""
+    service = make_service(tmp_path)
+    cache_file = service.cache_dir / "shas" / f"{_safe_name(SMITH_ID)}.json"
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text(json.dumps({"owner": "BurntSushi", "repo": "ripgrep", "sha": FULL_SHA}))
+    calls = []
+
+    def fake_github_json(path):
+        calls.append(path)
+        return _smith_head("Remove F2P Tests", "Bug Patch", "Initial commit")
+
+    monkeypatch.setattr(service, "_github_json", fake_github_json)
+    ref = parse_instance("mini-coder", SMITH_ID)
+    assert service._resolve_sha(ref) == ("swesmith", "BurntSushi__ripgrep.3b7fd442", HEAD_SHA)
+    assert json.loads(cache_file.read_text())["rule"] == _SHA_RULE
+    assert service._resolve_sha(ref) == ("swesmith", "BurntSushi__ripgrep.3b7fd442", HEAD_SHA)
+    assert len(calls) == 1

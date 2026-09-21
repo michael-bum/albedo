@@ -74,9 +74,11 @@ otherwise good observation.
 
 ### What the simulator must emit
 
-`judge_api` builds the simulator's system prompt as `BASE_PROMPT` + the repo-context block (when
-grounding is available) + the detected format's `OUTPUT FORMAT` section. Output is then gated by
-`observation_format.valid_output`:
+`judge_api` builds the simulator request with `simulation_messages`: the system prompt is
+`BASE_PROMPT` + the detected format's `OUTPUT FORMAT` section, and the user message holds the
+transcript followed by the repo-context block (when grounding is available) and any retry note.
+Keeping the per-turn block out of the system prompt lets providers cache the transcript prefix
+across turns. Output is then gated by `observation_format.valid_output`:
 
 | format | accepted |
 |---|---|

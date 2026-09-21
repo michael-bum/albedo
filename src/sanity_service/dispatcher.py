@@ -68,7 +68,7 @@ from albedo_eval_service.simulator.prompt_simulator import (
     COMPUTED_BLOCK_MARKER,
     DEGENERATE_RETRY,
     MUST_PRINT_RETRY,
-    simulation_system_prompt,
+    simulation_messages,
 )
 from sanity_remote.models import SanityRunRequest
 from sanity_service.chain import (
@@ -923,10 +923,7 @@ async def _confirm_silence(
     try:
         response = await client.complete(
             model=settings.evaluator_model,
-            messages=[
-                {"role": "system", "content": simulation_system_prompt(fmt)},
-                {"role": "user", "content": transcript},
-            ],
+            messages=simulation_messages(fmt, transcript),
             temperature=0.0,
             max_tokens=settings.simulation_max_tokens,
             provider=_evaluator_provider(settings),
@@ -1295,16 +1292,14 @@ async def _simulate_observation_uncached(
     )
     observation = ""
     for attempt in range(MAX_CONSECUTIVE_DEGENERATE_OBSERVATIONS):
-        ask = transcript if attempt == 0 else f"{transcript}\n\n{DEGENERATE_RETRY}"
         rescue = attempt == MAX_CONSECUTIVE_DEGENERATE_OBSERVATIONS - 1
         response = await client.complete(
             model=settings.evaluator_model
             if rescue
             else (settings.simulation_model or settings.evaluator_model),
-            messages=[
-                {"role": "system", "content": simulation_system_prompt(fmt, context_block)},
-                {"role": "user", "content": ask},
-            ],
+            messages=simulation_messages(
+                fmt, transcript, context_block, None if attempt == 0 else DEGENERATE_RETRY
+            ),
             temperature=0.0 if attempt == 0 else _DEGENERATE_RETRY_TEMPERATURE,
             max_tokens=settings.simulation_max_tokens,
             provider=_evaluator_provider(settings) if rescue else _simulation_provider(settings),
@@ -1455,10 +1450,7 @@ async def _retry_for_output(
     ):
         response = await client.complete(
             model=model,
-            messages=[
-                {"role": "system", "content": simulation_system_prompt(fmt)},
-                {"role": "user", "content": f"{transcript}\n\n{MUST_PRINT_RETRY}"},
-            ],
+            messages=simulation_messages(fmt, transcript, None, MUST_PRINT_RETRY),
             temperature=0.0,
             max_tokens=settings.simulation_max_tokens,
             provider=provider,

@@ -15,10 +15,10 @@ EVALUATOR_MODEL = "z-ai/glm-5.2"
 EVALUATOR_PROVIDERS = "streamlake,baidu"
 SOTA_MODELS = "z-ai/glm-5.2"
 SIMULATION_MODEL = "deepseek/deepseek-v4.1-flash"
-SIMULATION_PROVIDERS = "deepseek,siliconflow,novita,gmicloud"
+SIMULATION_PROVIDERS = "deepseek,fireworks,novita,streamlake"
 
 JUDGE_PROVIDER_PINS[SIMULATION_MODEL] = {
     "allow_fallbacks": False,
-    "order": ["deepseek", "siliconflow", "novita", "gmicloud"],
+    "order": ["deepseek", "fireworks", "novita", "streamlake"],
 }
 ENGY_MODELS = "z-ai/glm-5.2,deepseek/deepseek-v4-flash-0731"

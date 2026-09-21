@@ -119,7 +119,7 @@ from .simulator.prompt_simulator import (
     MUST_PRINT_RETRY,
     missing_command_output,
     reference_completion_observation,
-    simulation_system_prompt,
+    simulation_messages,
 )
 
 
@@ -791,10 +791,7 @@ class ObservationSimulationService:
         response = await self.client.complete(
             purpose="simulate",
             model=primary,
-            messages=[
-                {"role": "system", "content": simulation_system_prompt(fmt, context_block)},
-                {"role": "user", "content": f"{transcript}\n\n{MUST_PRINT_RETRY}"},
-            ],
+            messages=simulation_messages(fmt, transcript, context_block, MUST_PRINT_RETRY),
             temperature=0.0,
             eval_run_id=request.eval_run_id,
             max_tokens=self.settings.simulation_max_tokens,
@@ -950,13 +947,7 @@ class ObservationSimulationService:
         best_rank = -1
         for model, tries, provider_block, or_only in attempts:
             capped = model == primary and primary != fallback_model
-            messages = [
-                {
-                    "role": "system",
-                    "content": simulation_system_prompt(fmt, context_block),
-                },
-                {"role": "user", "content": transcript},
-            ]
+            messages = simulation_messages(fmt, transcript, context_block)
             # one parse attempt per rung: the ladder itself is the retry mechanism, and
             # every extra in-rung attempt lands on the turn barrier's critical path
             capped_kwargs = {"parse_retries": 1, "retry_count": 1} if capped else {}

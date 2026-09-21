@@ -47,6 +47,10 @@ STRICT RULES:
 - Never render the same line or block twice: a real file lists an import once and defines each
   method once, and grep or find prints a match once. Repeating content makes the file look
   corrupted and sends the agent chasing damage that does not exist.
+- Repository facts may follow the transcript under a heading such as REPOSITORY FILE LISTING,
+  COMMAND OUTPUT, GIT SEMANTICS or CHAIN STAGES ALREADY EXECUTED. They were produced by
+  inspecting the real repository for the current command: treat them as ground truth about
+  the machine you simulate, ahead of anything you would otherwise infer.
 - Anchor on evidence: file, directory and symbol names mentioned in the task description OR in
   any earlier observation in this transcript are real — build your output around them and the
   standard layout for the project's language. When you cannot infer paths with confidence,
@@ -150,6 +154,26 @@ def simulation_system_prompt(fmt: str, context_block: str | None = None) -> str:
     if context_block.lstrip().startswith(COMPUTED_BLOCK_MARKER):
         return f"{TRANSCRIBE_PROMPT}\n{context_block}\n{block}"
     return f"{BASE_PROMPT}\n{context_block}\n{block}"
+
+
+def simulation_messages(
+    fmt: str, transcript: str, context_block: str | None = None, note: str | None = None
+) -> list[dict[str, str]]:
+    if context_block and context_block.lstrip().startswith(COMPUTED_BLOCK_MARKER):
+        user = f"{transcript}\n\n{note}" if note else transcript
+        return [
+            {"role": "system", "content": simulation_system_prompt(fmt, context_block)},
+            {"role": "user", "content": user},
+        ]
+    parts = [transcript]
+    if context_block:
+        parts.append(context_block)
+    if note:
+        parts.append(note)
+    return [
+        {"role": "system", "content": simulation_system_prompt(fmt)},
+        {"role": "user", "content": "\n\n".join(parts)},
+    ]
 
 
 MISSING_COMMAND_MESSAGE = "No bash command found in assistant message."

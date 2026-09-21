@@ -1,0 +1,38 @@
+name: Sync Fork
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Add upstream
+        run: |
+          git remote add upstream https://github.com/unarbos/albedo.git
+      - name: Fetch upstream
+        run: |
+          git fetch upstream
+      - name: Sync main from upstream
+        run: |
+          git checkout main
+          git merge upstream/main --no-edit
+      - name: Push changes to fork
+        run: |
+          git push https://x-access-token:${{ secrets.SYNC_PAT }}@github.com/michael-bum/albedo.git main

@@ -46,15 +46,59 @@ def _turns(steps: list[dict]) -> list[dict]:
     return turns
 
 
-def _references(qs: dict) -> list[tuple[str, list[dict]]]:
-    """(model, turns) pairs. `reference_steps` carries each run as steps; artifacts written before
-    it carry the runs as rendered text, which has to be re-split to get the same thing back."""
+def _references(qs: dict) -> list[tuple[int, str, bool | None, list[dict]]]:
+    """(run, model, made_edit, turns) per reference run. `reference_steps` carries each run as
+    steps; artifacts written before it carry the runs as rendered text, which has to be re-split
+    to get the same thing back, and never said which run edited."""
     runs = qs.get("reference_steps")
     if runs:
-        return [(run.get("model", ""), _turns(run["steps"])) for run in runs]
+        return [
+            (
+                int(run.get("run") or i),
+                run.get("model", ""),
+                run.get("made_edit"),
+                _turns(run["steps"]),
+            )
+            for i, run in enumerate(runs, start=1)
+        ]
     models = qs.get("reference_models") or [qs.get("reference_model")]
     trajs = qs.get("reference_trajectories") or [qs.get("reference_trajectory")]
-    return [(m, parse_trajectory(t)) for m, t in zip(models, trajs) if m and t]
+    return [
+        (i, m, None, parse_trajectory(t))
+        for i, (m, t) in enumerate(zip(models, trajs), 1)
+        if m and t
+    ]
+
+
+def _columns(rec: dict, run: int, made_edit: bool | None, run_id: str) -> dict:
+    """The score columns of one reference run; None wherever this artifact never recorded it."""
+    qs = rec.get("question_source") or {}
+    earned = qs.get("reference_scoring")  # question id -> runs that earned it, since 2026-09-22
+    scores = {s["run"]: s["yes_rate"] for s in qs.get("reference_self_scores") or []}
+    questions = [
+        {
+            "id": q.get("id"),
+            "text": q.get("text"),
+            "milestone": q.get("milestone"),
+            "rung": q.get("rung"),
+            "weight": q.get("weight"),
+            "earned": (run in earned.get(q.get("id"), [])) if earned is not None else None,
+        }
+        for q in rec.get("questions") or []
+    ]
+    milestones = [
+        {"id": m.get("id"), "statement": m.get("statement"), "category": m.get("category")}
+        for m in qs.get("milestones") or []
+    ]
+    return {
+        "run": run,
+        "made_edit": made_edit,
+        "score": scores.get(run),
+        "questions": json.dumps(questions) if questions else None,
+        "milestones": json.dumps(milestones) if milestones else None,
+        "king_score": rec.get("king_score"),
+        "eval_run_id": run_id,
+    }
 
 
 def extract_rows(run_dir: Path) -> dict[str, list[dict]]:
@@ -72,7 +116,7 @@ def extract_rows(run_dir: Path) -> dict[str, list[dict]]:
             sample_id = rec["sample_id"].split("#")[0]
             if sample_id not in prompts:
                 continue
-            for ref_model, turns in _references(rec.get("question_source") or {}):
+            for run, ref_model, made_edit, turns in _references(rec.get("question_source") or {}):
                 key = (sample_id, tuple(t["content"] for t in turns if t["role"] == "assistant"))
                 if key in seen:
                     continue
@@ -84,6 +128,11 @@ def extract_rows(run_dir: Path) -> dict[str, list[dict]]:
                     *turns,
                 ]
                 by_model.setdefault(sanitize(ref_model), []).append(
-                    {"sample_id": sample_id, "messages": messages, "_run_id": run_id}
+                    {
+                        "sample_id": sample_id,
+                        "messages": messages,
+                        "_run_id": run_id,
+                        **_columns(rec, run, made_edit, run_id),
+                    }
                 )
     return by_model

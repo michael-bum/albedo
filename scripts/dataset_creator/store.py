@@ -5,8 +5,25 @@ import re
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from config import Config
 from state import State
+
+SCHEMA = pa.schema(
+    [
+        ("sample_id", pa.string()),
+        ("messages", pa.list_(pa.struct([("role", pa.string()), ("content", pa.string())]))),
+        ("run", pa.int64()),
+        ("made_edit", pa.bool_()),
+        ("score", pa.float64()),
+        ("questions", pa.string()),
+        ("milestones", pa.string()),
+        ("king_score", pa.float64()),
+        ("eval_run_id", pa.string()),
+    ]
+)
+COLUMNS = SCHEMA.names
 
 _CHUNK_NO_RE = re.compile(r"-(\d+)\.parquet$")
 
@@ -42,12 +59,18 @@ def _repo_path(model: str, name: str) -> str:
     return f"data/{model}/{name}"
 
 
+def write_chunk_file(rows: list[dict], path: Path) -> None:
+    """Rows to parquet under SCHEMA; a column a row does not carry is null."""
+    table = pa.Table.from_pylist([{k: row.get(k) for k in COLUMNS} for row in rows], schema=SCHEMA)
+    pq.write_table(table, path)
+
+
 def _write_chunk(cfg: Config, model: str, no: int, rows: list[dict]) -> str:
     model_dir = cfg.out_dir / model
     model_dir.mkdir(parents=True, exist_ok=True)
     name = f"{model}-{no:04d}.parquet"
     tmp = model_dir / (name + ".tmp")
-    pd.DataFrame(rows)[["sample_id", "messages"]].to_parquet(tmp, index=False)
+    write_chunk_file(rows, tmp)
     tmp.rename(model_dir / name)
     return name
 

@@ -1499,3 +1499,13 @@ def test_simulation_messages_transcribe_a_computed_output_the_old_way():
     messages = simulation_messages(OPENHANDS, "$ grep -n x", block)
     assert messages[0]["content"] == simulation_system_prompt(OPENHANDS, block)
     assert messages[1]["content"] == "$ grep -n x"
+
+
+def test_repo_context_client_keeps_few_requests_in_flight_and_never_times_out_on_the_pool():
+    client = RepoContextClient(JudgeSettings(repo_context_url="http://127.0.0.1:9"))
+    try:
+        assert client._client.timeout.pool is None
+        assert client._client.timeout.read == JudgeSettings().repo_context_timeout_seconds
+        assert client._client._transport._pool._max_connections == 8
+    finally:
+        asyncio.run(client.aclose())

@@ -793,9 +793,16 @@ def test_prepare_anchors_on_reference_and_filters_leaks():
     assert result.source["question_mode"] == "milestone_ladder"
     assert result.source["reference_runs"] == 3
     assert result.source["reference_models"] == ["z-ai/glm-5.2"] * 3
-    assert "REFERENCE STEP" in result.source["reference_trajectories"][0]
+    first_run = result.source["reference_steps"][0]
+    assert first_run["run"] == 1 and first_run["steps"][0]["assistant"]
     assert result.source["milestones_kept"] == 2
     assert all("the reference" not in q["text"].casefold() for q in result.questions)
+    milestones = {m["id"]: m for m in result.source["milestones"]}
+    assert {q["milestone"] for q in result.questions} <= set(milestones)
+    assert all(
+        m["evidence"] and m["consensus"] == sorted({e["run"] for e in m["evidence"]})
+        for m in milestones.values()
+    )
 
     from albedo_eval_service.judge_core import question_weight
 
@@ -852,6 +859,69 @@ def test_prepare_drops_questions_no_reference_can_answer():
     kept = {q["text"] for q in result.questions}
     assert result.source["pruned_unreachable"] == 1, "only the question nobody earned is dropped"
     assert len(kept) == result.source["n_questions"]
+
+
+def test_reference_scoring_joins_on_the_ids_the_checklist_ships_with():
+    """A pruned question renumbers every question after it, and the join table must follow.
+
+    The table is keyed by the ids the shipped checklist carries, so a question that was q_05
+    before the prune and q_04 after must appear as q_04; a stale pre-prune id would hand one
+    question's references to its neighbour, silently and only ever in the artifact.
+    """
+    from albedo_eval_service.judge_api import QuestionPrepSample
+
+    class MiddlePruned(_AnchorFakeClient):
+        """Nobody earns the second question; the fifth is earned by the first run alone."""
+
+        def __init__(self):
+            super().__init__()
+            self.seen = 0
+
+        async def score(self, **kwargs):
+            ids = kwargs["response_schema"]["properties"]["answers"]["items"]["properties"][
+                "asked"
+            ]["enum"]
+            self.seen += 1
+            unearned = {"q_02"} if self.seen == 1 else {"q_02", "q_05"}
+            return JudgeRawResponse(
+                model=kwargs["model"],
+                provider="fake",
+                raw=json.dumps(
+                    {
+                        "answers": [
+                            {"asked": qid, "reason": "e", "verdict": 0 if qid in unearned else 1}
+                            for qid in ids
+                        ]
+                    }
+                ),
+            )
+
+    fake = MiddlePruned()
+    service = _anchor_service(fake)
+    sample = QuestionPrepSample(
+        sample_id="s:1:1",
+        prompt="TASK",
+        messages=[{"role": "user", "content": "fix the bug"}],
+        assistant_turns=2,
+    )
+    result = asyncio.run(service.prepare(sample, eval_run_id="run-1"))
+    scoring = result.source["reference_scoring"]
+
+    assert set(scoring) == {q["id"] for q in result.questions}, "one entry per shipped question"
+    assert all(scoring.values()), "a kept question was earned by at least one run"
+    pruned = [d for d in result.source["discarded_questions"] if d["stage"] == "reference_prune"]
+    assert len(pruned) == 1, "the question nobody earned is recorded as discarded, not scored"
+    route_specific = [qid for qid, runs in scoring.items() if runs == [1]]
+    assert len(route_specific) == 1
+    assert route_specific[0] != "q_05", "ids must be the post-prune ones"
+    assert "scored_by" not in result.questions[0], "the join lives in reference_scoring only"
+
+    kept = len(result.questions)
+    assert [entry["yes_rate"] for entry in result.source["reference_self_scores"]] == [
+        1.0,
+        round((kept - 1) / kept, 6),
+        round((kept - 1) / kept, 6),
+    ]
 
 
 def test_prepare_raises_when_every_reference_run_fails():

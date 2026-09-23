@@ -61,9 +61,9 @@ function answerView(j, qid) {
   const a = j?.answers?.[qid];
   const v = answerValue(j, qid);
   if (v == null) return { glyph: "·", cls: "muted", text: a ?? "no answer" };
-  const letter = a && a !== "1" && a !== "0";
-  const glyph = letter ? v.toFixed(2) : v >= 0.5 ? "✓" : "✗";
-  const text = letter ? `${a} = ${v}` : a;
+  const graded = typeof j?.scores?.[qid] === "number";
+  const glyph = graded ? v.toFixed(2) : v >= 0.5 ? "✓" : "✗";
+  const text = graded ? `${a ?? "—"} = ${v}` : a;
   return { glyph, cls: v >= 0.5 ? "ok" : "bad", text };
 }
 

@@ -239,7 +239,7 @@ const REPORT_STATES = [
   ["error_ids", "ERROR", null],   // graded, but the harness reached no verdict
 ];
 
-function reportTaskResults(pulled, run, report) {
+function reportTaskResults(report, trajectoryOf) {
   const states = new Map();
   for (const [key, state, score] of REPORT_STATES) {
     for (const id of report?.[key] || []) {
@@ -250,7 +250,7 @@ function reportTaskResults(pulled, run, report) {
     task_name: id,
     state: states.get(id).state,
     score: states.get(id).score,
-    artifact_uri: trajectoryUrl(pulled, run, id),
+    artifact_uri: trajectoryOf(id),
   }));
 }
 
@@ -260,13 +260,13 @@ function predsUrl(pulled, run) {
   return absolute(`${base}/${run.pulled_run_id}/preds.json`);
 }
 
-function predsTaskResults(pulled, run, preds) {
+function predsTaskResults(preds, trajectoryOf) {
   const ids = Array.isArray(preds) ? preds.map(p => p?.instance_id) : Object.keys(preds || {});
   return ids.filter(Boolean).sort().map(id => ({
     task_name: id,
     state: "SUBMITTED",
     score: null,
-    artifact_uri: trajectoryUrl(pulled, run, id),
+    artifact_uri: trajectoryOf(id),
   }));
 }
 
@@ -277,14 +277,15 @@ async function loadPulledRun(run) {
   if (!pulled) return run;
   const url = reportUrl(pulled, run);
   const report = url ? await fetchJson(url) : null;
+  const trajectoryOf = id => trajectoryUrl(pulled, run, id);
   if (!report) {
     const preds = await fetchJson(predsUrl(pulled, run));
-    return preds ? { ...run, task_results: predsTaskResults(pulled, run, preds) } : run;
+    return preds ? { ...run, task_results: predsTaskResults(preds, trajectoryOf) } : run;
   }
   return {
     ...run,
     report_uri: url,
-    task_results: reportTaskResults(pulled, run, report),
+    task_results: reportTaskResults(report, trajectoryOf),
     task_count: report.total_instances ?? run.task_count,
     passed_count: report.resolved_instances ?? run.passed_count,
   };
@@ -316,10 +317,23 @@ function renderTrajectoryMessages(payload) {
   return messages.map((message, index) => {
     const role = message?.role || message?.sender || message?.source || `step ${index + 1}`;
     const content = message?.content ?? message?.message ?? message?.text ?? JSON.stringify(message);
+    // tool-calling agents (Terminal-Bench) put the command in tool_calls, not in the text
+    const calls = (message?.tool_calls || []).map(call => toolCallText(call)).filter(Boolean);
     return el("div", { class: "trajectory-message" },
       el("div", { class: "trajectory-role" }, String(role)),
-      el("pre", {}, typeof content === "string" ? content : JSON.stringify(content, null, 2)));
+      el("pre", {}, typeof content === "string" ? content : JSON.stringify(content, null, 2)),
+      calls.map(call => el("pre", { class: "trajectory-tool-call" }, call)));
   });
+}
+
+function toolCallText(call) {
+  const args = call?.function?.arguments;
+  try {
+    const parsed = typeof args === "string" ? JSON.parse(args) : args;
+    return `$ ${parsed?.command ?? JSON.stringify(parsed)}`;
+  } catch {
+    return args ? `$ ${args}` : null;
+  }
 }
 
 function renderPulledTrajectoryMeta(payload, task, links) {
@@ -363,6 +377,8 @@ function messageCost(payload, role) {
   return total || null;
 }
 
+const TRAJECTORY_MAX_BYTES = 50e6;
+
 function wireTrajectory(run) {
   const tasks = taskArtifactTasks(run);
   const select = $("trajectory-task-select");
@@ -376,13 +392,19 @@ function wireTrajectory(run) {
     open.href = task.artifact_uri;
     mount(messages, el("div", { class: "empty" }, "loading trajectory…"));
     mount(meta);
+    // a looping agent can leave a trajectory of hundreds of MB; parsing that would freeze the tab
+    const size = Number((await fetch(task.artifact_uri, { method: "HEAD" }).catch(() => null))?.headers.get("content-length"));
+    if (size > TRAJECTORY_MAX_BYTES) {
+      mount(messages, el("div", { class: "trajectory-error" }, `trajectory is ${Math.round(size / 1e6)} MB, too large to show here; use "open json".`));
+      return;
+    }
     const payload = await fetchJson(task.artifact_uri);
     if (!payload) {
       mount(messages, el("div", { class: "trajectory-error" }, "could not load trajectory artifact."));
       return;
     }
     mount(messages, renderTrajectoryMessages(payload));
-    mount(meta, renderTrajectoryMeta(payload, task, pulledRunFor(run)));
+    mount(meta, renderTrajectoryMeta(payload, task, pulledRunFor(run) || run?.source === "distributed"));
   }
 
   select.addEventListener("change", loadTask);
@@ -444,6 +466,16 @@ async function loadDistributedRun(run) {
   if (!shard) return run;
   const progress = shard.model_progress || {};
   const evalResults = shard.eval_results || {};
+  // the shard names its grading report, preds and trajectory layout, same shapes as the pulled suites
+  const artifacts = shard.artifacts || {};
+  const trajectoryOf = id => artifacts.trajectory_root && artifacts.trajectory_pattern
+    ? absolute(artifacts.trajectory_pattern.replace("{root}", artifacts.trajectory_root)
+      .replaceAll("{instance_id}", id).replaceAll("{trial_name}", id))
+    : null;
+  const report = artifacts.report ? await fetchJson(absolute(artifacts.report)) : null;
+  const preds = !report && artifacts.preds ? await fetchJson(absolute(artifacts.preds)) : null;
+  // Harbor benchmarks (Terminal-Bench) publish one row per trial instead of a report or preds
+  const trials = artifacts.trials ? await fetchJson(absolute(artifacts.trials)) : null;
   return {
     ...run,
     state: String(shard.status || run.state || "pending").toUpperCase(),
@@ -452,7 +484,15 @@ async function loadDistributedRun(run) {
     task_count: progress.total ?? run.task_count,
     passed_count: evalResults.resolved ?? run.passed_count,
     score: evalResults.score == null ? run.score : Number(evalResults.score) / 100,
-    artifacts: shard.artifacts || {},
+    artifacts,
+    task_results: report ? reportTaskResults(report, trajectoryOf)
+      : preds ? predsTaskResults(preds, trajectoryOf)
+      : (trials || []).map(trial => ({
+        task_name: trial.task_name,
+        state: trial.reward == null ? "ERROR" : trial.reward >= 1 ? "RESOLVED" : "UNRESOLVED",
+        score: trial.reward ?? null,
+        artifact_uri: trajectoryOf(trial.trial_name),
+      })),
   };
 }
 

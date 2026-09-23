@@ -1,3 +1,5 @@
+import { DISPLAYED_BENCHMARKS } from "./config.js";
+
 const LEGACY_BENCHMARKS = [
   { suite: "swe_rebench_2026_03", niceName: "SWE-rebench", order: 1 },
   { suite: "model_score", niceName: "SWE-bench Verified", order: 2 },
@@ -6,7 +8,7 @@ const LEGACY_BENCHMARKS = [
 export function benchmarkRegistry(manifest) {
   const bySuite = new Map(LEGACY_BENCHMARKS.map(entry => [entry.suite, entry]));
   for (const benchmark of manifest?.benchmarks || []) {
-    if (!benchmark.enabled) continue;
+    if (!benchmark.enabled || !DISPLAYED_BENCHMARKS.includes(benchmark.name)) continue;
     const suite = benchmark.legacy_suite || benchmark.name;
     bySuite.set(suite, { suite, niceName: benchmark.nice_name || benchmark.name, order: benchmark.order ?? 9999 });
   }
@@ -47,7 +49,7 @@ const rowKey = row => (row.reign === 0 ? "genesis" : row.model_repo);
 export function mergeDistributedResults(data, manifest) {
   const runsByRepo = new Map();
   for (const benchmark of manifest?.benchmarks || []) {
-    if (!benchmark.enabled) continue;
+    if (!benchmark.enabled || !DISPLAYED_BENCHMARKS.includes(benchmark.name)) continue;
     for (const row of manifest.results?.[benchmark.name] || []) {
       if (!row.model_repo || !row.model_key) continue;
       runsByRepo.set(rowKey(row), [...(runsByRepo.get(rowKey(row)) || []), distributedRun(benchmark, row)]);

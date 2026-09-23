@@ -25,6 +25,9 @@ const judgeLabel = m => {
   return v ? [judgeMeta(m).label, el("span", { class: "judge-ver" }, " " + v)] : judgeMeta(m).label;
 };
 const scoreCls = n => n == null ? "" : Number(n) >= 0.5 ? "ok" : "bad";
+const QUESTION_MODES = new Set(["binary", "graded_20"]);
+const isQuestionMode = mode => QUESTION_MODES.has(mode);
+const modeLabel = mode => mode === "graded_20" ? "graded A–T questions" : "binary questions";
 
 
 function parseJsonl(text) {
@@ -45,6 +48,23 @@ function categoryScore(record, id) {
 function metricText(scores = {}, categories = []) {
   const names = categories.length ? categories.map(c => c.id) : Object.keys(scores);
   return names.map(id => `${id} ${pct(scores[id])}`).join(" · ") || "—";
+}
+
+function answerValue(j, qid) {
+  const s = j?.scores?.[qid];
+  if (typeof s === "number") return s;
+  const a = j?.answers?.[qid];
+  return a === "1" ? 1 : a === "0" ? 0 : null;
+}
+
+function answerView(j, qid) {
+  const a = j?.answers?.[qid];
+  const v = answerValue(j, qid);
+  if (v == null) return { glyph: "·", cls: "muted", text: a ?? "no answer" };
+  const letter = a && a !== "1" && a !== "0";
+  const glyph = letter ? v.toFixed(2) : v >= 0.5 ? "✓" : "✗";
+  const text = letter ? `${a} = ${v}` : a;
+  return { glyph, cls: v >= 0.5 ? "ok" : "bad", text };
 }
 
 // binary scoring mode: judges in stable order; per side, judge_model -> judge_result record
@@ -84,8 +104,8 @@ function weightFnFor(record) {
     for (const q of qs) {
       const w = wf(q);
       if (!w) continue;
-      const a = jr.answers?.[q.id];
-      if (a === "0" || a === "1") { den += w; if (a === "1") num += w; }
+      const v = answerValue(jr, q.id);
+      if (v != null) { den += w; num += w * v; }
     }
     let s = den ? num / den : null;
     if (s != null && record.chal_amputated_thinking) s *= 0.5;
@@ -115,15 +135,13 @@ function scoreShares(records, keyFn) {
       for (const q of record.questions || []) {
         const w = wf(q);
         if (!w) continue;
-        const ka = kj.answers?.[q.id], ca = cj.answers?.[q.id];
-        if (ka === "0" || ka === "1") kden += w;
-        if (ca === "0" || ca === "1") cden += w;
+        const kv = answerValue(kj, q.id), cv = answerValue(cj, q.id);
+        if (kv != null) kden += w;
+        if (cv != null) cden += w;
         const t = (nums[keyFn(q)] ||= { k: 0, c: 0, wk: 0, wc: 0, cells: 0, w });
         t.cells++;
-        if (ka === "0" || ka === "1") t.wk += w;
-        if (ca === "0" || ca === "1") t.wc += w;
-        if (ka === "1") t.k += w;
-        if (ca === "1") t.c += w;
+        if (kv != null) { t.wk += w; t.k += w * kv; }
+        if (cv != null) { t.wc += w; t.c += w * cv; }
       }
       for (const [key, t] of Object.entries(nums)) {
         const b = (acc[key] ||= { king: 0, chal: 0, max: 0, cells: 0, weight: t.w });
@@ -258,17 +276,17 @@ async function renderSampleScores(r, section, recordsP) {
   const source = records.find(x => x.category_source)?.category_source;
   const sourceLine = source
     ? `${source.provider || "category"} · ${source.model || "model"} · ${source.prompt_version || "prompt"}`
-    : records.some(x => x.scoring_mode === "binary")
+    : records.some(x => isQuestionMode(x.scoring_mode))
       ? rollouts > 1
-        ? `${bySample.size} samples × ${rollouts} rollouts · ${scored}/${records.length} trajectories scored · binary questions`
-        : `${scored}/${records.length} samples scored · binary questions`
+        ? `${bySample.size} samples × ${rollouts} rollouts · ${scored}/${records.length} trajectories scored · ${modeLabel(records[0].scoring_mode)}`
+        : `${scored}/${records.length} samples scored · ${modeLabel(records[0].scoring_mode)}`
       : `${records.length} scored samples`;
 
   mount(section,
     el("h2", {}, "samples"),
     el("div", { class: "sample-source" }, sourceLine),
     el("div", { class: "sample-list" }, groups.map((group, i) =>
-      group[0].scoring_mode === "binary" ? binarySampleCard(group, i) : legacySampleCard(group[0], i))));
+      isQuestionMode(group[0].scoring_mode) ? binarySampleCard(group, i) : legacySampleCard(group[0], i))));
 }
 
 function legacySampleCard(record, i) {
@@ -393,11 +411,10 @@ function milestoneRow(q) {
 
 function answerGlyphs(sideMap, judges, qid) {
   return judges.map(m => {
-    const a = sideMap[m]?.answers?.[qid];
-    const [glyph, cls] = a === "1" ? ["✓", "ok"] : a === "0" ? ["✗", "bad"] : ["·", "muted"];
+    const { glyph, cls, text } = answerView(sideMap[m], qid);
     const v = judgeVersion(m);
     const tag = v ? `${judgeMeta(m).label} ${v}` : judgeMeta(m).label;
-    return el("span", { class: "q-ans " + cls, title: `${tag}: ${a ?? "no answer"}` }, glyph);
+    return el("span", { class: "q-ans " + cls, title: `${tag}: ${text}` }, glyph);
   });
 }
 
@@ -422,11 +439,10 @@ function questionRow(q, p) {
 }
 
 function explCell(j, qid) {
-  const a = j?.answers?.[qid];
-  const glyph = a === "1" ? "✓ " : a === "0" ? "✗ " : "· ";
+  const { glyph, cls, text: value } = answerView(j, qid);
   const text = j?.explanations?.[qid] || (j && !j.parse_ok ? (j.error || "judge parse error") : "—");
-  return el("td", { class: "q-expl-cell " + (a === "1" ? "ok" : a === "0" ? "bad" : "muted") },
-    el("b", {}, glyph), el("span", {}, text));
+  return el("td", { class: "q-expl-cell " + cls },
+    el("b", { title: value }, glyph + " "), el("span", {}, text));
 }
 
 const ROMAN = ["I", "II", "III", "IV"];
@@ -492,7 +508,7 @@ function renderEval(r, netuid, passes = [r]) {
     ? fetchText(r.artifacts.SCORING_RESULTS).then(t => t ? parseJsonl(t) : [])
     : Promise.resolve([]);
 
-  const binary = r.scoring_mode === "binary";
+  const binary = isQuestionMode(r.scoring_mode);
 
   const byMetric = Object.keys(r.score_breakdown?.by_category || {}).length
     ? r.score_breakdown.by_category

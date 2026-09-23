@@ -239,6 +239,7 @@ class MockScoringClient:
                     "judge_model": model,
                     "provider": "mock",
                     "answers": {},
+                    "scores": {},
                     "explanations": {},
                     "yes_rate": rate,
                     "parse_ok": True,

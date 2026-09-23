@@ -26,8 +26,8 @@ king each generate **12 or 16 assistant turns** per sample (the horizon is strat
 Between turns your command is run against a real checkout of the repository at that commit, so
 `git`/`grep`/`find`/`sed` return real output; only what cannot be executed is filled in by an LLM
 simulator, always in whatever observation format that trajectory natively uses. Judges then score
-both sides on the same per-sample yes/no checklist, anchored on a SOTA reference trajectory for that
-exact task.
+both sides on the same per-sample checklist, each check rated on a twenty-level A–T scale and read
+as a probability-weighted score, anchored on a SOTA reference trajectory for that exact task.
 
 Two documents cover this in detail:
 

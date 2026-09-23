@@ -19,7 +19,7 @@ trajectories, so one lucky or unlucky rollout weighs half as much.
 sample prefix ──► king model      ──► king trajectory      ─┐
               └─► challenger model──► challenger trajectory ─┤
                                                              ├─► judges answer the SAME
-reference model ──► N reference runs ──► vector of change ────┘   yes/no checklist per side
+reference model ──► N reference runs ──► vector of change ────┘   graded checklist per side
                                           └─► question ladder
 ```
 
@@ -39,7 +39,8 @@ Per sample the pipeline is:
 4. **Judging** — each judge model answers the whole checklist twice: once for the king's
    trajectory, once for the challenger's. Judges never see which side is which, and never see any
    reference (leak-filtered, see below).
-5. **Aggregation** — weighted yes-rate per judge → mean across judges → mean across samples.
+5. **Aggregation** — weighted mean question score per judge → mean across judges → mean across
+   samples.
 
 If fewer than two reference runs survive, or the sample carries no prior context to anchor them to,
 `QuestionService.prepare` raises `QuestionScoringUnavailable` — there is no task-only fallback
@@ -130,7 +131,9 @@ recorded in `question_source`:
 ### Pruning against the reference runs
 
 Every reference run is judged against the finished checklist, and a question that **not one of them**
-earns is dropped (`_prune_unreachable`, gated by `ALBEDO_JUDGE_REFERENCE_PRUNE`).
+earns is dropped (`_prune_unreachable`, gated by `ALBEDO_JUDGE_REFERENCE_PRUNE`). A run earns a
+question when its graded score for it is at least `PRUNE_EARNED_MIN` (0.5), i.e. the judge leaned
+toward satisfied.
 If no run returns a readable verdict the unpruned checklist is kept rather than deleted blind.
 
 A sample is rejected outright if fewer than `QUESTION_FLOOR` (6) milestone questions survive
@@ -138,7 +141,7 @@ A sample is rejected outright if fewer than `QUESTION_FLOOR` (6) milestone quest
 ## Before the judge: degenerate sides are scored 0 outright
 
 Two checks run on a side's document *before* any judge call, in `_side()` in `judge_api.py`. Either
-one short-circuits scoring for that side: every question is answered `0`, `parse_ok` stays `True` (this
+one short-circuits scoring for that side: every question is answered `A` (score 0), `parse_ok` stays `True` (this
 is a real score, not a parse failure, so it counts toward `min_valid_fraction`), and no tokens are spent.
 
 1. **Truncated output** (`is_truncated`) — the side is recorded as corrupted.
@@ -162,9 +165,48 @@ worst looped trajectory scoring 0.913 while repeating one `grep` in 10 of its 12
 
 ## From answers to a score
 
-### 1. Per judge: a weighted yes-rate
+### 0. Per question: a letter, read as a probability-weighted score
 
-`judge_yes_rate` is the mean of every answered bit (1/0), weighted per question by tag. 
+The judge does not answer yes/no. Every check is rated with one letter `A`–`T`
+(`shared/verdict_levels.py`). The prompt (`judge/prompt_judge.py`) describes five anchor letters and
+tells the judge to use the letters in between for judgments between anchors; their values are
+spaced linearly:
+
+| letter | A | E | J | O | T |
+|---|---|---|---|---|---|
+| value | 0.00 | 0.15 | 0.35 | 0.70 | 1.00 |
+| meaning | shows the opposite | not satisfied | cannot be settled | satisfied with a gap | fully demonstrated |
+
+`B`–`D` sit between `A` and `E` (0.0375 apart), `F`–`I` between `E` and `J` (0.04), `K`–`N` between `J`
+and `O` (0.07), `P`–`S` between `O` and `T` (0.06). "No credit" in the prompt means `A`–`E`; "full
+credit" means `T`; an unsettleable check is `J`.
+
+A question's score is **not** the value of the letter written. Judge calls request
+`logprobs` + `top_logprobs: 20`, and `read_verdict_logprobs` reads, at the token where the verdict
+letter was emitted, the probability of every letter in the top-20 list, renormalised over the letters
+found, and takes the expectation `Σ p(letter) · value(letter)`. A hard `T` scores 1.0; a judge torn
+between `O` and `T` scores ≈0.85. The letters that carried probability ≥ 0.001 are kept per question
+as `distributions` in the record; the letter written is kept as `answers`; the expectation as
+`scores`.
+
+The reading is validated before it is trusted: the sampled token must be the letter the JSON says
+(providers under speculative decoding return top_logprobs from a different position — StreamLake
+did), the token spans must cover the whole content, and the written letter must be in the list. A
+response that fails any of these is rejected like a parse failure and re-asked on the next pinned
+provider; there is no fallback to letter-only scoring. Because of this, judge calls run on their own
+provider pin (`JUDGE_LOGPROB_PROVIDER_PINS`: ambient, then alibaba — the only fp8 glm-5.2
+endpoints whose top-20 logprobs line up with the sampled token; StreamLake and GMICloud accept the
+parameter but return misaligned arrays), not the general `JUDGE_PROVIDER_PINS` the sanity checks
+use.
+
+With `ALBEDO_JUDGE_JUDGE_REPEATS` > 1, a question's score is the **mean** of the repeats'
+expectations (not a majority vote); `answers` shows the majority letter and `disputed` counts the
+questions the repeats split on. The default is one repeat.
+
+### 1. Per judge: a weighted mean score
+
+`judge_yes_rate` (the name survives from the binary era) is the mean of every question's score,
+weighted per question by tag.
 
 
 | tag | weight |
@@ -200,8 +242,11 @@ worth more of the score.
 challenger_beats_king = (score_challenger - score_king) >= CHALLENGER_WIN_MARGIN   # 0.025
 ```
 
-A **2.5-point absolute margin** — beating the king by a hair is a loss. Scores are the mean yes-rate,
-so the margin is in the same units. The comparison runs on the GPU box (`remote/worker.py`), and the
+A **2.5-point absolute margin** — beating the king by a hair is a loss. Scores are the mean graded
+score, so the margin is in the same units. The margin was set under binary scoring and kept
+unchanged when the graded judge shipped; graded scores sit on a narrower range than 1/0 answers did
+(the floor is no longer 0, since an unsettled check is worth 0.35), so 0.025 is a stricter bar than
+it was. The comparison runs on the GPU box (`remote/worker.py`), and the
 backend records what it reports; a version skew between the two boxes skews the margin, so they are
 always deployed together.
 
@@ -252,7 +297,7 @@ Judge-side settings are `JudgeSettings` in `src/albedo_config/config.py`, prefix
 | `reference_prune` | `true` | judge every run against the checklist and drop what none of them earns |
 | `milestone_readings` | 4 | independent extractor readings, merged by union |
 | `question_readings` | 3 | independent ladder writers, merged by majority |
-| `judge_repeats` | 3 | judgings per trajectory; a question's answer is the majority |
+| `judge_repeats` | 1 | judgings per trajectory; a question's score is the mean over repeats |
 | `judge_count` | 1 | how many judges vote |
 | `sota_trajectory_turns` | 8 | reference trajectory length |
 | `min_valid_fraction` | 0.8 | below this the eval fails instead of scoring |
@@ -264,5 +309,6 @@ The model roster lives in `src/albedo_config/models.py`. `JUDGE_MODELS` is now a
 `("z-ai/glm-5.2",)` — matching `judge_count = 1`; `EVALUATOR_MODEL` and `SOTA_MODELS` are the same model.
 Read the run's `judge-results` in `scoring-results.jsonl` to confirm who actually voted for a given eval.
 
-`ScoringConfig.allowed_scores` is `[0, 1]`: answers are binary, and the verdict reports
-`scoring_mode: "binary"`.
+`ScoringConfig.allowed_scores` is `[0, 1]`: the range a question score lies in. The verdict and
+every scoring record report `scoring_mode: "graded_20"` (runs before the graded judge say
+`"binary"`; the dashboard renders both).

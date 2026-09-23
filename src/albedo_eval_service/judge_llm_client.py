@@ -14,7 +14,9 @@ import httpx
 from loguru import logger
 
 from albedo_config import JudgeSettings
-from albedo_config.models import JUDGE_MODELS, JUDGE_PROVIDER_PINS
+from albedo_config.models import JUDGE_LOGPROB_PROVIDER_PINS, JUDGE_MODELS, JUDGE_PROVIDER_PINS
+
+from .shared.verdict_levels import TOP_LOGPROBS
 
 
 @dataclass(frozen=True)
@@ -23,6 +25,7 @@ class JudgeRawResponse:
     provider: str | None
     raw: str
     error: str | None = None
+    logprobs: list[dict[str, Any]] | None = None
 
 
 ENGY_PURPOSES = frozenset({"reference"})
@@ -101,6 +104,8 @@ class JudgeLLMClient:
         provider: dict[str, Any] | None = None,
         accept: Callable[[str], bool] | None = None,
         purpose: str = "judge",
+        accept_response: Callable[[JudgeRawResponse], bool] | None = None,
+        want_logprobs: bool = False,
     ) -> JudgeRawResponse:
         return await self._call(
             model=model,
@@ -111,6 +116,8 @@ class JudgeLLMClient:
             provider=provider,
             accept=accept,
             purpose=purpose,
+            accept_response=accept_response,
+            want_logprobs=want_logprobs,
         )
 
     async def complete(
@@ -163,6 +170,8 @@ class JudgeLLMClient:
         eval_run_id: str = "",
         force_openrouter: bool = False,
         hedge_after_seconds: float | None = None,
+        accept_response: Callable[[JudgeRawResponse], bool] | None = None,
+        want_logprobs: bool = False,
     ) -> JudgeRawResponse:
         sem = self._semaphores.setdefault(
             model, asyncio.Semaphore(max(1, self.settings.max_concurrency_per_model))
@@ -189,8 +198,9 @@ class JudgeLLMClient:
                     eval_run_id=eval_run_id,
                     force_openrouter=engy_spent,
                     hedge_after_seconds=hedge_after_seconds,
+                    want_logprobs=want_logprobs,
                 )
-                if _usable(last, accept):
+                if _usable(last, accept, accept_response):
                     return last
                 if last.provider == "engy":
                     engy_spent = True
@@ -212,8 +222,9 @@ class JudgeLLMClient:
                         retry_count=transport_budget,
                         eval_run_id=eval_run_id,
                         force_openrouter=True,
+                        want_logprobs=want_logprobs,
                     )
-                    if _usable(last, accept):
+                    if _usable(last, accept, accept_response):
                         return last
             return last
 
@@ -233,6 +244,7 @@ class JudgeLLMClient:
         eval_run_id: str = "",
         force_openrouter: bool = False,
         hedge_after_seconds: float | None = None,
+        want_logprobs: bool = False,
     ) -> JudgeRawResponse:
         transport_budget = self.settings.retry_count if retry_count is None else retry_count
         hedged = hedge_after_seconds is not None and (
@@ -253,6 +265,7 @@ class JudgeLLMClient:
                     purpose=purpose,
                     eval_run_id=eval_run_id,
                     force_openrouter=force_openrouter,
+                    want_logprobs=want_logprobs,
                 )
                 if hedged:
                     return await self._score_once_hedged(hedge_after_seconds, **kwargs)
@@ -315,6 +328,7 @@ class JudgeLLMClient:
             response.raise_for_status()
             return response.json()
         content: list[str] = []
+        logprobs: list[dict[str, Any]] = []
         body: dict[str, Any] = {}
         finish: str | None = None
         async with asyncio.timeout(self.settings.request_timeout_seconds):
@@ -339,11 +353,17 @@ class JudgeLLMClient:
                         piece = (choice.get("delta") or {}).get("content")
                         if piece:
                             content.append(piece)
+                        logprobs.extend((choice.get("logprobs") or {}).get("content") or [])
                         finish = choice.get("finish_reason") or finish
         if finish is None:
             # a stream that dies mid-generation must never be accepted as a complete answer
             raise RuntimeError("stream ended without finish_reason")
-        body["choices"] = [{"message": {"content": "".join(content)}}]
+        body["choices"] = [
+            {
+                "message": {"content": "".join(content)},
+                "logprobs": {"content": logprobs} if logprobs else None,
+            }
+        ]
         return body
 
     async def _score_once(
@@ -360,10 +380,12 @@ class JudgeLLMClient:
         purpose: str = "other",
         eval_run_id: str = "",
         force_openrouter: bool = False,
+        want_logprobs: bool = False,
     ) -> JudgeRawResponse:
         on_engy = not force_openrouter and self._use_engy(purpose, model, eval_run_id)
         client = self._engy if on_engy else self._client
-        provider_block = provider if provider is not None else JUDGE_PROVIDER_PINS.get(model, {})
+        pins = JUDGE_LOGPROB_PROVIDER_PINS if want_logprobs else JUDGE_PROVIDER_PINS
+        provider_block = provider if provider is not None else pins.get(model, {})
         provider_block = _rotate_order(provider_block, provider_shift)
         payload: dict[str, Any] = {
             "model": model.split("/", 1)[-1] if on_engy else model,
@@ -377,6 +399,9 @@ class JudgeLLMClient:
         if model.startswith("openai/"):
             del payload["temperature"]
             payload["provider"] = dict(provider_block)
+        if want_logprobs:
+            payload["logprobs"] = True
+            payload["top_logprobs"] = TOP_LOGPROBS
         if response_schema is not None:
             payload["response_format"] = {
                 "type": "json_schema",
@@ -418,16 +443,27 @@ class JudgeLLMClient:
                 f"{self._engy_errors[(eval_run_id, model)]}/{self.settings.engy_max_errors} "
                 f"eval_run_id={eval_run_id} model={model} body={str(body)[:200]}"
             )
-        provider = "engy" if on_engy else _provider_name(model)
-        return JudgeRawResponse(model=model, provider=provider, raw=raw)
+        provider = "engy" if on_engy else _provider_name(model, pins)
+        return JudgeRawResponse(
+            model=model,
+            provider=provider,
+            raw=raw,
+            logprobs=_message_logprobs(body.get("choices", [])) if want_logprobs else None,
+        )
 
 
-def _usable(result: JudgeRawResponse, accept: Callable[[str], bool] | None) -> bool:
+def _usable(
+    result: JudgeRawResponse,
+    accept: Callable[[str], bool] | None,
+    accept_response: Callable[[JudgeRawResponse], bool] | None = None,
+) -> bool:
     if result.error is not None:
         return False
     if result.provider == "engy" and not result.raw.strip():
         return False
-    return accept is None or accept(result.raw)
+    if accept is not None and not accept(result.raw):
+        return False
+    return accept_response is None or accept_response(result)
 
 
 def _rotate_order(provider: dict[str, Any], shift: int) -> dict[str, Any]:
@@ -438,8 +474,10 @@ def _rotate_order(provider: dict[str, Any], shift: int) -> dict[str, Any]:
     return {**provider, "order": order[k:] + order[:k]}
 
 
-def _provider_name(model: str) -> str | None:
-    order = JUDGE_PROVIDER_PINS.get(model, {}).get("order")
+def _provider_name(
+    model: str, pins: dict[str, dict[str, object]] = JUDGE_PROVIDER_PINS
+) -> str | None:
+    order = pins.get(model, {}).get("order")
     if isinstance(order, list) and order:
         return str(order[0])
     return None
@@ -476,3 +514,13 @@ def _message_content(choices: list[dict[str, Any]]) -> str:
         return ""
     content = message.get("content")
     return content if isinstance(content, str) else ""
+
+
+def _message_logprobs(choices: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+    if not choices:
+        return None
+    logprobs = choices[0].get("logprobs")
+    if not isinstance(logprobs, dict):
+        return None
+    content = logprobs.get("content")
+    return content if isinstance(content, list) and content else None

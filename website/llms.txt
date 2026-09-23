@@ -13,11 +13,12 @@
 > LLM (`deepseek/deepseek-v4.1-flash`, provider-rotating ladder with the evaluator model as the last
 > rung), always in whatever observation format that trajectory natively uses. For each task an
 > evaluator (GLM 5.2) rolls **three** GLM 5.2 reference trajectories, reduces them to the task's
-> **milestones** and writes a ladder of yes/no questions per milestone — generalized to the task, not
-> to one run's route. King and challenger each roll every task out **twice**; a judge (GLM 5.2) answers
-> every question 1/0 three times per trajectory (majority wins), and each side's score is its mean
-> yes-rate over all its trajectories. A trajectory that has collapsed into a command loop is scored
-> **0 outright, without being judged**.
+> **milestones** and writes a ladder of questions per milestone — generalized to the task, not
+> to one run's route. King and challenger each roll every task out **twice**; a judge (GLM 5.2) rates
+> every question with a letter A–T (A 0.00 … J 0.35 "cannot be settled" … T 1.00), the question's score
+> is the probability-weighted mean of the letter values read from the verdict token's top-20 logprobs,
+> and each side's score is its mean question score over all its trajectories. A trajectory that has
+> collapsed into a command loop is scored **0 outright, without being judged**.
 > A challenger must beat the king by a **2.5% margin** to win, and must win **two independent
 > evals** before it is crowned. Winners are crowned into a
 > rolling 5-king chain and earn emissions.
@@ -501,10 +502,14 @@ A sample is rejected outright if fewer than `QUESTION_FLOOR` (6) questions survi
 recorded in the scoring artifact. Questions are generated once per task and reused for both models
 and all their rollouts.
 
-**Judge** (`albedo-judge-api`, OpenRouter): the judge model (`z-ai/glm-5.2`) answers every question
-**1/0** (forced `json_schema`, fp8) `ALBEDO_JUDGE_JUDGE_REPEATS` (3) times per trajectory, seeing only
-the questions + one side's trajectory — never the other side's; a question's answer is the majority of
-the repeats (the record carries `repeats`, `repeats_held`, `disputed`). Each side rolls every sample out
+**Judge** (`albedo-judge-api`, OpenRouter): the judge model (`z-ai/glm-5.2`) rates every question
+with a **letter A–T** (forced `json_schema`, fp8, `top_logprobs: 20`, pinned to the ambient/alibaba
+endpoints whose logprobs align) `ALBEDO_JUDGE_JUDGE_REPEATS` (1) times per trajectory, seeing only
+the questions + one side's trajectory — never the other side's. A question's score is the
+probability-weighted mean of the letter values at the verdict token (A 0.00, E 0.15, J 0.35, O 0.70,
+T 1.00, linear in between); a response whose logprobs do not line up with the letter written is
+rejected and re-asked. With several repeats the scores are averaged (the record carries `answers`
+= letters, `scores`, `distributions`, `repeats`, `repeats_held`, `logprob_readings`, `disputed`). Each side rolls every sample out
 `ALBEDO_REMOTE_ROLLOUTS_PER_SAMPLE` (2) times and every rollout is judged against the sample's one
 checklist. King and challenger are scored **independently**: the mean yes-rate over all of a side's
 trajectories → an absolute score in `[0,1]` per side (`score_king` and `score_challenger` are
@@ -670,8 +675,9 @@ loop every ALBEDO_MONITOR_INTERVAL_S (default 2s):
 - **Model filter:** history + chart only include `eval_runs` whose `model_uri` matches
   `ALBEDO_DASHBOARD_MODEL_FILTER` (SQL `LIKE` substring, default `qwen3.6-35b` — the 35B genesis plus
   any `albedo-qwen3.6-…` challenger), so a model migration doesn't mix old and new runs.
-- The **per-eval detail page** surfaces each sample's yes/no questions and per-side judge scores
-  (from scoring-results.jsonl) and the run's `scoring_mode` (`binary`).
+- The **per-eval detail page** surfaces each sample's questions with the letter each side earned and
+  its score, per-side judge scores (from scoring-results.jsonl) and the run's `scoring_mode`
+  (`graded_20`; older runs `binary`).
 - Reactive, not asyncio: a synchronous on-change poll loop, each tick wrapped in try/except (a DB/S3 blip
   just retries next tick). Env: `ALBEDO_MONITOR_INTERVAL_S`, `ALBEDO_DASHBOARD_NETUID` (97),
   `ALBEDO_DASHBOARD_ARTIFACT_BASE_URL` (https://s3.hippius.com), `ALBEDO_DASHBOARD_MODEL_FILTER`
@@ -749,7 +755,7 @@ Full reference in [.env.example](../.env.example) (backend + GPU host) and [.env
 | `ALBEDO_JUDGE_SIMULATION_PROVIDERS` | provider list for the simulator, tried as one rung each in rotation (default `deepseek,siliconflow,novita,gmicloud`; empty → no pin) |
 | `ALBEDO_JUDGE_MILESTONE_READINGS` | independent extractor readings, merged by union into the milestone vector (default 4) |
 | `ALBEDO_JUDGE_QUESTION_READINGS` | independent ladder writers, merged by majority (default 3) |
-| `ALBEDO_JUDGE_JUDGE_REPEATS` | judgings per trajectory; a question's answer is the majority (default 3) |
+| `ALBEDO_JUDGE_JUDGE_REPEATS` | judgings per trajectory; a question's score is the mean over repeats (default 1) |
 | `ALBEDO_JUDGE_NUM_QUESTIONS` | recorded in `question_source` for provenance only; the checklist size is the surviving milestones x `RUNGS_MAX` (6), capped at `QUESTIONS_MAX` (60) |
 | `ALBEDO_JUDGE_ENGY_MODELS` | model pool for grounded/engy calls (default `z-ai/glm-5.2,deepseek/deepseek-v4-flash-0731`) |
 
@@ -827,7 +833,8 @@ the question ladder; the score batch then judges every rollout of both sides aga
 
 **Score request (GPU → backend over WS /score-bridge):** `{type:"score_request", request_id, payload}`
 → forwarded to judge API `/score-batch` → `{type:"score_response", request_id, body}`. Scoring records
-carry `scoring_mode` (`binary`), the `questions`, per-side `judge_results`, and `question_source`
+carry `scoring_mode` (`graded_20`), the `questions`, per-side `judge_results` (letters, per-question
+scores and letter distributions), and `question_source`
 (question regime + reference trajectory provenance + every question discarded during prep). A side that
 was short-circuited also carries `looped`, `loop_reasons` and `loop_commands`.
 

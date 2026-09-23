@@ -77,22 +77,35 @@ def test_reading_strips_quotes_and_ignores_the_sentinel_and_non_letters():
     assert set(reading.distributions["q_01"]) == {"J", "O"}
 
 
-def test_reading_rejects_misaligned_logprobs():
-    raw = _raw({"q_01": "T"})
-    shifted = logprob_entries(raw)
-    shifted.insert(0, {"token": "", "logprob": 0.0, "top_logprobs": []})
-    shifted[1:] = shifted[2:] + [{"token": " ", "logprob": 0.0, "top_logprobs": []}]
-    reading = read_verdict_logprobs(raw, shifted)
+def test_reading_rejects_logprobs_whose_verdicts_differ_from_the_content():
+    raw = _raw({"q_01": "T", "q_02": "E"})
+    entries = logprob_entries(raw)
+    letter = next(e for e in entries if e["top_logprobs"])
+    letter["token"] = "A"
+    reading = read_verdict_logprobs(raw, entries)
     assert not reading.ok
-    assert "logprob token" in reading.error
+    assert "carry verdicts AE but the content has TE" in reading.error
+
+
+def test_reading_survives_characters_missing_from_the_token_stream():
+    """Alibaba's stream sometimes drops 1-3 characters; outside a verdict they must not matter."""
+    raw = _raw({"q_01": "O", "q_02": "E"})
+    entries = logprob_entries(raw, top={"O": {"O": math.log(0.5), "T": math.log(0.5)}})
+    reason_char = next(i for i, e in enumerate(entries) if e["token"] == "e")
+    del entries[reason_char]
+    del entries[0]
+    reading = read_verdict_logprobs(raw, entries)
+    assert reading.ok
+    assert reading.scores == {"q_01": round(0.5 * 0.70 + 0.5 * 1.0, 6), "q_02": 0.15}
 
 
 def test_reading_rejects_missing_or_short_logprobs():
     raw = _raw({"q_01": "T", "q_02": "E"})
     assert read_verdict_logprobs(raw, None).error == "no logprobs in response"
     assert read_verdict_logprobs(raw, []).error == "no logprobs in response"
-    short = logprob_entries(raw)[:-3]
-    assert "do not reproduce the content" in read_verdict_logprobs(raw, short).error
+    cut = raw.rindex('"E"')
+    short = logprob_entries(raw)[:cut]
+    assert "carry verdicts T but the content has TE" in read_verdict_logprobs(raw, short).error
     no_top = logprob_entries(raw)
     for entry in no_top:
         entry["top_logprobs"] = []

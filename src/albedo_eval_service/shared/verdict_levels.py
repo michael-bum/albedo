@@ -78,17 +78,21 @@ def read_verdict_logprobs(raw: str, entries: list[dict[str, Any]] | None) -> Log
         spans.append((position, position + len(token), entry))
         tokens.append(token)
         position += len(token)
-    # The content must be covered token for token, so a char offset into it names one token.
-    # A terminator the provider emits past the end of the content (Ambient sends
-    # `<|endoftext|>`) carries no verdict and is ignored.
-    spanned = "".join(tokens)
-    if not spanned.startswith(raw):
+    # Verdicts are located in the token text, not the content: a provider's stream can drop a
+    # few characters elsewhere (seen on Alibaba), which would shift every content offset. The
+    # stream must still carry the same verdicts in the same order as the content. A terminator
+    # past the end of the content (Ambient sends `<|endoftext|>`) carries no verdict.
+    spanned_matches = list(_VERDICT_VALUE_RE.finditer("".join(tokens)))
+    written_letters = [m.group(1).upper() for m in matches]
+    streamed_letters = [m.group(1).upper() for m in spanned_matches]
+    if streamed_letters != written_letters:
         return LogprobReading(
-            error=f"logprob tokens do not reproduce the content ({position} vs {len(raw)} chars)"
+            error=f"logprob tokens carry verdicts {''.join(streamed_letters) or 'none'}"
+            f" but the content has {''.join(written_letters)}"
         )
     scores: dict[str, float] = {}
     distributions: dict[str, dict[str, float]] = {}
-    for match, qid in zip(matches, question_ids):
+    for match, qid in zip(spanned_matches, question_ids):
         offset = match.start(1)
         entry = next((e for start, end, e in spans if start <= offset < end), None)
         if entry is None:

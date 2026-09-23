@@ -46,11 +46,20 @@ async def insert_new_commits(pool: asyncpg.Pool, commits: list[Commit]) -> int:
                         (netuid, block_number, block_hash, extrinsic_hash, uid, hotkey,
                          commit_payload, model_uri, payload_hash)
                     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
+                    -- Once a submission exists its commit is frozen at the reveal it was made
+                    -- from: re-committing the same payload later (e.g. after re-registering the
+                    -- hotkey) must not move the old submission into the new registration.
                     ON CONFLICT (netuid, hotkey, payload_hash) DO UPDATE SET
-                        block_number = EXCLUDED.block_number,
-                        block_hash = EXCLUDED.block_hash,
+                        block_number = CASE WHEN chain_commits.submission_id IS NULL
+                            THEN EXCLUDED.block_number ELSE chain_commits.block_number END,
+                        block_hash = CASE
+                            WHEN chain_commits.submission_id IS NULL
+                                OR chain_commits.block_number = EXCLUDED.block_number
+                            THEN COALESCE(EXCLUDED.block_hash, chain_commits.block_hash)
+                            ELSE chain_commits.block_hash END,
                         extrinsic_hash = COALESCE(chain_commits.extrinsic_hash, EXCLUDED.extrinsic_hash),
-                        uid = EXCLUDED.uid,
+                        uid = CASE WHEN chain_commits.submission_id IS NULL
+                            THEN EXCLUDED.uid ELSE chain_commits.uid END,
                         commit_payload = EXCLUDED.commit_payload,
                         model_uri = EXCLUDED.model_uri
                     RETURNING id, submission_id, (xmax = 0) AS inserted

@@ -268,11 +268,15 @@ class PreEvalRepository:
                     conn.execute(
                         """
                         SELECT count(*) AS fails
-                        FROM model_submissions
-                        WHERE hotkey = (SELECT hotkey FROM model_submissions WHERE id = %s)
-                          AND state = 'TERMINAL_INVALID'
-                          AND fault_class = 'MINER_FAULT'
-                          AND fault_code NOT IN (
+                        FROM model_submissions ms
+                        JOIN chain_commits cc ON cc.id = ms.chain_commit_id
+                        LEFT JOIN miners m ON m.hotkey = ms.hotkey
+                        WHERE ms.hotkey = (SELECT hotkey FROM model_submissions WHERE id = %s)
+                          AND (m.registration_block IS NULL
+                               OR cc.block_number >= m.registration_block)
+                          AND ms.state = 'TERMINAL_INVALID'
+                          AND ms.fault_class = 'MINER_FAULT'
+                          AND ms.fault_code NOT IN (
                             'hotkey_sanity_blocked', 'hotkey_duplicate_blocked',
                             'hotkey_already_validated', 'hotkey_preeval_blocked'
                           )

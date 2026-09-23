@@ -436,19 +436,7 @@ async def reap_expired(pool: asyncpg.Pool, deps: Deps) -> int:
 
 
 async def _sanity_blocked(pool: asyncpg.Pool, hotkey: str) -> bool:
-    async with pool.acquire() as conn:
-        return bool(
-            await conn.fetchval(
-                """
-                SELECT 1 FROM sanity_results sr
-                JOIN model_submissions ms ON ms.model_uri = sr.repo
-                WHERE ms.hotkey = $1 AND sr.passed = false
-                  AND (sr.reason ILIKE '%injection%' OR sr.reason ILIKE '%low vocab%')
-                LIMIT 1
-                """,
-                hotkey,
-            )
-        )
+    return await mv_db.hotkey_sanity_block_reason(pool, hotkey) is not None
 
 
 async def _reset_for_retry(pool: asyncpg.Pool, deps: Deps, row: asyncpg.Record) -> None:

@@ -75,16 +75,32 @@ async def _apply_activate(pool: asyncpg.Pool, signal: PrivateSignal) -> int:
             return 1
         attempt = await conn.fetchval(
             """
-            UPDATE private_registrations
+            WITH reg AS (
+                SELECT COALESCE(
+                    (SELECT registration_block FROM miners WHERE hotkey = $6)
+                        > pr.activation_block
+                    AND $3 >= (SELECT registration_block FROM miners WHERE hotkey = $6),
+                    false
+                ) AS fresh
+                FROM private_registrations pr
+                WHERE pr.registration_id = $1
+            )
+            UPDATE private_registrations pr
             SET submission_pubkey = $2, attempt_count = attempt_count + 1, state = 'ACTIVATED',
                 activation_block = $3, credential_expires_at = NULL, model_prefix = NULL,
-                coldkey = COALESCE($5, coldkey), updated_at = now()
-            WHERE registration_id = $1
-              AND ( (state IN ('ACTIVATED', 'CREDENTIALED') AND submission_pubkey <> $2)
-                    OR (state = 'SUBMITTED' AND submission_id IS NULL)
-                    OR state = 'FAILED' )
+                coldkey = COALESCE($5, coldkey), uid = $7, updated_at = now(),
+                extra_attempts = CASE WHEN reg.fresh THEN attempt_count ELSE extra_attempts END,
+                submission_id = CASE WHEN reg.fresh THEN NULL ELSE submission_id END,
+                model_digest = CASE WHEN reg.fresh THEN NULL ELSE model_digest END,
+                fault_message = CASE WHEN reg.fresh THEN NULL ELSE fault_message END
+            FROM reg
+            WHERE pr.registration_id = $1
               AND $3 > activation_block
-              AND attempt_count < $4 + extra_attempts
+              AND ( reg.fresh
+                    OR ( ( (state IN ('ACTIVATED', 'CREDENTIALED') AND submission_pubkey <> $2)
+                           OR (state = 'SUBMITTED' AND submission_id IS NULL)
+                           OR state = 'FAILED' )
+                         AND attempt_count < $4 + extra_attempts ) )
             RETURNING attempt_count
             """,
             rid,
@@ -92,6 +108,8 @@ async def _apply_activate(pool: asyncpg.Pool, signal: PrivateSignal) -> int:
             signal.block_number,
             settings.max_attempts,
             signal.coldkey,
+            signal.hotkey,
+            signal.uid,
         )
     if attempt is None:
         return 0

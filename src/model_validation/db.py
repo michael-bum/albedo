@@ -21,6 +21,13 @@ _VALIDATED_OR_BEYOND = (
     "COMPLETE_CORONATED",
 )
 
+_OF_CURRENT_REGISTRATION = """
+    JOIN chain_commits cc ON cc.id = ms.chain_commit_id
+    LEFT JOIN miners m ON m.hotkey = ms.hotkey
+    WHERE ms.hotkey = $1
+      AND (m.registration_block IS NULL OR cc.block_number >= m.registration_block)
+"""
+
 
 async def connect(db_url: str) -> asyncpg.Pool:
     if not db_url:
@@ -396,12 +403,10 @@ async def hotkey_validated(pool: asyncpg.Pool, hotkey: str) -> bool:
                 SELECT EXISTS(
                     SELECT 1
                     FROM model_submissions ms
-                    JOIN chain_commits cc ON cc.id = ms.chain_commit_id
-                    LEFT JOIN miners m ON m.hotkey = ms.hotkey
-                    WHERE ms.hotkey = $1
+                    """
+                + _OF_CURRENT_REGISTRATION
+                + """
                       AND ms.state = ANY($2::text[])
-                      AND (m.registration_block IS NULL
-                           OR cc.block_number >= m.registration_block)
                 )
                 """,
                 hotkey,
@@ -417,7 +422,9 @@ async def hotkey_sanity_block_reason(pool: asyncpg.Pool, hotkey: str) -> str | N
             SELECT sr.reason
             FROM sanity_results sr
             JOIN model_submissions ms ON ms.model_uri = sr.repo
-            WHERE ms.hotkey = $1
+            """
+            + _OF_CURRENT_REGISTRATION
+            + """
               AND sr.passed = false
               AND (sr.reason ILIKE '%injection%' OR sr.reason ILIKE '%low vocab%')
             ORDER BY sr.checked_at DESC
@@ -456,11 +463,13 @@ async def hotkey_preeval_fail_count(pool: asyncpg.Pool, hotkey: str) -> int:
         return await conn.fetchval(
             """
             SELECT count(*)
-            FROM model_submissions
-            WHERE hotkey = $1
-              AND state = 'TERMINAL_INVALID'
-              AND fault_class = 'MINER_FAULT'
-              AND fault_code <> ALL($2::text[])
+            FROM model_submissions ms
+            """
+            + _OF_CURRENT_REGISTRATION
+            + """
+              AND ms.state = 'TERMINAL_INVALID'
+              AND ms.fault_class = 'MINER_FAULT'
+              AND ms.fault_code <> ALL($2::text[])
             """,
             hotkey,
             list(_STRIKE_EXCLUDED_CODES),
@@ -471,13 +480,15 @@ async def hotkey_duplicate_block_reason(pool: asyncpg.Pool, hotkey: str) -> str 
     async with pool.acquire() as conn:
         return await conn.fetchval(
             """
-            SELECT fault_message
-            FROM model_submissions
-            WHERE hotkey = $1
-              AND state = 'TERMINAL_INVALID'
-              AND fault_class = 'MINER_FAULT'
-              AND fault_code = 'duplicate'
-            ORDER BY created_at DESC
+            SELECT ms.fault_message
+            FROM model_submissions ms
+            """
+            + _OF_CURRENT_REGISTRATION
+            + """
+              AND ms.state = 'TERMINAL_INVALID'
+              AND ms.fault_class = 'MINER_FAULT'
+              AND ms.fault_code = 'duplicate'
+            ORDER BY ms.created_at DESC
             LIMIT 1
             """,
             hotkey,

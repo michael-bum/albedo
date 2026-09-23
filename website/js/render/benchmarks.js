@@ -1,7 +1,8 @@
 import { el, mount } from "../dom.js";
-import { pct, fmtRelative, fmtDuration } from "../format.js";
+import { pct, fmtRelative } from "../format.js";
 import { modelRepo, kingTitleName } from "../model.js";
 import { PULLED_SUITES, PREDS_STALE_MS } from "../config.js";
+import { benchmarkRegistry, mergeDistributedResults, distributedRunFor, distributedProgress } from "../results.js";
 
 const MODEL_SCORE_SUITE = "model_score";
 
@@ -14,7 +15,14 @@ const BENCHMARK_LABELS = {
 };
 
 // const BENCHMARK_ORDER = ["tau2_airline", "tau2_retail", "tau2_telecom", "swe_rebench_2026_03", MODEL_SCORE_SUITE];
-const BENCHMARK_ORDER = ["swe_rebench_2026_03", MODEL_SCORE_SUITE];
+let BENCHMARK_ORDER = ["swe_rebench_2026_03", MODEL_SCORE_SUITE];
+
+function applyBenchmarkRegistry(manifest) {
+  const registry = benchmarkRegistry(manifest);
+  BENCHMARK_ORDER = registry.map(entry => entry.suite);
+  for (const entry of registry) BENCHMARK_LABELS[entry.suite] = entry.niceName;
+  if (!BENCHMARK_ORDER.includes(benchSort)) benchSort = BENCHMARK_ORDER[0];
+}
 
 const ACTIVE_STATES = new Set(["QUEUED", "CLAIMED", "LOADING_MODEL", "RUNNING", "SCORING"]);
 const LEADERBOARD_ROWS = 5;
@@ -267,7 +275,6 @@ function scoreTotal(rows, fallback) {
 function livePreds(live, rows, pulled) {
   if (!live?.count) return null;
   const total = scoreTotal(rows, pulled.totalFallback);
-  const left = Math.max(0, total - live.count);
   const updated = live.updatedAt ? new Date(live.updatedAt).getTime() : NaN;
   const ratio = Math.min(1, live.count / total);
   const fresh = Number.isFinite(updated) ? Date.now() - updated < PREDS_STALE_MS : true;
@@ -277,7 +284,6 @@ function livePreds(live, rows, pulled) {
     ratio,
     fresh,
     scoring: !fresh && ratio >= 0.95,
-    eta: live.rate && left ? fmtDuration(left / live.rate) : null,
     updatedAt: live.updatedAt,
   };
 }
@@ -314,7 +320,8 @@ export function suiteScores(model) {
 
 function hasPanelScores(model) {
   const scores = suiteScores(model);
-  return BENCHMARK_ORDER.some(suite => scores[suite]?.score != null);
+  return BENCHMARK_ORDER.some(suite => scores[suite]?.score != null)
+    || (model?.runs || []).some(run => run?.source === "distributed" && BENCHMARK_ORDER.includes(run.suite));
 }
 
 function panelScore(value) {
@@ -358,151 +365,19 @@ function svgEl(tag, attrs = {}, ...children) {
   return node;
 }
 
-function shortLabel(model) {
-  return modelLabel(model).replace(/^ALBEDO-/i, "");
-}
+const SPARK_KINGS = 20;
 
-function barPath(x, top, w, h, r = 4) {
-  if (h <= 0) return "";
-  const rr = Math.min(r, w / 2, h);
-  const bottom = top + h;
-  return `M ${x.toFixed(1)},${bottom.toFixed(1)} V ${(top + rr).toFixed(1)} `
-    + `Q ${x.toFixed(1)},${top.toFixed(1)} ${(x + rr).toFixed(1)},${top.toFixed(1)} `
-    + `H ${(x + w - rr).toFixed(1)} Q ${(x + w).toFixed(1)},${top.toFixed(1)} ${(x + w).toFixed(1)},${(top + rr).toFixed(1)} `
-    + `V ${bottom.toFixed(1)} Z`;
-}
-
-const BAR_INK = "#1c1c1c";
-const GOLD_BASE = "#b5842a";   // darker gold for the genesis base, solid so it stays gold on the dark surface
-const BELOW_GREY = "#6a6a6a";  // kings that never reach genesis
-const KINGS_SHOWN = 5;
-const REFERENCE_MODELS = [
-  { label: "GLM 5.2", pattern: /glm-5\.2/i },
-];
-
-// Non-king rows in the pulled score files (frontier references) never become models,
-// so the chart reads them straight off the rows, per suite.
-export function referenceScores(scoresBySuite) {
-  const refs = new Map();
-  for (const pulled of PULLED_SUITES) {
-    const rows = scoresBySuite?.get(pulled.suite) || [];
-    const found = [];
-    for (const ref of REFERENCE_MODELS) {
-      const row = rows.find(r => ref.pattern.test(String(r?.model || r?.run_id || "")));
-      const score = Number(row?.score);
-      if (Number.isFinite(score)) found.push({ label: ref.label, score: score / 100 });
-    }
-    refs.set(pulled.suite, found);
-  }
-  return refs;
-}
-
-function renderBars(sorted, suite, selected, baselineScore = null, refs = [], width = 360) {
-  const H = 104, TOP = 16, FLOOR = 88, GAP = 2;
-  const svg = svgEl("svg", { viewBox: `0 0 ${width} ${H}`, preserveAspectRatio: "none", role: "img" });
-  const kings = sorted
-    .filter(model => !isGenesis(model) && suiteScores(model)[suite]?.score != null)
-    .slice(0, KINGS_SHOWN)
-    .map(model => ({ model, label: shortLabel(model), score: suiteScores(model)[suite].score, current: model === selected }));
-  const references = [
-    baselineScore != null ? { label: "GENESIS", score: baselineScore, genesis: true } : null,
-    ...refs,
-  ].filter(Boolean);
-
-  svg.append(svgEl("line", { x1: 6, y1: FLOOR, x2: width - 6, y2: FLOOR, stroke: "currentColor", "stroke-width": 1, opacity: 0.15 }));
-  if (!kings.length && !references.length) {
-    svg.append(svgEl("text", { x: width / 2, y: 50, "text-anchor": "middle", "font-size": 8, fill: "currentColor", opacity: 0.45 }, "no score"));
-    return { svg, deficit: false };
-  }
-
-  const vals = [...kings, ...references].map(b => b.score);
-  let min = Math.min(...vals), max = Math.max(...vals);
-  if (min === max) { min -= 0.01; max += 0.01; }
-  const span = max - min;
-  // bars share a display range so pp-sized gaps stay visible
-  const lo = Math.max(0, min - span * 0.35);
-  const hi = Math.min(1, max + span * 0.05);
-  const yOf = v => FLOOR - ((Math.max(v, lo) - lo) / (hi - lo)) * (FLOOR - TOP);
-
-  const slots = kings.length + references.length + (kings.length && references.length ? 0.5 : 0);
-  const slotW = (width - 16) / slots;
-  const barW = Math.min(24, slotW * 0.62);
-  let x = 8 + (slotW - barW) / 2;
-  const next = (n = 1) => { x += slotW * n; };
-
-  const capLabel = (cx, y, text, title) => svgEl("text", {
-    x: cx.toFixed(1), y: (y - 4).toFixed(1), "text-anchor": "middle", "font-size": 8,
-    "font-family": "var(--font-mono)", fill: "currentColor",
-  }, title ? svgEl("title", {}, title) : null, text);
-  const nameLabel = (cx, text, strong = false) => svgEl("text", {
-    x: cx.toFixed(1), y: H - 4, "text-anchor": "middle", "font-size": 7, "letter-spacing": "0.04em",
-    "font-family": "var(--font-mono)", "font-weight": strong ? 700 : 400,
-    fill: strong ? "var(--color-gold)" : "currentColor", opacity: strong ? 1 : 0.55,
-  }, text);
-
-  let deficit = false;
-  // every king stacks on the genesis base (muted gold) with its gain on top (solid gold);
-  // a king below genesis is drawn in grey under a dashed genesis-level marker
-  kings.forEach((king, i) => {
-    const cx = x + barW / 2, bx = cx - barW / 2;
-    const kingTop = yOf(king.score);
-    let labelTop = kingTop;
-    const title = `${modelLabel(king.model)} · ${panelScore(king.score)}`;
-    if (baselineScore != null && king.score >= baselineScore) {
-      const baseTop = yOf(baselineScore);
-      const gainH = baseTop - kingTop - GAP;
-      const baseFrom = gainH >= 3 ? baseTop : kingTop;   // a sub-3px gain merges into the base
-      svg.append(svgEl("path", { d: barPath(bx, baseFrom, barW, FLOOR - baseFrom, gainH >= 3 ? 0 : 4), fill: GOLD_BASE },
-        svgEl("title", {}, `genesis base · ${panelScore(baselineScore)}`)));
-      if (gainH >= 3) svg.append(svgEl("path", { d: barPath(bx, kingTop, barW, gainH), fill: "var(--color-gold)" }, svgEl("title", {}, title)));
-      if (i === 0 && FLOOR - baseTop >= 14) {
-        svg.append(svgEl("text", { x: cx.toFixed(1), y: (baseTop + 10).toFixed(1), "text-anchor": "middle", "font-size": 7, "font-family": "var(--font-mono)", fill: BAR_INK },
-          panelScore(baselineScore)));
-      }
-    } else {
-      svg.append(svgEl("path", { d: barPath(bx, kingTop, barW, FLOOR - kingTop), fill: BELOW_GREY }, svgEl("title", {}, title)));
-      if (baselineScore != null) {
-        deficit = true;
-        const baseTop = yOf(baselineScore);
-        svg.append(svgEl("line", {
-          x1: (bx - 3).toFixed(1), y1: baseTop.toFixed(1), x2: (bx + barW + 3).toFixed(1), y2: baseTop.toFixed(1),
-          stroke: "var(--color-bad)", "stroke-width": 1, "stroke-dasharray": "2 2", opacity: 0.85,
-        }, svgEl("title", {}, `genesis level · ${((king.score - baselineScore) * 100).toFixed(1)} pp`)));
-        labelTop = Math.min(kingTop, baseTop);
-      }
-    }
-    svg.append(capLabel(cx, labelTop, panelScore(king.score), title));
-    svg.append(nameLabel(cx, king.label, king.current));
-    next();
-  });
-
-  if (kings.length && references.length) {
-    const dx = x - (slotW - barW) / 2 + slotW * 0.25;
-    svg.append(svgEl("line", { x1: dx.toFixed(1), y1: TOP - 6, x2: dx.toFixed(1), y2: FLOOR, stroke: "currentColor", "stroke-width": 1, "stroke-dasharray": "3 3", opacity: 0.25 }));
-    next(0.5);
-  }
-  for (const ref of references) {
-    const cx = x + barW / 2;
-    const top = yOf(ref.score);
-    svg.append(svgEl("path", {
-      d: barPath(cx - barW / 2, top, barW, FLOOR - top),
-      fill: ref.genesis ? GOLD_BASE : "var(--color-accent)",
-    }, svgEl("title", {}, `${ref.label} · ${panelScore(ref.score)}`)));
-    svg.append(capLabel(cx, top, panelScore(ref.score)));
-    svg.append(nameLabel(cx, ref.label.toUpperCase()));
-    next();
-  }
-  return { svg, deficit };
-}
-
-// full-history trend, shown while the panel is in "show all kings" mode
 function renderSpark(sorted, suite, baselineScore = null, width = 360) {
-  const points = [...sorted].reverse()
-    .map(model => ({ label: modelLabel(model), score: suiteScores(model)[suite]?.score }))
+  // a fixed window of the last SPARK_KINGS kings: a new king adds a slot even before it has a
+  // score, so the line shifts left as reigns change instead of stretching over all history
+  const slots = sorted.filter(model => !isGenesis(model)).slice(0, SPARK_KINGS).reverse();
+  const points = slots
+    .map((model, slot) => ({ slot, label: modelLabel(model), score: suiteScores(model)[suite]?.score }))
     .filter(point => point.score != null);
   const FLOOR = 54, TOP = 8;
-  const svg = svgEl("svg", { viewBox: `0 0 ${width} 64`, preserveAspectRatio: "xMidYMid", role: "img", class: "bench-spark" });
+  const svg = svgEl("svg", { viewBox: `0 0 ${width} 64`, preserveAspectRatio: "xMidYMid", role: "img" });
 
+  // line below graph
   svg.append(svgEl("line", { x1: 6, y1: FLOOR, x2: width - 6, y2: FLOOR, stroke: "currentColor", "stroke-width": 1, opacity: 0.15 }));
 
   if (!points.length) {
@@ -514,17 +389,19 @@ function renderSpark(sorted, suite, baselineScore = null, width = 360) {
   let min = Math.min(...scaleVals);
   let max = Math.max(...scaleVals);
   if (min === max) { min -= 0.005; max += 0.005; }
-  const pad = (max - min) * 0.12; min -= pad; max += pad;
+  const pad = (max - min) * 0.12; min -= pad; max += pad;   // breathing room so points/baseline don't hug edges
   const yOf = v => FLOOR - ((v - min) / (max - min)) * (FLOOR - TOP);
-  const xOf = i => points.length === 1 ? width / 2 : 6 + (i / (points.length - 1)) * (width - 12);
-  const coords = points.map((point, i) => ({ x: xOf(i), y: yOf(point.score), point }));
+  const xOf = slot => 6 + (slot / (SPARK_KINGS - 1)) * (width - 12);
+  const coords = points.map(point => ({ x: xOf(point.slot), y: yOf(point.score), point }));
 
+  // soft area fill under the trend
   if (coords.length > 1) {
     const d = `M ${coords[0].x.toFixed(1)},${FLOOR} `
       + coords.map(c => `L ${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(" ")
       + ` L ${coords[coords.length - 1].x.toFixed(1)},${FLOOR} Z`;
     svg.append(svgEl("path", { d, fill: "currentColor", opacity: 0.08 }));
   }
+  // genesis baseline reference (dashed gold) — points above it beat genesis
   if (baselineScore != null) {
     const by = yOf(baselineScore);
     svg.append(svgEl("line", {
@@ -539,7 +416,7 @@ function renderSpark(sorted, suite, baselineScore = null, width = 360) {
       "stroke-linejoin": "round", "stroke-linecap": "round",
     }));
   }
-  const bestIdx = vals.indexOf(Math.max(...vals));
+  const bestIdx = vals.indexOf(Math.max(...vals));   // best model overall — highlighted gold
   coords.forEach((c, i) => {
     const last = i === coords.length - 1;
     const best = i === bestIdx;
@@ -552,28 +429,18 @@ function renderSpark(sorted, suite, baselineScore = null, width = 360) {
   return svg;
 }
 
-function renderChart(sorted, suite, selected, baselineScore, refs, width) {
-  if (benchMode === "all") return [renderSpark(sorted, suite, baselineScore, width)];
-  const { svg, deficit } = renderBars(sorted, suite, selected, baselineScore, refs, width);
-  const key = (cls, text) => el("span", { class: "bench-legend-item" }, el("i", { class: `bench-legend-swatch ${cls}` }), text);
-  const legend = el("div", { class: "bench-tile-legend" },
-    key("gain", "gain over genesis"),
-    key("base", "genesis"),
-    deficit ? key("below", "below genesis") : null,
-    deficit ? key("gap", "genesis level") : null,
-    refs.length ? key("ref", refs.map(ref => ref.label).join(" · ")) : null);
-  return [svg, legend];
-}
-
 function progressLabel(preds) {
+  if (preds.distributed) return preds.status;
   if (preds.fresh) return "running";
   return preds.scoring ? "scoring" : "stalled";
 }
 
 function renderProgress(preds, label) {
   const percent = (preds.ratio * 100).toFixed(1);
-  const state = preds.fresh
-    ? [`${percent}%`, preds.eta ? `eta ${preds.eta}` : "generating"]
+  const state = preds.distributed
+    ? [`${percent}%`, preds.status, `${preds.completed} completed`, preds.errored ? `${preds.errored} errored` : null, `updated ${fmtRelative(preds.updatedAt)}`]
+    : preds.fresh
+      ? [`${percent}%`, "generating"]
     : preds.scoring
       ? [`${percent}%`, "awaiting score"]
       : [`${percent}%`, `idle ${fmtRelative(preds.updatedAt)}`];
@@ -583,33 +450,38 @@ function renderProgress(preds, label) {
     el("div", { class: "bench-tile-progress-note" }, [label, ...state].filter(Boolean).join(" · ")));
 }
 
-function renderTile(model, suite, sorted, baseline, activity, preds, refs = []) {
+function renderTile(model, suite, sorted, baseline, activity, preds) {
   const entry = suiteScores(model)[suite];
+  const distributed = distributedRunFor(model, suite);
   const scored = entry?.score != null;
-  const progress = scored ? null : preds;
+  // A running distributed benchmark can publish a meaningful partial score. Keep its
+  // progress visible—and use the running theme—until the producer marks it complete.
+  const distributedLive = distributed && !["complete", "failed"].includes(distributed.distributed_status);
+  const progress = distributedLive ? distributedProgress(distributed) : (scored ? null : preds);
   const genesis = baselineComparison(entry, baseline);
   const previous = previousComparison(entry, sorted, model, suite);
-  const running = scored ? null : activity?.running;
-  const queued = scored ? [] : (activity?.queued || []);
-  const href = entry?.run_id && !entry.no_detail ? detailHref(model, entry.run_id) : null;
+  const running = scored || distributed ? null : activity?.running;
+  const queued = scored || distributed ? [] : (activity?.queued || []);
+  const selectedRun = entry || distributed;
+  const href = selectedRun?.run_id && !selectedRun.no_detail ? detailHref(model, selectedRun.run_id) : null;
   const runNote = running
     ? [runningLabel(running, activity.labelByRepo), progressNote(running)].filter(Boolean).join(" · ")
     : queued.length ? `${queued.length} pending` : "";
   const live = Boolean(running) || Boolean(progress?.fresh);
 
-  const chartSvgElement = el("div", { class: "bench-tile-chart" }, renderChart(sorted, suite, model, baseline?.score, refs));
+  const chartSvgElement = el("div", { class: "bench-tile-chart" }, renderSpark(sorted, suite, baseline?.score));
   let chartWidth = 0;
   const chartObserver = new ResizeObserver(entries => {
     const w = Math.round(entries[0].contentRect.width);
     if (!w || w === chartWidth) return;
     chartWidth = w;
-    chartSvgElement.replaceChildren(...renderChart(sorted, suite, model, baseline?.score, refs, w));
+    chartSvgElement.replaceChildren(renderSpark(sorted, suite, baseline?.score, w));
   });
   chartObserver.observe(chartSvgElement);
 
   return el("article", {
     class: "bench-tile",
-    "data-status": scored ? "completed" : progress ? "progress" : "missing",
+    "data-status": progress ? "progress" : scored ? "completed" : "missing",
     "data-activity": live ? "running" : "idle",
   },
     el("div", { class: "bench-tile-head" },
@@ -618,7 +490,7 @@ function renderTile(model, suite, sorted, baseline, activity, preds, refs = []) 
     el("div", { class: "bench-tile-main" },
       el("div", { class: "bench-tile-score-wrap" },
         el(href ? "a" : "span", { class: "bench-tile-score", href },
-          scored ? panelScore(entry.score) : progress ? progressLabel(progress) : "missing"),
+          scored ? `${entry.partial_score ? "partial " : ""}${panelScore(entry.score)}` : progress ? progressLabel(progress) : "missing"),
         scored
           ? el("span", { class: "bench-tile-pass-count" },
               entry.score_meta || `avg · ${entry.pass_count || 1} ${entry.pass_count === 1 ? "pass" : "passes"}`)
@@ -676,15 +548,21 @@ function benchScoreOf(model, suite) {
 }
 
 function renderLeaderboard(sorted, selectedModel, baselineScores, rerender) {
+  const best = Object.fromEntries(BENCHMARK_ORDER.map(suite => [suite, Math.max(
+    ...sorted.filter(model => !isGenesis(model)).map(model => benchScoreOf(model, suite) ?? -Infinity))]));
   const setSort = suite => {
     benchSort = suite;
     localStorage.setItem("benchLeaderboardSort", suite);
     rerender();
   };
   // top N by the active benchmark, descending; genesis ranks by its own score
-  const ranked = [...sorted]
-    .sort((a, b) => (benchScoreOf(b, benchSort) ?? -Infinity) - (benchScoreOf(a, benchSort) ?? -Infinity))
-    .slice(0, LEADERBOARD_ROWS);
+  const order = [...sorted]
+    .sort((a, b) => (benchScoreOf(b, benchSort) ?? -Infinity) - (benchScoreOf(a, benchSort) ?? -Infinity));
+  const ranked = order.slice(0, LEADERBOARD_ROWS);
+  // genesis is the reference point, so it stays visible below the top rows with its real rank
+  const genesisRank = order.findIndex(isGenesis);
+  const shown = ranked.map((model, i) => [model, i + 1]);
+  if (genesisRank >= LEADERBOARD_ROWS) shown.push([order[genesisRank], genesisRank + 1]);
 
   const headCell = suite => el("th", {
     class: `r bench-sort-th${suite === benchSort ? " active" : ""}`,
@@ -692,7 +570,15 @@ function renderLeaderboard(sorted, selectedModel, baselineScores, rerender) {
     title: `sort by ${benchmarkLabel(suite)} (descending)`,
   }, benchmarkLabel(suite));
 
-  const rows = ranked.map((model, i) => {
+  const rows = shown.flatMap(([model, rank], i) => [
+    // ranks skipped between the top rows and genesis read as a gap, not as consecutive places
+    i > 0 && rank - shown[i - 1][1] > 1
+      ? el("tr", { class: "bench-rank-gap" }, el("td", { colspan: 3 + BENCHMARK_ORDER.length }, "⋯"))
+      : null,
+    leaderboardRow(model, rank),
+  ]).filter(Boolean);
+
+  function leaderboardRow(model, rank) {
     const scores = suiteScores(model);
     const repoUrl = hfRepoUrl(model);
     const genesis = isGenesis(model);
@@ -700,7 +586,7 @@ function renderLeaderboard(sorted, selectedModel, baselineScores, rerender) {
       class: ["clickable", genesis ? "bench-genesis-row" : ""].filter(Boolean).join(" "),
       onClick: e => { if (!e.target.closest("a")) location.href = detailHref(model); },
     },
-      el("td", { class: "bench-rank" }, String(i + 1)),
+      el("td", { class: "bench-rank" }, String(rank)),
       el("td", { class: "bench-king-col" },
         el("a", { href: detailHref(model) }, modelLabel(model)),
         genesis ? el("span", { class: "bench-baseline-tag" }, "baseline") : null),
@@ -710,19 +596,18 @@ function renderLeaderboard(sorted, selectedModel, baselineScores, rerender) {
       BENCHMARK_ORDER.map(suite => {
         const entry = scores[suite];
         if (entry?.score == null) return el("td", { class: "r" }, el("span", { class: "muted-dash" }, "—"));
-        const base = baselineScores?.[suite]?.score;
-        const beats = !genesis && base != null && entry.score > base;
+        const top = !genesis && entry.score === best[suite];
         return el("td", {
-          class: `r${beats ? " beats-genesis" : ""}`,
-          title: beats ? `beats genesis (${panelScore(base)})` : (entry.score_meta || `${entry.pass_count || 1} pass average`),
+          class: `r${top ? " bench-best" : ""}`,
+          title: top ? `best on ${benchmarkLabel(suite)}` : (entry.score_meta || `${entry.pass_count || 1} pass average`),
         }, panelScore(entry.score));
       }));
-  });
+  }
 
   return el("div", { class: "bench-history" },
     el("div", { class: "bench-leaderboard-cap" },
       el("span", {}, `top ${ranked.length} · by ${benchmarkLabel(benchSort)}`),
-      el("span", { class: "bench-leaderboard-hint" }, "click a benchmark to sort · green beats genesis")),
+      el("span", { class: "bench-leaderboard-hint" }, "click a benchmark to sort · yellow is the best score")),
     sorted.length
       ? el("div", { class: "data-table-wrap" },
           el("table", { class: "data-table bench-leaderboard" },
@@ -787,8 +672,9 @@ function renderKingHistory(sorted, selectedModel, rerender) {
       : el("div", { class: "bench-history-empty" }, "no benchmark history yet"));
 }
 
-export function renderBenchmarks(container, metaNode, data, scoresBySuite = null, liveBySuite = null) {
-  data = mergePulledScores(data, scoresBySuite);
+export function renderBenchmarks(container, metaNode, data, scoresBySuite = null, liveBySuite = null, resultsManifest = null) {
+  applyBenchmarkRegistry(resultsManifest);
+  data = mergeDistributedResults(mergePulledScores(data, scoresBySuite), resultsManifest);
   const liveRunIds = new Set([...(liveBySuite?.values() || [])].map(live => live?.runId).filter(Boolean));
   const { models, sorted, selected } = panelModels(data, liveRunIds);
   if (!models.length) {
@@ -813,8 +699,7 @@ export function renderBenchmarks(container, metaNode, data, scoresBySuite = null
     }
     return [pulled.suite, preds];
   }));
-  const refs = referenceScores(scoresBySuite);
-  const rerender = () => renderBenchmarks(container, metaNode, data, scoresBySuite, liveBySuite);
+  const rerender = () => renderBenchmarks(container, metaNode, data, scoresBySuite, liveBySuite, resultsManifest);
   const scores = suiteScores(selected);
   const done = BENCHMARK_ORDER.filter(suite => scores[suite]?.score != null).length;
 
@@ -832,9 +717,9 @@ export function renderBenchmarks(container, metaNode, data, scoresBySuite = null
             `${done}/${BENCHMARK_ORDER.length} scores · ${modelLabel(selected)}`))),
       el("div", { class: "bench-tile-grid" }, BENCHMARK_ORDER.map(suite =>
         renderTile(selected, suite, sorted, baselineScores[suite], activity.get(suite),
-          predsBySuite.get(suite) || null, refs.get(suite) || []))),
+          predsBySuite.get(suite) || null))),
       benchMode === "all"
         ? renderKingHistory(sorted, selected, rerender)
         : renderLeaderboard(sorted, selected, baselineScores, rerender)));
-  if (metaNode) metaNode.textContent = `${models.length} models · ${data.counts?.runs ?? 0} benchmark runs · updated ${fmtRelative(data.generated_at)}`;
+  if (metaNode) metaNode.textContent = `${models.length} models · ${data.counts?.runs ?? 0} benchmark runs`;
 }

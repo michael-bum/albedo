@@ -1,0 +1,17 @@
+name: sync unarbos
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  push:
+    if: github.repository == 'tony-dendrite/albedo'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: git push "https://x-access-token:${{ secrets.UNARBOS_ACCESS_TOKEN }}@github.com/unarbos/albedo.git" HEAD:main

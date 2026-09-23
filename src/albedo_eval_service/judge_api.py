@@ -119,7 +119,7 @@ from .simulator.prompt_simulator import (
     MUST_PRINT_RETRY,
     missing_command_output,
     reference_completion_observation,
-    simulation_system_prompt,
+    simulation_messages,
 )
 
 
@@ -396,6 +396,12 @@ def _reference_document(prefix: list[dict[str, str]] | None, turns: list[dict[st
     return format_scored_trajectory(context + turns)
 
 
+def _reference_yes_rate(run: int, questions: list[dict[str, Any]]) -> float | None:
+    """What one reference run scores on the checklist it survived, on the candidates' own scale."""
+    answers = {q["id"]: "1" if run in q["scored_by"] else "0" for q in questions}
+    return judge_yes_rate(answers, questions)
+
+
 def _steps_from_turns(turns: list[dict[str, Any]]) -> list[dict[str, str]]:
     """The turns a reference run produced, as the {assistant, observation} pairs the vector wants.
 
@@ -614,13 +620,17 @@ class QuestionService:
         runs: list[tuple[str, str, bool, list[dict[str, Any]]]],
         prefix: list[dict[str, str]] | None,
         discarded: list[dict[str, str]],
-    ) -> list[dict[str, Any]]:
-        """Drop questions that no reference run can answer.
+    ) -> tuple[list[dict[str, Any]], set[int]]:
+        """Drop questions that no reference run can answer, stamping `scored_by` on every one.
 
         A milestone is extracted FROM these runs and its questions are written from that milestone,
         so a run should be able to answer them: it is the trajectory that did the work being asked
         about. A question none of them earns is asking for something no run did, or asking in a way
         the judge cannot see.
+
+        `scored_by` is the runs that earned the question, empty for one that is pruned. The second
+        return value is the runs that came back readable at all, which is what separates a run that
+        earned nothing from a run whose verdict could not be parsed.
         """
         judges = [self.settings.evaluator_model]
         results = await asyncio.gather(
@@ -636,23 +646,23 @@ class QuestionService:
                 for index, (_, _, _, turns) in enumerate(runs, start=1)
             ]
         )
-        earned: set[str] = set()
-        unreadable = 0
-        for _, records in results:
+        earned: dict[str, list[int]] = {question["id"]: [] for question in questions}
+        readable: set[int] = set()
+        for run, (_, records) in enumerate(results, start=1):
             for record in records:
                 if not record.get("parse_ok"):
-                    unreadable += 1
                     continue
-                earned.update(
-                    qid for qid, value in (record.get("answers") or {}).items() if value == "1"
-                )
-        if unreadable == len(results):
+                readable.add(run)
+                for qid, value in (record.get("answers") or {}).items():
+                    if value == "1" and qid in earned:
+                        earned[qid].append(run)
+        if not readable:
             # no usable verdict from any run: keep the checklist rather than delete it blind
             logger.warning("reference_prune_unreadable runs={} keeping_unpruned", len(results))
-            return questions
-        kept = [q for q in questions if q["id"] in earned]
+            return questions, readable
         for question in questions:
-            if question["id"] not in earned:
+            question["scored_by"] = earned[question["id"]]
+            if not question["scored_by"]:
                 discarded.append(
                     {
                         "stage": "reference_prune",
@@ -661,7 +671,7 @@ class QuestionService:
                         "origin": "content",
                     }
                 )
-        return kept
+        return [question for question in questions if question["scored_by"]], readable
 
     async def _prepare_once(
         self,
@@ -679,8 +689,8 @@ class QuestionService:
         discarded: list[dict[str, str]] = []
 
         trajectories = [
-            {"run": index, "steps": _steps_from_turns(turns)}
-            for index, (_, _, _, turns) in enumerate(runs, start=1)
+            {"run": index, "model": model, "made_edit": edit, "steps": _steps_from_turns(turns)}
+            for index, (_, model, edit, turns) in enumerate(runs, start=1)
         ]
         (
             milestones,
@@ -716,8 +726,9 @@ class QuestionService:
         questions = filter_reference_leaks(questions, discards=discarded)
         questions, drops = enforce_question_labels(questions, discards=discarded)
         pruned_from = len(questions)
+        readable: set[int] = set()
         if self.settings.reference_prune:
-            questions = await self._prune_unreachable(questions, runs, prefix, discarded)
+            questions, readable = await self._prune_unreachable(questions, runs, prefix, discarded)
         pruned_out = pruned_from - len(questions)
         if len(questions) < QUESTION_FLOOR:
             raise QuestionScoringUnavailable(
@@ -749,10 +760,20 @@ class QuestionService:
             "milestones_kept": len(milestones),
             "pruned_unreachable": pruned_out,
             "milestones_thin": thin,
+            "milestones": milestones,
             "enforcement_drops": drops,
-            "reference_trajectories": references,
+            "reference_steps": trajectories,
             "discarded_questions": discarded,
+            # kept question id -> runs that earned it; pruned ones are in discarded_questions
+            "reference_scoring": {q["id"]: q["scored_by"] for q in questions if "scored_by" in q},
+            "reference_self_scores": [
+                {"run": run, "model": model, "yes_rate": _reference_yes_rate(run, questions)}
+                for run, (_, model, _, _) in enumerate(runs, start=1)
+                if run in readable
+            ],
         }
+        for question in questions:
+            question.pop("scored_by", None)  # it is carried by reference_scoring, once
         return QuestionPrepResult(questions=questions, source=source)
 
 
@@ -791,10 +812,7 @@ class ObservationSimulationService:
         response = await self.client.complete(
             purpose="simulate",
             model=primary,
-            messages=[
-                {"role": "system", "content": simulation_system_prompt(fmt, context_block)},
-                {"role": "user", "content": f"{transcript}\n\n{MUST_PRINT_RETRY}"},
-            ],
+            messages=simulation_messages(fmt, transcript, context_block, MUST_PRINT_RETRY),
             temperature=0.0,
             eval_run_id=request.eval_run_id,
             max_tokens=self.settings.simulation_max_tokens,
@@ -950,13 +968,7 @@ class ObservationSimulationService:
         best_rank = -1
         for model, tries, provider_block, or_only in attempts:
             capped = model == primary and primary != fallback_model
-            messages = [
-                {
-                    "role": "system",
-                    "content": simulation_system_prompt(fmt, context_block),
-                },
-                {"role": "user", "content": transcript},
-            ]
+            messages = simulation_messages(fmt, transcript, context_block)
             # one parse attempt per rung: the ladder itself is the retry mechanism, and
             # every extra in-rung attempt lands on the turn barrier's critical path
             capped_kwargs = {"parse_retries": 1, "retry_count": 1} if capped else {}

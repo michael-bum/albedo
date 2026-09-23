@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
@@ -304,6 +304,37 @@ def parse_instance(source: str, instance_id: str) -> RepoRef | None:
         return None
     except ValueError:
         return None
+
+
+_SMITH_MIRROR_OWNER = "swesmith"
+_SMITH_REMOVE_F2P_SUBJECT = "Remove F2P Tests"
+_SHA_RULE = 2
+
+
+def _smith_mirror(ref: RepoRef) -> RepoRef | None:
+    if not ref.source.startswith("mini-coder") or not ref.commit:
+        return None
+    return replace(
+        ref,
+        owner=_SMITH_MIRROR_OWNER,
+        repo=f"{ref.owner}__{ref.repo}.{ref.commit}",
+        commit=ref.instance_id,
+    )
+
+
+def _smith_env_is_bug_patch(ref: RepoRef, head: dict) -> bool:
+    if not ref.source.startswith("mini-coder-rs"):
+        return False
+    message = str((head.get("commit") or {}).get("message") or "")
+    return message.startswith(_SMITH_REMOVE_F2P_SUBJECT) and bool(head.get("parents"))
+
+
+def _read_cached_sha(path: Path) -> dict | None:
+    """A cached SHA entry, or None when it was written under an older resolution rule."""
+    cached = _read_json(path)
+    if not isinstance(cached, dict) or cached.get("rule") != _SHA_RULE:
+        return None
+    return cached
 
 
 def _first_command(text: str) -> str:
@@ -730,15 +761,16 @@ class RepoContextService:
         return self._shards
 
     def _resolve_sha(self, ref: RepoRef) -> tuple[str, str, str] | None:
+        ref = _smith_mirror(ref) or ref
         cache_path = self._shas_dir / f"{_safe_name(ref.instance_id)}.json"
-        cached = _read_json(cache_path)
+        cached = _read_cached_sha(cache_path)
         if cached is not None:
             if cached.get("sha"):
                 return cached["owner"], cached["repo"], cached["sha"]
             if self._negative_fresh(cached):
                 return None
         with self._key_lock(f"sha:{ref.instance_id}"):
-            cached = _read_json(cache_path)
+            cached = _read_cached_sha(cache_path)
             if cached is not None and cached.get("sha"):
                 return cached["owner"], cached["repo"], cached["sha"]
             owner, repo = ref.owner, ref.repo
@@ -763,10 +795,13 @@ class RepoContextService:
                         "error": f"{type(exc).__name__}: {exc}",
                         "failed_at": time.time(),
                         "kind": "permanent" if permanent else "transient",
+                        "rule": _SHA_RULE,
                     },
                 )
                 return None
-            _write_json_atomic(cache_path, {"owner": owner, "repo": repo, "sha": sha})
+            _write_json_atomic(
+                cache_path, {"owner": owner, "repo": repo, "sha": sha, "rule": _SHA_RULE}
+            )
             return owner, repo, sha
 
     @staticmethod
@@ -885,6 +920,10 @@ class RepoContextService:
             data = self._github_json(f"/repos/{owner}/{repo}/pulls/{ref.pr}")
             return data["base"]["sha"]
         data = self._github_json(f"/repos/{owner}/{repo}/commits/{ref.commit}")
+        if ref.source == "swe-hero":
+            return data["parents"][0]["sha"]
+        if owner == _SMITH_MIRROR_OWNER and _smith_env_is_bug_patch(ref, data):
+            return data["parents"][0]["sha"]
         return data["sha"]
 
     def _ensure_snapshot(self, owner: str, repo: str, sha: str) -> Path | None:

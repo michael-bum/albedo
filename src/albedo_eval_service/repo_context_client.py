@@ -27,7 +27,8 @@ class RepoContextClient:
     def __init__(self, settings: JudgeSettings):
         self._client = httpx.AsyncClient(
             base_url=settings.repo_context_url.rstrip("/"),
-            timeout=settings.repo_context_timeout_seconds,
+            timeout=httpx.Timeout(settings.repo_context_timeout_seconds, pool=None),
+            limits=httpx.Limits(max_connections=8),
         )
         self._last_warning = 0.0
 

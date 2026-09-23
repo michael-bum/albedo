@@ -1,8 +1,8 @@
 import { POLL_MS, PREDS_POLL_MS, SLOW_POLL_MS, PULLED_SUITES } from "../config.js";
-import { fetchDashboard, fetchState, fetchBenchmarks, fetchPulledScores, fetchManifest, fetchLlmsText, fetchRegistrationHistory, fetchPredsProgress } from "../fetch.js";
+import { fetchDashboard, fetchState, fetchBenchmarks, fetchPulledScores, fetchResultsManifest, fetchManifest, fetchLlmsText, fetchRegistrationHistory, fetchPredsProgress } from "../fetch.js";
 import { normalize } from "../data.js";
 import { el, mount } from "../dom.js";
-import { fmtRelative, toRoman } from "../format.js";
+import { toRoman } from "../format.js";
 import { kingTitleName, hubRepoUrl, modelRepo, dendriteRepo, dendriteRepoUrl } from "../model.js";
 import { renderReign } from "../render/reign.js";
 import { renderBenchmarks, liveScoreCandidates } from "../render/benchmarks.js";
@@ -60,7 +60,6 @@ function render(d) {
   renderHeroChart($("hero-chart"), d.history);
   renderReign($("reign-wrap"), d.reign, netuid);
   renderTables(d);
-  if (d.updatedAt) $("updated").textContent = "updated " + fmtRelative(d.updatedAt);
 }
 
 let lastSig = null;
@@ -77,21 +76,23 @@ async function tick() {
 
 let benchmarkData = null;
 let benchmarkScores = null;
+let resultsManifest = null;
 let predsProgress = new Map();
 
 function paintBenchmarks() {
   if (!benchmarkData) return;
-  renderBenchmarks($("benchmarks-wrap"), $("benchmarks-meta"), benchmarkData, benchmarkScores, predsProgress);
+  renderBenchmarks($("benchmarks-wrap"), $("benchmarks-meta"), benchmarkData, benchmarkScores, predsProgress, resultsManifest);
 }
 
 async function tickBenchmarks() {
-  const [data, scores] = await Promise.all([fetchBenchmarks(), fetchPulledScores()]);
+  const [data, scores, distributed] = await Promise.all([fetchBenchmarks(), fetchPulledScores(), fetchResultsManifest()]);
   if (!data) return;
-  const sig = JSON.stringify([data, [...scores]]);
+  const sig = JSON.stringify([data, [...scores], distributed]);
   if (sig === benchmarkSig) return;
   benchmarkSig = sig;
   benchmarkData = data;
   benchmarkScores = scores;
+  resultsManifest = distributed;
   paintBenchmarks();
 }
 
@@ -106,10 +107,17 @@ function reigningCandidate(pulled) {
   return scored ? [] : [runId];
 }
 
+function hasDistributedProgress(suite) {
+  const benchmark = (resultsManifest?.benchmarks || []).find(item => item?.legacy_suite === suite);
+  return Boolean(benchmark && (resultsManifest?.results?.[benchmark.name] || []).some(row =>
+    ["pending", "running", "scoring"].includes(String(row?.status || "").toLowerCase())));
+}
+
 async function tickPreds() {
   const candidates = benchmarkData ? liveScoreCandidates(benchmarkData, benchmarkScores) : new Map();
   const next = new Map();
   for (const pulled of PULLED_SUITES) {
+    if (hasDistributedProgress(pulled.suite)) continue;
     const runIds = [...new Set([...(candidates.get(pulled.suite) || []), ...reigningCandidate(pulled)])];
     const progress = runIds.length ? await fetchPredsProgress(pulled.predsEndpoints, runIds) : null;
     if (progress) next.set(pulled.suite, progress);

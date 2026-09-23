@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from repo_context_service.command_search import ParseFailure
 from repo_context_service.git_sim import (
     GitMeta,
@@ -8,6 +10,7 @@ from repo_context_service.git_sim import (
     ledger_block,
     run_git_chain,
 )
+from repo_context_service.git_sim.patches import _apply_hunks, _observed_patches
 from repo_context_service.overlay import build_overlay
 
 BASE = {
@@ -159,3 +162,66 @@ def test_the_ledger_is_rendered_for_git_commands_only():
     assert is_git_command("cd /testbed && git add app.py")
     assert not is_git_command("cat README.md")
     assert not is_git_command("grep -rn digit .")
+
+
+APP_DIFF = (
+    "diff --git a/src/app.py b/src/app.py\n"
+    "index 1111111..2222222 100644\n"
+    "--- a/src/app.py\n"
+    "+++ b/src/app.py\n"
+    "@@ -1,2 +1,2 @@\n"
+    " def main():\n"
+    "-    return 1\n"
+    "+    return 2\n"
+)
+APP_HUNKS = [(1, [" def main():", "-    return 1", "+    return 2"])]
+OPENHANDS_TRAILER = (
+    "[The command completed with exit code 0.]\n"
+    "[Current working directory: /workspace/demo]\n"
+    "[Command finished with exit code 0]"
+)
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [
+        APP_DIFF,  # bare output, git's own trailing newline
+        APP_DIFF + "\n",  # a blank line after the diff
+        APP_DIFF + OPENHANDS_TRAILER,  # OpenHands bash output closes with the exit-code trailer
+        APP_DIFF + "\n" + OPENHANDS_TRAILER,
+        f"<returncode>0</returncode>\n<output>\n{APP_DIFF}\n</output>",
+        f"OBSERVATION:\n{APP_DIFF}",
+    ],
+)
+def test_observed_diff_is_kept_whatever_follows_the_last_hunk(observation):
+    patches = _observed_patches(observation)
+    assert patches == {"src/app.py": APP_HUNKS}
+    assert _apply_hunks(BASE["src/app.py"], patches["src/app.py"]) == "def main():\n    return 2\n"
+
+
+def test_observed_diff_keeps_a_blank_context_line_inside_a_hunk():
+    diff = (
+        "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n"
+        "@@ -1,3 +1,3 @@\n # demo\n\n-old\n+new\n" + OPENHANDS_TRAILER
+    )
+    assert _observed_patches(diff) == {"README.md": [(1, [" # demo", " ", "-old", "+new"])]}
+
+
+def test_observed_diff_keeps_every_file_when_a_trailer_follows():
+    readme = (
+        "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n"
+        "@@ -1 +1 @@\n-# demo\n+# Demo\n"
+    )
+    patches = _observed_patches(APP_DIFF + readme + OPENHANDS_TRAILER)
+    assert patches == {"src/app.py": APP_HUNKS, "README.md": [(1, ["-# demo", "+# Demo"])]}
+
+
+def test_transcript_git_diff_teaches_the_overlay_the_edit():
+    """A `git diff` the real harness ran (OpenHands trailer included) is how the overlay learns
+    an edit it did not see being made; later reads must show the edited file."""
+    messages = [
+        {"role": "assistant", "content": "```bash\ngit diff\n```"},
+        {"role": "user", "content": APP_DIFF + OPENHANDS_TRAILER},
+    ]
+    overlay = build_overlay(messages, LISTING, {}, _read_base)
+    assert overlay.read("src/app.py") == "def main():\n    return 2\n"

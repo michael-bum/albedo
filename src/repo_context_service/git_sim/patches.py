@@ -171,26 +171,39 @@ def _observed_patches(observation: str) -> dict[str, list[tuple[int, list[str]]]
     path: str | None = None
     hunks: list[tuple[int, list[str]]] = []
     current: list[str] | None = None
+    blank_tail = 0
+
+    def flush() -> None:
+        if current is not None and blank_tail:
+            del current[len(current) - blank_tail :]
+        if path and hunks:
+            patches[path] = hunks
+
     for line in body.split("\n"):
         if header := _DIFF_FILE.match(line):
-            if path and hunks:
-                patches[path] = hunks
-            path, hunks, current = header.group(2), [], None
+            flush()
+            path, hunks, current, blank_tail = header.group(2), [], None, 0
             continue
         if path is None:
             continue
         if start := _HUNK_START.match(line):
-            current = []
+            if current is not None and blank_tail:
+                del current[len(current) - blank_tail :]
+            current, blank_tail = [], 0
             hunks.append((int(start.group(1)), current))
             continue
         if current is None:
             continue
-        if line[:1] in (" ", "+", "-", "\\") or line == "":
-            current.append(line if line else " ")
+        if line == "":
+            current.append(" ")
+            blank_tail += 1
+        elif line[:1] in (" ", "+", "-", "\\"):
+            current.append(line)
+            blank_tail = 0
         else:
-            path, current = None, None
-    if path and hunks:
-        patches[path] = hunks
+            flush()
+            path, hunks, current, blank_tail = None, [], None, 0
+    flush()
     return patches
 
 

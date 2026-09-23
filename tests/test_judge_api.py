@@ -40,10 +40,12 @@ from albedo_eval_service.shared.observation_format import (
 )
 from albedo_eval_service.simulator.prompt_simulator import (
     BASE_PROMPT,
+    COMPUTED_BLOCK_MARKER,
     FORMAT_MINI_CODER,
     FORMAT_OPENHANDS,
     FORMAT_SWE_AGENT,
     MUST_PRINT_RETRY,
+    simulation_messages,
     simulation_system_prompt,
 )
 
@@ -791,9 +793,16 @@ def test_prepare_anchors_on_reference_and_filters_leaks():
     assert result.source["question_mode"] == "milestone_ladder"
     assert result.source["reference_runs"] == 3
     assert result.source["reference_models"] == ["z-ai/glm-5.2"] * 3
-    assert "REFERENCE STEP" in result.source["reference_trajectories"][0]
+    first_run = result.source["reference_steps"][0]
+    assert first_run["run"] == 1 and first_run["steps"][0]["assistant"]
     assert result.source["milestones_kept"] == 2
     assert all("the reference" not in q["text"].casefold() for q in result.questions)
+    milestones = {m["id"]: m for m in result.source["milestones"]}
+    assert {q["milestone"] for q in result.questions} <= set(milestones)
+    assert all(
+        m["evidence"] and m["consensus"] == sorted({e["run"] for e in m["evidence"]})
+        for m in milestones.values()
+    )
 
     from albedo_eval_service.judge_core import question_weight
 
@@ -850,6 +859,69 @@ def test_prepare_drops_questions_no_reference_can_answer():
     kept = {q["text"] for q in result.questions}
     assert result.source["pruned_unreachable"] == 1, "only the question nobody earned is dropped"
     assert len(kept) == result.source["n_questions"]
+
+
+def test_reference_scoring_joins_on_the_ids_the_checklist_ships_with():
+    """A pruned question renumbers every question after it, and the join table must follow.
+
+    The table is keyed by the ids the shipped checklist carries, so a question that was q_05
+    before the prune and q_04 after must appear as q_04; a stale pre-prune id would hand one
+    question's references to its neighbour, silently and only ever in the artifact.
+    """
+    from albedo_eval_service.judge_api import QuestionPrepSample
+
+    class MiddlePruned(_AnchorFakeClient):
+        """Nobody earns the second question; the fifth is earned by the first run alone."""
+
+        def __init__(self):
+            super().__init__()
+            self.seen = 0
+
+        async def score(self, **kwargs):
+            ids = kwargs["response_schema"]["properties"]["answers"]["items"]["properties"][
+                "asked"
+            ]["enum"]
+            self.seen += 1
+            unearned = {"q_02"} if self.seen == 1 else {"q_02", "q_05"}
+            return JudgeRawResponse(
+                model=kwargs["model"],
+                provider="fake",
+                raw=json.dumps(
+                    {
+                        "answers": [
+                            {"asked": qid, "reason": "e", "verdict": 0 if qid in unearned else 1}
+                            for qid in ids
+                        ]
+                    }
+                ),
+            )
+
+    fake = MiddlePruned()
+    service = _anchor_service(fake)
+    sample = QuestionPrepSample(
+        sample_id="s:1:1",
+        prompt="TASK",
+        messages=[{"role": "user", "content": "fix the bug"}],
+        assistant_turns=2,
+    )
+    result = asyncio.run(service.prepare(sample, eval_run_id="run-1"))
+    scoring = result.source["reference_scoring"]
+
+    assert set(scoring) == {q["id"] for q in result.questions}, "one entry per shipped question"
+    assert all(scoring.values()), "a kept question was earned by at least one run"
+    pruned = [d for d in result.source["discarded_questions"] if d["stage"] == "reference_prune"]
+    assert len(pruned) == 1, "the question nobody earned is recorded as discarded, not scored"
+    route_specific = [qid for qid, runs in scoring.items() if runs == [1]]
+    assert len(route_specific) == 1
+    assert route_specific[0] != "q_05", "ids must be the post-prune ones"
+    assert "scored_by" not in result.questions[0], "the join lives in reference_scoring only"
+
+    kept = len(result.questions)
+    assert [entry["yes_rate"] for entry in result.source["reference_self_scores"]] == [
+        1.0,
+        round((kept - 1) / kept, 6),
+        round((kept - 1) / kept, 6),
+    ]
 
 
 def test_prepare_raises_when_every_reference_run_fails():
@@ -958,16 +1030,19 @@ def test_observation_simulation_uses_repo_context_when_available():
                 assistant_output="```bash\nls\n```",
             )
         )
-        return client.kwargs["messages"][0]["content"]
+        return client.kwargs["messages"]
 
     ctx = FakeRepoContext("REAL LISTING")
-    system_prompt = asyncio.run(run(ctx))
-    assert "REAL LISTING" in system_prompt
-    assert BASE_PROMPT in system_prompt
+    system_prompt, user = (m["content"] for m in asyncio.run(run(ctx)))
+    assert "REAL LISTING" in user and user.endswith("\n\nREAL LISTING")
+    assert "REAL LISTING" not in system_prompt
+    assert system_prompt == f"{BASE_PROMPT}\n{FORMAT_OPENHANDS}"
     assert ctx.calls == [("swe-zero/x:0:0", "```bash\nls\n```")]
 
-    assert asyncio.run(run(FakeRepoContext(None))) == f"{BASE_PROMPT}\n{FORMAT_OPENHANDS}"
-    assert asyncio.run(run(None)) == f"{BASE_PROMPT}\n{FORMAT_OPENHANDS}"
+    ungrounded, _ = (m["content"] for m in asyncio.run(run(FakeRepoContext(None))))
+    assert ungrounded == f"{BASE_PROMPT}\n{FORMAT_OPENHANDS}"
+    absent, _ = (m["content"] for m in asyncio.run(run(None)))
+    assert absent == f"{BASE_PROMPT}\n{FORMAT_OPENHANDS}"
 
 
 def test_looping_output_detection():
@@ -1134,7 +1209,7 @@ def test_same_prompt_used_for_primary_and_fallback():
             self.systems = []
 
         async def complete(self, **kw):
-            self.systems.append((kw["model"], kw["messages"][0]["content"]))
+            self.systems.append((kw["model"], kw["messages"]))
             raw = (
                 "ok"
                 if kw["model"] == "z-ai/glm-5.2"
@@ -1165,11 +1240,11 @@ def test_same_prompt_used_for_primary_and_fallback():
         )
     )
     assert observation == "ok"
-    primary_system = [s for m, s in client.systems if m == "xiaomi/mimo-v2.5-pro"][0]
-    fallback_system = [s for m, s in client.systems if m == "z-ai/glm-5.2"][0]
-    assert primary_system == fallback_system
-    assert BASE_PROMPT in fallback_system
-    assert "GROUNDING BLOCK" in fallback_system
+    primary = [s for m, s in client.systems if m == "xiaomi/mimo-v2.5-pro"][0]
+    fallback = [s for m, s in client.systems if m == "z-ai/glm-5.2"][0]
+    assert primary == fallback
+    assert BASE_PROMPT in fallback[0]["content"]
+    assert "GROUNDING BLOCK" in fallback[1]["content"]
 
 
 def test_repo_context_client_degrades_to_none_on_error():
@@ -1465,3 +1540,42 @@ def test_a_leaked_turn_is_not_memoised_on_the_eval_side():
     calls_after_first = client.calls
     _observe(service, "cat -A app.py")
     assert client.calls > calls_after_first, "the identical read was asked again, not replayed"
+
+
+def test_simulation_messages_keep_the_system_prompt_stable_across_turns():
+    """The grounding block changes every turn; it must not sit in the cached prefix."""
+    turn_one = simulation_messages(OPENHANDS, "### user\ntask\n\n### assistant\nls", "LISTING A")
+    longer = "### user\ntask\n\n### assistant\nls\n\n### user\nout\n\n### assistant\ncat x"
+    turn_two = simulation_messages(OPENHANDS, longer, "LISTING B")
+    system = {"role": "system", "content": simulation_system_prompt(OPENHANDS)}
+    assert turn_one[0] == turn_two[0] == system
+    assert [m["role"] for m in turn_two] == ["system", "user"]
+    assert turn_two[1]["content"].startswith("### user\ntask")
+    assert turn_two[1]["content"].endswith("\n\nLISTING B")
+    assert turn_two[1]["content"].startswith(turn_one[1]["content"].split("\n\nLISTING A")[0])
+
+
+def test_simulation_messages_put_the_retry_note_after_the_block():
+    messages = simulation_messages(RETURNCODE, "### assistant\ncat x", "LISTING", "RETRY NOTE")
+    assert messages[1]["content"] == "### assistant\ncat x\n\nLISTING\n\nRETRY NOTE"
+    plain = simulation_messages(RETURNCODE, "### assistant\ncat x")
+    assert plain[1]["content"] == "### assistant\ncat x"
+    noted = simulation_messages(RETURNCODE, "### assistant\ncat x", None, "NOTE")
+    assert noted[1]["content"] == "### assistant\ncat x\n\nNOTE"
+
+
+def test_simulation_messages_transcribe_a_computed_output_the_old_way():
+    block = f"{COMPUTED_BLOCK_MARKER} executed:\nline"
+    messages = simulation_messages(OPENHANDS, "$ grep -n x", block)
+    assert messages[0]["content"] == simulation_system_prompt(OPENHANDS, block)
+    assert messages[1]["content"] == "$ grep -n x"
+
+
+def test_repo_context_client_keeps_few_requests_in_flight_and_never_times_out_on_the_pool():
+    client = RepoContextClient(JudgeSettings(repo_context_url="http://127.0.0.1:9"))
+    try:
+        assert client._client.timeout.pool is None
+        assert client._client.timeout.read == JudgeSettings().repo_context_timeout_seconds
+        assert client._client._transport._pool._max_connections == 8
+    finally:
+        asyncio.run(client.aclose())

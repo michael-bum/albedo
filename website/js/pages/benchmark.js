@@ -1,5 +1,6 @@
-import { fetchBenchmarkRun, fetchBenchmarks, fetchPulledScores, fetchJson } from "../fetch.js";
+import { fetchBenchmarkRun, fetchBenchmarks, fetchPulledScores, fetchResultsManifest, fetchResultShard, fetchJson } from "../fetch.js";
 import { mergePulledScores, pulledRunFor } from "../render/benchmarks.js";
+import { mergeDistributedResults } from "../results.js";
 import { el, mount } from "../dom.js";
 import { fmt, fmtDateTime, shortDigest } from "../format.js";
 import { modelRepo, kingTitleName } from "../model.js";
@@ -21,8 +22,8 @@ const params = new URLSearchParams(location.search);
 const modelId = params.get("model_id");
 const runId = params.get("run_id");
 
-function benchmarkLabel(suite) {
-  return BENCHMARK_LABELS[suite] || suite || "—";
+function benchmarkLabel(suite, run = null) {
+  return run?.benchmark_nice_name || BENCHMARK_LABELS[suite] || suite || "—";
 }
 
 function modelName(model) {
@@ -108,7 +109,7 @@ function deltaCell(delta) {
 
 function score(run, delta = null) {
   return el("span", { class: "bench-score-wrap" },
-    el("span", { class: `bench-score ${runStateClass(run)}` }, run?.score == null ? "—" : fmt(run.score, 3)),
+    el("span", { class: `bench-score ${runStateClass(run)}` }, run?.score == null ? "—" : `${run.partial_score ? "partial " : ""}${fmt(run.score, 3)}`),
     deltaCell(delta));
 }
 
@@ -146,6 +147,9 @@ function benchVersion(run) {
 
 function methodologyNotes(model, run) {
   const pulled = pulledRunFor(run);
+  if (run?.source === "distributed") {
+    return `Published by the benchmarking service as ${run.distributed_benchmark}; status: ${run.distributed_status || "—"}.`;
+  }
   if (pulled) {
     return [
       `Evaluated using ${modelName(model)} as ${run.pulled_run_id}.`,
@@ -187,7 +191,7 @@ function suiteDomain(suite) {
 }
 
 function renderMethodology(model, run) {
-  const agentHarness = pulledRunFor(run) || run?.suite === "swe_rebench_2026_03";
+  const agentHarness = run?.source === "distributed" || pulledRunFor(run) || run?.suite === "swe_rebench_2026_03";
   const actorKey = agentHarness ? "Agent Harness" : "User Simulator";
   const actorValue = agentHarness ? (run?.metrics?.agent_harness || "mini-swe-agent") : cleanUserSimulator(run);
   return el("div", { class: "detail-section" },
@@ -386,7 +390,7 @@ function wireTrajectory(run) {
 }
 
 function renderTaskTable(run) {
-  const pulled = Boolean(pulledRunFor(run));
+  const pulled = Boolean(pulledRunFor(run) || run?.source === "distributed");
   const rows = (run?.task_results || []).map(task => {
     const info = task.metrics?.exception_info;
     return el("tr", {},
@@ -411,12 +415,12 @@ function render(model, selected, baseline) {
 
   const runs = completedRuns(model);
   const tabs = runs.length ? el("div", { class: "bench-run-tabs detail-section" }, runs.map(run =>
-    el("a", { href: detailHref(model, run), class: run.id === selected?.id ? "active" : "" }, benchmarkLabel(run.suite)))) : null;
+    el("a", { href: detailHref(model, run), class: run.id === selected?.id ? "active" : "" }, benchmarkLabel(run.suite, run)))) : null;
 
   mount($("b-body"),
     tabs,
     selected ? el("div", { class: "kv-grid" },
-      kv("benchmark", benchmarkLabel(selected.suite)),
+      kv("benchmark", benchmarkLabel(selected.suite, selected)),
       kv("state", selected.state || "—", runStateClass(selected)),
       kv("score", score(selected, scoreDelta(model, selected, baseline))),
       kv("tasks", taskSummary(selected)),
@@ -435,13 +439,30 @@ function render(model, selected, baseline) {
   if (selected) wireTrajectory(selected);
 }
 
+async function loadDistributedRun(run) {
+  const shard = await fetchResultShard(run?.distributed_benchmark, run?.distributed_model_key);
+  if (!shard) return run;
+  const progress = shard.model_progress || {};
+  const evalResults = shard.eval_results || {};
+  return {
+    ...run,
+    state: String(shard.status || run.state || "pending").toUpperCase(),
+    started_at: shard.started_at || run.started_at,
+    finished_at: shard.status === "complete" ? shard.updated_at : null,
+    task_count: progress.total ?? run.task_count,
+    passed_count: evalResults.resolved ?? run.passed_count,
+    score: evalResults.score == null ? run.score : Number(evalResults.score) / 100,
+    artifacts: shard.artifacts || {},
+  };
+}
+
 async function load() {
-  const [raw, scores] = await Promise.all([fetchBenchmarks(), fetchPulledScores()]);
+  const [raw, scores, resultsManifest] = await Promise.all([fetchBenchmarks(), fetchPulledScores(), fetchResultsManifest()]);
   if (!raw) {
     mount($("b-body"), el("div", { class: "empty" }, "could not load benchmark data."));
     return;
   }
-  const data = mergePulledScores(raw, scores);
+  const data = mergeDistributedResults(mergePulledScores(raw, scores), resultsManifest);
   const models = data.models || [];
   const model = models.find(m => m.id === modelId)
     || models.find(m => completedRuns(m).some(r => r.id === runId));
@@ -453,6 +474,8 @@ async function load() {
   if (selected?.detail_path) {
     const detail = await fetchBenchmarkRun(selected);
     if (detail) selected = { ...selected, ...detail };
+  } else if (selected?.source === "distributed") {
+    selected = await loadDistributedRun(selected);
   } else if (pulledRunFor(selected)) {
     selected = await loadPulledRun(selected);
   }

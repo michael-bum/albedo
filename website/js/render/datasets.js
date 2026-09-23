@@ -3,13 +3,7 @@ import { fmtCount } from "../format.js";
 
 const hubDatasetUrl = repo => "https://huggingface.co/datasets/" + repo;
 
-// family -> bar segment color; order comes from meta.sampling.families when present
-const FAMILY_COLORS = {
-  pr: "var(--color-gold)",
-  lm: "var(--color-accent)",
-  combine: "var(--color-warn)",
-  mechanical: "var(--color-fg-4)",
-};
+// family order comes from meta.sampling.families when present
 const FAMILY_ORDER = ["pr", "lm", "combine", "mechanical"];
 
 function orderedEntries(counts, order) {
@@ -30,14 +24,9 @@ function familyMixCell(stats, familyOrder) {
   const entries = orderedEntries(stats?.families, familyOrder);
   const total = entries.reduce((sum, [, v]) => sum + v, 0);
   if (!total) return el("td", { class: "ds-mix" }, "—");
-  const top = [...entries].sort((a, b) => b[1] - a[1])[0];
-  const title = entries.map(([k, v]) => `${k} ${((v / total) * 100).toFixed(0)}%`).join(" · ") + " (instances)";
-  return el("td", { class: "ds-mix", title },
-    el("span", {}, `${top[0]} ${((top[1] / total) * 100).toFixed(0)}%`),
-    el("span", { class: "ds-mixbar" },
-      entries.map(([k, v]) => el("i", {
-        style: `width:${(v / total) * 100}%;background:${FAMILY_COLORS[k] || "var(--color-fg-3)"}`,
-      }))));
+  const mix = [...entries].sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `${k} ${((v / total) * 100).toFixed(0)}%`).join(" · ");
+  return el("td", { class: "ds-mix", title: `${mix} (instances)` }, mix);
 }
 
 function samplingNote(s) {

@@ -66,22 +66,9 @@
   min-width: 128px;
   font-family: var(--font-mono);
   font-size: 11px;
-  color: var(--color-gold);
+  color: var(--color-fg-2);
   white-space: nowrap;
 }
-.datasets-table .ds-mix > span:first-child { display: inline-block; min-width: 64px; }
-.datasets-table .ds-mixbar {
-  display: inline-block;
-  width: 48px;
-  height: 3px;
-  margin-left: 8px;
-  border-radius: 2px;
-  background: var(--color-border);
-  overflow: hidden;
-  vertical-align: middle;
-  font-size: 0; /* kill inline-block whitespace between segments */
-}
-.datasets-table .ds-mixbar > i { display: inline-block; height: 100%; }
 .datasets-table .ds-num { color: var(--color-fg-2); white-space: nowrap; }
 .ds-sampling {
   margin-top: 8px;
@@ -728,8 +715,9 @@ table.bench-leaderboard th.bench-sort-th:hover { color: var(--color-fg); }
 table.bench-leaderboard th.bench-sort-th.active { color: var(--color-gold); }
 /* scores read at full brightness (the shared data-table dims cells to fg-2) */
 .bench-history table.data-table td { color: var(--color-fg); }
-table.bench-leaderboard td.beats-genesis { color: var(--color-ok); }
+table.bench-leaderboard td.bench-best { color: var(--color-gold); }
 table.bench-leaderboard tr.bench-genesis-row td:first-child { box-shadow: inset 3px 0 0 var(--color-gold); }
+table.bench-leaderboard tr.bench-rank-gap td { text-align: center; color: var(--color-fg-3); padding: 0; line-height: 1.2; }
 .bench-baseline-tag {
   margin-left: 6px; font-family: var(--font-mono); font-size: 9px; text-transform: uppercase;
   letter-spacing: 0.06em; color: var(--color-gold); opacity: 0.85;
@@ -739,7 +727,7 @@ table.bench-leaderboard th.bench-rank, table.bench-leaderboard td.bench-rank {
 }
 .bench-tile-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
 }
 .bench-tile {
@@ -931,8 +919,10 @@ a.bench-tile-score:hover { color: var(--color-accent); }
   padding: 10px 0;
 }
 
-@media (max-width: 760px) {
+@media (max-width: 1100px) {
   .bench-tile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 760px) {
   .bench-panel-head { flex-direction: column; align-items: flex-start; gap: 6px; }
 }
 @media (max-width: 520px) {

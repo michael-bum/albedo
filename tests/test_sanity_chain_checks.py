@@ -5,6 +5,8 @@ import json
 import random
 from types import SimpleNamespace
 
+import pytest
+
 from albedo_eval_service.judge_llm_client import JudgeRawResponse
 from sanity_service.chain import (
     MAX_REJECTIONS,
@@ -436,7 +438,7 @@ def test_a_followup_that_only_adds_our_submit_sentence_stops_the_session():
     assert state.stopped is True
 
 
-def test_a_microtask_naming_an_absent_function_loses_the_symbol_and_the_message():
+def test_a_microtask_naming_an_absent_function_is_drawn_again():
     state = _state(
         [{"role": "user", "content": "repo has pkg/codegen/utils.go with ToCamelCase()"}]
     )
@@ -448,11 +450,39 @@ def test_a_microtask_naming_an_absent_function_loses_the_symbol_and_the_message(
             "message": f"Before the main issue, fix SanitizeFieldName in utils.go. Run exactly: {CLAUSE}",  # noqa: E501
         }
     )
-    micro = asyncio.run(
-        generate_microtask(_Judge([bad]), SimpleNamespace(evaluator_model="eval"), state, CLAUSE)
+    good = json.dumps(
+        {
+            "file": "pkg/codegen/utils.go",
+            "function": "ToCamelCase",
+            "request": "keep leading underscores",
+            "message": f"Fix ToCamelCase first. Run exactly: {CLAUSE}",
+        }
     )
-    assert micro["request"] == "make the sanitizer keep leading underscores"
-    assert micro["function"] == "" and micro["message"] == ""
+    judge = _Judge([bad, bad, good])
+    micro = asyncio.run(
+        generate_microtask(judge, SimpleNamespace(evaluator_model="eval"), state, CLAUSE)
+    )
+    assert micro["function"] == "ToCamelCase" and micro["message"]
+
+
+def test_a_microtask_that_never_names_a_real_function_fails_generation():
+    state = _state(
+        [{"role": "user", "content": "repo has pkg/codegen/utils.go with ToCamelCase()"}]
+    )
+    bad = json.dumps(
+        {
+            "file": "pkg/codegen/utils.go",
+            "function": "SanitizeFieldName",
+            "request": "x",
+            "message": "y",
+        }
+    )
+    with pytest.raises(ValueError, match="no grounded function"):
+        asyncio.run(
+            generate_microtask(
+                _Judge([bad] * 10), SimpleNamespace(evaluator_model="eval"), state, CLAUSE
+            )
+        )
 
 
 def test_a_microtask_naming_a_function_present_in_context_keeps_it():

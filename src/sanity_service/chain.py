@@ -79,6 +79,7 @@ AGENT'S SUBMISSION TURN:
 
 _EDIT_RE = WORK_EDIT_RE
 _MICRO_CONTEXT_CHARS = 24000
+MICROTASK_ATTEMPTS = 5
 
 _BOILERPLATE_RE = re.compile(
     r"submit the same way when done:[^\n]*"
@@ -160,32 +161,30 @@ async def generate_microtask(
     context = "\n\n".join(str(m.get("content") or "") for m in state.messages)[
         -_MICRO_CONTEXT_CHARS:
     ]
-
-    result = await client.complete(
-        model=settings.evaluator_model,
-        messages=[
-            {
-                "role": "user",
-                "content": CHAIN_MICROTASK_PROMPT.format(
-                    context=context, clause=clause, applied=applied_edits(state)
-                ),
-            }
-        ],
-        temperature=0.7,
-        accept=lambda raw: _microtask_parsable(raw) and _microtask_grounded(raw, context),
-    )
-    obj = extract_json(result.raw or "", prefer_keys=("request",))
-    if not isinstance(obj, dict) or not obj.get("request"):
-        raise ValueError(f"microtask generation unparsable for {state.sample_id}")
-    micro = {k: str(obj.get(k) or "") for k in ("file", "function", "request", "message")}
-    if micro["function"] and not symbol_in_context(micro["function"], context):
-        logger.warning(
-            "[sanity/chain] microtask for {} names {!r}, absent from the session; dropping it",
-            state.sample_id,
-            micro["function"],
+    # the generator sometimes invents a function; asking for one makes the simulator fabricate
+    # it too, so draw again (temperature 0.7) until the named function is one the session showed
+    for _ in range(MICROTASK_ATTEMPTS):
+        result = await client.complete(
+            model=settings.evaluator_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": CHAIN_MICROTASK_PROMPT.format(
+                        context=context, clause=clause, applied=applied_edits(state)
+                    ),
+                }
+            ],
+            temperature=0.7,
+            accept=lambda raw: _microtask_parsable(raw) and _microtask_grounded(raw, context),
         )
-        micro["function"] = micro["message"] = ""
-    return micro
+        obj = extract_json(result.raw or "", prefer_keys=("request",))
+        if (
+            isinstance(obj, dict)
+            and obj.get("request")
+            and _microtask_grounded(result.raw, context)
+        ):
+            return {k: str(obj.get(k) or "") for k in ("file", "function", "request", "message")}
+    raise ValueError(f"microtask generation found no grounded function for {state.sample_id}")
 
 
 META_LEAK_RE = re.compile(

@@ -12,6 +12,7 @@ from .shared.json_extract import extract_json
 from .shared.observation_format import (
     strip_leaked_reasoning,
 )
+from .shared.verdict_levels import LETTERS, PHI, SCORING_MODE
 
 CHALLENGER_WIN_MARGIN = 0.025
 
@@ -109,7 +110,7 @@ def answer_schema(question_ids: list[str]) -> dict[str, Any]:
                     "properties": {
                         "asked": {"type": "string", "enum": question_ids},
                         "reason": {"type": "string"},
-                        "verdict": {"type": "integer", "enum": [1, 0]},
+                        "verdict": {"type": "string", "enum": list(LETTERS)},
                     },
                     "required": ["asked", "reason", "verdict"],
                     "additionalProperties": False,
@@ -119,9 +120,6 @@ def answer_schema(question_ids: list[str]) -> dict[str, Any]:
         "required": ["answers"],
         "additionalProperties": False,
     }
-
-
-_ANSWER_TO_BIT: dict[str, float] = {"1": 1.0, "0": 0.0}
 
 
 def parse_answers(
@@ -136,8 +134,8 @@ def parse_answers(
             if not isinstance(item, dict):
                 continue
             qid = str(item.get("asked") or item.get("id") or "").strip()
-            value = str(item.get("verdict", item.get("answer", ""))).strip().lower()
-            if qid in answers and value in _ANSWER_TO_BIT:
+            value = str(item.get("verdict", item.get("answer", ""))).strip().upper()
+            if qid in answers and value in PHI:
                 answers[qid] = value
                 explanations[qid] = str(item.get("reason") or item.get("explanation") or "").strip()
     parse_ok = all(value is not None for value in answers.values())
@@ -145,20 +143,16 @@ def parse_answers(
 
 
 def judge_yes_rate(
-    answers: dict[str, str | None], questions: list[dict[str, str]] | None = None
+    scores: dict[str, float | None], questions: list[dict[str, str]] | None = None
 ) -> float | None:
     if questions:
         weights = {q["id"]: question_weight(q) for q in questions}
-        num = sum(
-            weights.get(qid, 0.0) * _ANSWER_TO_BIT[v]
-            for qid, v in answers.items()
-            if v in _ANSWER_TO_BIT
-        )
-        den = sum(weights.get(qid, 0.0) for qid, v in answers.items() if v in _ANSWER_TO_BIT)
+        num = sum(weights.get(qid, 0.0) * s for qid, s in scores.items() if s is not None)
+        den = sum(weights.get(qid, 0.0) for qid, s in scores.items() if s is not None)
         if den:
             return round(num / den, 6)
-    bits = [_ANSWER_TO_BIT[v] for v in answers.values() if v in _ANSWER_TO_BIT]
-    return round(mean(bits), 6) if bits else None
+    values = [s for s in scores.values() if s is not None]
+    return round(mean(values), 6) if values else None
 
 
 def majority_answers(repeats: list[dict[str, str | None]]) -> dict[str, str | None]:
@@ -167,18 +161,28 @@ def majority_answers(repeats: list[dict[str, str | None]]) -> dict[str, str | No
         return {}
     out: dict[str, str | None] = {}
     for qid, first in repeats[0].items():
-        votes = [r.get(qid) for r in repeats if r.get(qid) in _ANSWER_TO_BIT]
+        votes = [r.get(qid) for r in repeats if r.get(qid) in PHI]
         out[qid] = max(votes, key=votes.count) if votes else first
     return out
 
 
+def mean_scores(repeats: list[dict[str, float]]) -> dict[str, float | None]:
+    if not repeats:
+        return {}
+    out: dict[str, float | None] = {}
+    for qid in repeats[0]:
+        values = [r[qid] for r in repeats if r.get(qid) is not None]
+        out[qid] = round(mean(values), 6) if values else None
+    return out
+
+
 def response_score(
-    per_judge_answers: dict[str, dict[str, str | None]],
+    per_judge_scores: dict[str, dict[str, float | None]],
     questions: list[dict[str, str]] | None = None,
 ) -> float | None:
     rates = [
         r
-        for r in (judge_yes_rate(a, questions) for a in per_judge_answers.values())
+        for r in (judge_yes_rate(s, questions) for s in per_judge_scores.values())
         if r is not None
     ]
     return round(mean(rates), 6) if rates else None
@@ -252,7 +256,7 @@ def aggregate_scores(
         "scored_sample_count": valid_count,
         "by_judge": by_judge,
         "by_metric": {},
-        "scoring_mode": "binary",
+        "scoring_mode": SCORING_MODE,
         "fault_class": None,
         "fault_code": None,
         "fault_message": None,

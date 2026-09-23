@@ -59,12 +59,13 @@ from .judge_core import (
     build_judge_messages,
     judge_yes_rate,
     majority_answers,
+    mean_scores,
     parse_answers,
     question_weight,
     reserved_token_leak,
     response_score,
 )
-from .judge_llm_client import JudgeLLMClient
+from .judge_llm_client import JudgeLLMClient, JudgeRawResponse
 from .remote.generation import format_scored_trajectory
 from .repo_context_client import Grounding, RepoContextClient
 from .shared.edit_detection import any_shows_work, named_in_removal
@@ -113,6 +114,12 @@ from .shared.observation_memo import ObservationMemo
 from .shared.pip_check import fabricated_pip_error
 from .shared.sed_check import fabricated_sed_error, misdiagnosed_sed
 from .shared.submit_protocol import first_bash_command, is_exact_submission
+from .shared.verdict_levels import (
+    NO_CREDIT,
+    PRUNE_EARNED_MIN,
+    SCORING_MODE,
+    read_verdict_logprobs,
+)
 from .simulator.prompt_simulator import (
     COMPLETE_MARKER,
     COMPUTED_BLOCK_MARKER,
@@ -398,8 +405,8 @@ def _reference_document(prefix: list[dict[str, str]] | None, turns: list[dict[st
 
 def _reference_yes_rate(run: int, questions: list[dict[str, Any]]) -> float | None:
     """What one reference run scores on the checklist it survived, on the candidates' own scale."""
-    answers = {q["id"]: "1" if run in q["scored_by"] else "0" for q in questions}
-    return judge_yes_rate(answers, questions)
+    scores = {q["id"]: 1.0 if run in q["scored_by"] else 0.0 for q in questions}
+    return judge_yes_rate(scores, questions)
 
 
 def _steps_from_turns(turns: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -653,8 +660,8 @@ class QuestionService:
                 if not record.get("parse_ok"):
                     continue
                 readable.add(run)
-                for qid, value in (record.get("answers") or {}).items():
-                    if value == "1" and qid in earned:
+                for qid, score in (record.get("scores") or {}).items():
+                    if score is not None and score >= PRUNE_EARNED_MIN and qid in earned:
                         earned[qid].append(run)
         if not readable:
             # no usable verdict from any run: keep the checklist rather than delete it blind
@@ -1553,18 +1560,19 @@ def _corrupted_side(
     questions: list[dict[str, str]],
     judge_models: list[str],
     reason: str,
-) -> tuple[dict[str, dict[str, str | None]], list[dict[str, Any]]]:
-    per_judge_answers: dict[str, dict[str, str | None]] = {
-        model: {q["id"]: "0" for q in questions} for model in judge_models
+) -> tuple[dict[str, dict[str, float | None]], list[dict[str, Any]]]:
+    per_judge_scores: dict[str, dict[str, float | None]] = {
+        model: {q["id"]: 0.0 for q in questions} for model in judge_models
     }
     records = [
         {
             "side": side,
             "judge_model": model,
             "provider": None,
-            "answers": per_judge_answers[model],
+            "answers": {q["id"]: NO_CREDIT for q in questions},
+            "scores": per_judge_scores[model],
             "explanations": {q["id"]: reason for q in questions},
-            "yes_rate": judge_yes_rate(per_judge_answers[model], questions),
+            "yes_rate": judge_yes_rate(per_judge_scores[model], questions),
             "parse_ok": True,
             "error": None,
             "corrupted": True,
@@ -1572,7 +1580,7 @@ def _corrupted_side(
         }
         for model in judge_models
     ]
-    return per_judge_answers, records
+    return per_judge_scores, records
 
 
 def _looped_side(
@@ -1581,19 +1589,20 @@ def _looped_side(
     questions: list[dict[str, str]],
     judge_models: list[str],
     verdict: LoopVerdict,
-) -> tuple[dict[str, dict[str, str | None]], list[dict[str, Any]]]:
+) -> tuple[dict[str, dict[str, float | None]], list[dict[str, Any]]]:
     explanation = loop_explanation(verdict)
-    per_judge_answers: dict[str, dict[str, str | None]] = {
-        model: {q["id"]: "0" for q in questions} for model in judge_models
+    per_judge_scores: dict[str, dict[str, float | None]] = {
+        model: {q["id"]: 0.0 for q in questions} for model in judge_models
     }
     records = [
         {
             "side": side,
             "judge_model": model,
             "provider": None,
-            "answers": per_judge_answers[model],
+            "answers": {q["id"]: NO_CREDIT for q in questions},
+            "scores": per_judge_scores[model],
             "explanations": {q["id"]: explanation for q in questions},
-            "yes_rate": judge_yes_rate(per_judge_answers[model], questions),
+            "yes_rate": judge_yes_rate(per_judge_scores[model], questions),
             "parse_ok": True,
             "error": None,
             "looped": True,
@@ -1609,7 +1618,15 @@ def _looped_side(
         }
         for model in judge_models
     ]
-    return per_judge_answers, records
+    return per_judge_scores, records
+
+
+def _reading_error(result: JudgeRawResponse, question_ids: list[str]) -> str | None:
+    if result.error:
+        return result.error
+    if not parse_answers(result.raw, question_ids)[2]:
+        return "judge answers unparseable"
+    return read_verdict_logprobs(result.raw, result.logprobs).error
 
 
 async def _judge_side(
@@ -1621,8 +1638,8 @@ async def _judge_side(
     questions: list[dict[str, str]],
     judge_models: list[str],
     repeats: int = 1,
-) -> tuple[dict[str, dict[str, str | None]], list[dict[str, Any]]]:
-    """Each judge model answers `repeats` times; a question's answer is the majority."""
+) -> tuple[dict[str, dict[str, float | None]], list[dict[str, Any]]]:
+    """Each judge model answers `repeats` times; a question's score is the mean expectation."""
     question_ids = [q["id"] for q in questions]
     schema = answer_schema(question_ids)
     messages = build_judge_messages(response=response_text, questions=questions)
@@ -1635,46 +1652,61 @@ async def _judge_side(
                 response_schema=schema,
                 schema_name="albedo_answers",
                 max_tokens=settings.answer_max_tokens,
-                accept=lambda raw: parse_answers(raw, question_ids)[2],
+                accept_response=lambda result: _reading_error(result, question_ids) is None,
+                want_logprobs=True,
             )
             for model in judge_models
             for _ in range(repeats)
         ]
     )
-    per_judge_answers: dict[str, dict[str, str | None]] = {}
+    per_judge_scores: dict[str, dict[str, float | None]] = {}
     records: list[dict[str, Any]] = []
     for index, model in enumerate(judge_models):
-        parsed = [
-            parse_answers(raw.raw, question_ids)
-            for raw in raws[index * repeats : (index + 1) * repeats]
-        ]
-        held = [
-            (a, e, raw)
-            for (a, e, ok), raw in zip(parsed, raws[index * repeats : (index + 1) * repeats])
-            if ok and not raw.error
-        ]
-        answers = majority_answers([a for a, _, _ in held]) if held else parsed[0][0]
-        explanations = held[0][1] if held else parsed[0][1]
-        first = held[0][2] if held else raws[index * repeats]
-        per_judge_answers[model] = answers
+        window = raws[index * repeats : (index + 1) * repeats]
+        held = []
+        errors = []
+        for result in window:
+            error = _reading_error(result, question_ids)
+            if error is not None:
+                errors.append(error)
+                continue
+            answers, explanations, _ = parse_answers(result.raw, question_ids)
+            held.append(
+                (answers, explanations, read_verdict_logprobs(result.raw, result.logprobs), result)
+            )
+        if held:
+            answers = majority_answers([a for a, _, _, _ in held])
+            scores = mean_scores([r.scores for _, _, r, _ in held])
+            explanations = held[0][1]
+            distributions = held[0][2].distributions
+            first = held[0][3]
+        else:
+            answers, explanations, _ = parse_answers(window[0].raw, question_ids)
+            scores = {qid: None for qid in question_ids}
+            distributions = {}
+            first = window[0]
+        per_judge_scores[model] = scores
         records.append(
             {
                 "side": side,
                 "judge_model": model,
                 "provider": first.provider,
                 "answers": answers,
+                "scores": scores,
+                "distributions": distributions,
                 "explanations": explanations,
-                "yes_rate": judge_yes_rate(answers, questions),
+                "yes_rate": judge_yes_rate(scores, questions),
                 "parse_ok": bool(held),
-                "error": None if held else first.error,
+                "error": None if held else (errors[0] if errors else None),
                 "repeats": repeats,
                 "repeats_held": len(held),
+                "logprob_readings": len(held),
                 "disputed": sum(
-                    1 for qid in question_ids if len({a.get(qid) for a, _, _ in held}) > 1
+                    1 for qid in question_ids if len({a.get(qid) for a, _, _, _ in held}) > 1
                 ),
             }
         )
-    return per_judge_answers, records
+    return per_judge_scores, records
 
 
 async def _score_samples(
@@ -1719,7 +1751,7 @@ async def _score_samples(
                 "challenger_score": None,
                 "judge_results": [],
                 "scored": False,
-                "scoring_mode": "binary",
+                "scoring_mode": SCORING_MODE,
                 "error": f"{type(exc).__name__}: {exc}",
             }
 
@@ -1790,12 +1822,12 @@ async def _score_samples(
                 repeats=int(getattr(settings, "judge_repeats", 1) or 1),
             )
 
-        (king_answers, king_recs), (chal_answers, chal_recs) = await asyncio.gather(
+        (king_scores, king_recs), (chal_scores, chal_recs) = await asyncio.gather(
             _side("previous_king", sample.previous_king_output),
             _side("challenger", sample.challenger_output),
         )
-        king_score = response_score(king_answers, questions)
-        chal_score = response_score(chal_answers, questions)
+        king_score = response_score(king_scores, questions)
+        chal_score = response_score(chal_scores, questions)
         king_amputated = amputated_thinking(sample.previous_king_output)
         chal_amputated = amputated_thinking(sample.challenger_output)
         if king_amputated and king_score is not None:
@@ -1829,7 +1861,7 @@ async def _score_samples(
             "challenger_score": chal_score,
             "judge_results": king_recs + chal_recs,
             "scored": scored,
-            "scoring_mode": "binary",
+            "scoring_mode": SCORING_MODE,
             "question_source": prepared.source,
         }
 
@@ -1864,7 +1896,7 @@ def _notify(
             batch_id=request.batch_id,
             fault_class="PROVIDER_FAULT",
             fault_code=fault_code,
-            scoring_mode="binary",
+            scoring_mode=SCORING_MODE,
             retryable=retryable,
             details=details,
         ),

@@ -11,6 +11,15 @@ JUDGE_PROVIDER_PINS: dict[str, dict[str, object]] = {
     for model in JUDGE_MODELS
 }
 
+JUDGE_LOGPROB_PROVIDER_PINS: dict[str, dict[str, object]] = {
+    model: {
+        "allow_fallbacks": False,
+        "quantizations": ["fp8"],
+        "order": ["ambient", "alibaba"],
+    }
+    for model in JUDGE_MODELS
+}
+
 EVALUATOR_MODEL = "z-ai/glm-5.2"
 EVALUATOR_PROVIDERS = "streamlake,baidu"
 SOTA_MODELS = "z-ai/glm-5.2"

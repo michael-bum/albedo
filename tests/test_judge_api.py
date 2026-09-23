@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from test_verdict_levels import logprob_entries
 
 from albedo_config import JudgeSettings
 from albedo_config.models import JUDGE_MODELS
@@ -38,6 +39,7 @@ from albedo_eval_service.shared.observation_format import (
     truncation_notice,
     valid_output,
 )
+from albedo_eval_service.shared.verdict_levels import NO_CREDIT
 from albedo_eval_service.simulator.prompt_simulator import (
     BASE_PROMPT,
     COMPUTED_BLOCK_MARKER,
@@ -152,14 +154,21 @@ class FakeClient:
         provider=None,
         accept=None,
         purpose="",
+        accept_response=None,
+        want_logprobs=False,
     ):
         ids = response_schema["properties"]["answers"]["items"]["properties"]["asked"]["enum"]
         content = messages[1]["content"]
-        answer = 0 if "KING" in content and "CHAL" not in content else 1
+        answer = NO_CREDIT if "KING" in content and "CHAL" not in content else "T"
         raw = json.dumps(
             {"answers": [{"asked": qid, "reason": "e", "verdict": answer} for qid in ids]}
         )
-        return JudgeRawResponse(model=model, provider="fake", raw=raw)
+        return JudgeRawResponse(
+            model=model,
+            provider="fake",
+            raw=raw,
+            logprobs=logprob_entries(raw) if want_logprobs else None,
+        )
 
 
 def _reference_backed_service(settings, fake):
@@ -317,12 +326,95 @@ def test_scoring_scores_both_sides_independently():
         _score_samples(client=fake, request=request, settings=settings, prep_store=store)
     )
     record = records[0]
-    assert record["scoring_mode"] == "binary"
+    assert record["scoring_mode"] == "graded_20"
     assert record["scored"] is True
     assert record["challenger_score"] == 1.0
     assert record["king_score"] == 0.0
     assert len(record["judge_results"]) == 2 * len(JUDGE_MODELS)
     assert {r["side"] for r in record["judge_results"]} == {"previous_king", "challenger"}
+    chal = next(r for r in record["judge_results"] if r["side"] == "challenger")
+    assert set(chal["answers"].values()) == {"T"}
+    assert set(chal["scores"].values()) == {1.0}
+    assert all(dist == {"T": 1.0} for dist in chal["distributions"].values())
+    assert chal["logprob_readings"] == chal["repeats_held"] == chal["repeats"] == 1
+    assert chal["disputed"] == 0
+
+
+class RepeatingClient(FakeClient):
+    """Three readings per call site: T, O and (on the third) a response without logprobs."""
+
+    def __init__(self):
+        super().__init__(n_questions=8)
+        self.calls = 0
+
+    async def score(self, **kwargs):
+        ids = kwargs["response_schema"]["properties"]["answers"]["items"]["properties"]["asked"]
+        letters = ["T", "O", "T"]
+        letter = letters[self.calls % 3]
+        broken = self.calls % 3 == 2
+        self.calls += 1
+        raw = json.dumps(
+            {"answers": [{"asked": qid, "reason": "e", "verdict": letter} for qid in ids["enum"]]}
+        )
+        return JudgeRawResponse(
+            model=kwargs["model"],
+            provider="fake",
+            raw=raw,
+            logprobs=None if broken else logprob_entries(raw),
+        )
+
+
+def test_repeats_average_the_expectations_and_drop_readings_without_logprobs():
+    from albedo_eval_service.judge_api import _judge_side
+
+    questions = [{"id": "q_01", "text": "a?", "tag": "reference:claims", "example_bad": "b"}]
+    fake = RepeatingClient()
+    scores, records = asyncio.run(
+        _judge_side(
+            client=fake,
+            settings=JudgeSettings(),
+            side="challenger",
+            response_text="CHAL",
+            questions=questions,
+            judge_models=list(JUDGE_MODELS[:1]),
+            repeats=3,
+        )
+    )
+    (record,) = records
+    assert record["repeats"] == 3
+    assert record["repeats_held"] == record["logprob_readings"] == 2
+    assert record["parse_ok"] is True
+    assert record["scores"] == {"q_01": 0.85}
+    assert scores[JUDGE_MODELS[0]] == {"q_01": 0.85}
+    assert record["answers"] == {"q_01": "T"}
+    assert record["disputed"] == 1
+    assert record["yes_rate"] == 0.85
+
+
+def test_side_unscored_when_no_reading_has_logprobs():
+    from albedo_eval_service.judge_api import _judge_side
+
+    class NoLogprobs(FakeClient):
+        async def score(self, **kwargs):
+            return await super().score(**{**kwargs, "want_logprobs": False})
+
+    questions = [{"id": "q_01", "text": "a?", "tag": "reference:claims", "example_bad": "b"}]
+    _, records = asyncio.run(
+        _judge_side(
+            client=NoLogprobs(),
+            settings=JudgeSettings(),
+            side="challenger",
+            response_text="CHAL",
+            questions=questions,
+            judge_models=list(JUDGE_MODELS[:1]),
+        )
+    )
+    (record,) = records
+    assert record["parse_ok"] is False
+    assert record["error"] == "no logprobs in response"
+    assert record["scores"] == {"q_01": None}
+    assert record["answers"] == {"q_01": "T"}
+    assert record["yes_rate"] is None
 
 
 def test_call_retries_until_accept_passes():
@@ -400,13 +492,19 @@ class OneJudgeBrokenClient:
         provider=None,
         accept=None,
         purpose="",
+        accept_response=None,
+        want_logprobs=False,
     ):
         ids = response_schema["properties"]["answers"]["items"]["properties"]["asked"]["enum"]
         if model == JUDGE_MODELS[0]:
             raw = "garbage, not json"
         else:
-            raw = json.dumps({"answers": [{"asked": i, "reason": "e", "verdict": 1} for i in ids]})
-        return JudgeRawResponse(model=model, provider="fake", raw=raw)
+            raw = json.dumps(
+                {"answers": [{"asked": i, "reason": "e", "verdict": "T"} for i in ids]}
+            )
+        return JudgeRawResponse(
+            model=model, provider="fake", raw=raw, logprobs=logprob_entries(raw)
+        )
 
 
 def test_sample_unscored_if_a_judge_never_parses():
@@ -563,7 +661,8 @@ def test_looped_side_scores_zero_without_calling_the_judge():
     assert all(r["looped"] for r in challenger_results)
     assert all(r["parse_ok"] for r in challenger_results)
     assert all(r["yes_rate"] == 0.0 for r in challenger_results)
-    assert all(value == "0" for r in challenger_results for value in r["answers"].values())
+    assert all(value == NO_CREDIT for r in challenger_results for value in r["answers"].values())
+    assert all(value == 0.0 for r in challenger_results for value in r["scores"].values())
 
     questions = record["questions"]
     assert questions
@@ -757,15 +856,16 @@ class _AnchorFakeClient:
         provider=None,
         accept=None,
         purpose="",
+        accept_response=None,
+        want_logprobs=False,
     ):
         # every reference answers every question, so pruning removes nothing here
         ids = response_schema["properties"]["answers"]["items"]["properties"]["asked"]["enum"]
+        raw = json.dumps(
+            {"answers": [{"asked": qid, "reason": "e", "verdict": "T"} for qid in ids]}
+        )
         return JudgeRawResponse(
-            model=model,
-            provider="fake",
-            raw=json.dumps(
-                {"answers": [{"asked": qid, "reason": "e", "verdict": 1} for qid in ids]}
-            ),
+            model=model, provider="fake", raw=raw, logprobs=logprob_entries(raw)
         )
 
 
@@ -832,18 +932,20 @@ def test_prepare_drops_questions_no_reference_can_answer():
             ids = kwargs["response_schema"]["properties"]["answers"]["items"]["properties"][
                 "asked"
             ]["enum"]
-            # q_01 is answered by nobody; q_02 by this run only
+            # q_01 is answered by nobody; q_02 by this run only. L is 0.49, just under the
+            # prune bar; M is 0.56, just over it
             answers = [
-                {"asked": qid, "reason": "e", "verdict": 0 if qid in ("q_01", "q_02") else 1}
+                {"asked": qid, "reason": "e", "verdict": "L" if qid in ("q_01", "q_02") else "M"}
                 for qid in ids
             ]
             if self.seen == 0:
                 answers = [
-                    {**a, "verdict": 1 if a["asked"] == "q_02" else a["verdict"]} for a in answers
+                    {**a, "verdict": "M" if a["asked"] == "q_02" else a["verdict"]} for a in answers
                 ]
             self.seen += 1
+            raw = json.dumps({"answers": answers})
             return JudgeRawResponse(
-                model=kwargs["model"], provider="fake", raw=json.dumps({"answers": answers})
+                model=kwargs["model"], provider="fake", raw=raw, logprobs=logprob_entries(raw)
             )
 
     fake = OneQuestionRejected()
@@ -883,17 +985,16 @@ def test_reference_scoring_joins_on_the_ids_the_checklist_ships_with():
             ]["enum"]
             self.seen += 1
             unearned = {"q_02"} if self.seen == 1 else {"q_02", "q_05"}
+            raw = json.dumps(
+                {
+                    "answers": [
+                        {"asked": qid, "reason": "e", "verdict": "A" if qid in unearned else "T"}
+                        for qid in ids
+                    ]
+                }
+            )
             return JudgeRawResponse(
-                model=kwargs["model"],
-                provider="fake",
-                raw=json.dumps(
-                    {
-                        "answers": [
-                            {"asked": qid, "reason": "e", "verdict": 0 if qid in unearned else 1}
-                            for qid in ids
-                        ]
-                    }
-                ),
+                model=kwargs["model"], provider="fake", raw=raw, logprobs=logprob_entries(raw)
             )
 
     fake = MiddlePruned()

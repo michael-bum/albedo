@@ -6,7 +6,7 @@ import json
 import httpx
 
 from albedo_config import JudgeSettings
-from albedo_eval_service.judge_llm_client import JudgeLLMClient
+from albedo_eval_service.judge_llm_client import JudgeLLMClient, JudgeRawResponse
 
 
 def test_openrouter_payload_respects_provider_structured_output_support():
@@ -27,6 +27,15 @@ def test_openrouter_payload_respects_provider_structured_output_support():
     assert schema_payload["provider"]["allow_fallbacks"] is False
     assert schema_payload["provider"]["require_parameters"] is True
     assert schema_payload["response_format"]["type"] == "json_schema"
+    assert "logprobs" not in plain_payload and "logprobs" not in schema_payload
+
+    logprob_payload = payloads[2]
+    assert logprob_payload["logprobs"] is True
+    assert logprob_payload["top_logprobs"] == 20
+    assert logprob_payload["provider"]["order"] == ["ambient", "alibaba"]
+    assert logprob_payload["provider"]["quantizations"] == ["fp8"]
+    assert logprob_payload["provider"]["allow_fallbacks"] is False
+    assert logprob_payload["provider"]["require_parameters"] is True
 
 
 async def _capture_payloads():
@@ -51,9 +60,92 @@ async def _capture_payloads():
             messages=[{"role": "user", "content": "x"}],
             response_schema={"type": "object", "properties": {"answers": {"type": "array"}}},
         )
+        await client.score(
+            model="z-ai/glm-5.2",
+            messages=[{"role": "user", "content": "x"}],
+            want_logprobs=True,
+        )
     finally:
         await client.aclose()
     return payloads
+
+
+def test_logprobs_are_returned_only_when_asked_for():
+    body = {
+        "choices": [
+            {
+                "message": {"content": '"T"'},
+                "logprobs": {
+                    "content": [
+                        {"token": '"', "logprob": 0.0, "top_logprobs": []},
+                        {
+                            "token": "T",
+                            "logprob": -0.1,
+                            "top_logprobs": [{"token": "T", "logprob": -0.1}],
+                        },
+                        {"token": '"', "logprob": 0.0, "top_logprobs": []},
+                    ]
+                },
+            }
+        ]
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    async def run():
+        settings = JudgeSettings(openrouter_api_key="test-key", stream_enabled=False)
+        client = JudgeLLMClient(settings)
+        await client._client.aclose()
+        client._client = httpx.AsyncClient(
+            base_url=settings.openrouter_base_url.rstrip("/"),
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            messages = [{"role": "user", "content": "x"}]
+            plain = await client.score(model="z-ai/glm-5.2", messages=messages)
+            asked = await client.score(model="z-ai/glm-5.2", messages=messages, want_logprobs=True)
+            return plain, asked
+        finally:
+            await client.aclose()
+
+    plain, asked = asyncio.run(run())
+    assert plain.logprobs is None
+    assert plain.provider == "streamlake"
+    assert asked.provider == "ambient"
+    assert [entry["token"] for entry in asked.logprobs] == ['"', "T", '"']
+
+
+def test_accept_response_rejects_and_retries_on_the_response_object():
+    settings = JudgeSettings(openrouter_api_key="x", parse_retries=3)
+    client = JudgeLLMClient(settings)
+    calls = {"n": 0}
+
+    async def fake_swr(**kwargs):
+        calls["n"] += 1
+        assert kwargs["want_logprobs"] is True
+        return JudgeRawResponse(
+            model="m",
+            provider="p",
+            raw="ok",
+            logprobs=[{"token": "ok"}] if calls["n"] == 2 else None,
+        )
+
+    client._score_with_retries = fake_swr
+
+    async def run():
+        r = await client._call(
+            model="m",
+            messages=[],
+            accept_response=lambda result: result.logprobs is not None,
+            want_logprobs=True,
+        )
+        await client.aclose()
+        return r
+
+    result = asyncio.run(run())
+    assert result.logprobs == [{"token": "ok"}]
+    assert calls["n"] == 2
 
 
 def test_provider_order_rotates_across_parse_attempts():
@@ -540,8 +632,10 @@ def test_streaming_response_is_assembled_and_logged():
     sse = (
         b": OPENROUTER PROCESSING\n\n"
         b'data: {"provider":"Novita",'
-        b'"choices":[{"delta":{"content":"Hel"},"finish_reason":null}]}\n\n'
-        b'data: {"choices":[{"delta":{"content":"lo"},"finish_reason":"stop"}]}\n\n'
+        b'"choices":[{"delta":{"content":"Hel"},"finish_reason":null,'
+        b'"logprobs":{"content":[{"token":"Hel","logprob":-0.5,"top_logprobs":[]}]}}]}\n\n'
+        b'data: {"choices":[{"delta":{"content":"lo"},"finish_reason":"stop",'
+        b'"logprobs":{"content":[{"token":"lo","logprob":-0.1,"top_logprobs":[]}]}}]}\n\n'
         b'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"cost":0.01}}\n\n'
         b"data: [DONE]\n\n"
     )
@@ -559,16 +653,20 @@ def test_streaming_response_is_assembled_and_logged():
             transport=httpx.MockTransport(handler),
         )
         try:
-            return await client.score(
-                model="z-ai/glm-5.2", messages=[{"role": "user", "content": "x"}]
-            )
+            messages = [{"role": "user", "content": "x"}]
+            plain = await client.score(model="z-ai/glm-5.2", messages=messages)
+            asked = await client.score(model="z-ai/glm-5.2", messages=messages, want_logprobs=True)
+            return plain, asked
         finally:
             await client.aclose()
 
-    result = asyncio.run(run())
+    result, asked = asyncio.run(run())
     assert result.error is None
     assert result.raw == "Hello"
+    assert result.logprobs is None
     assert captured[0]["stream"] is True
+    assert asked.raw == "Hello"
+    assert [entry["token"] for entry in asked.logprobs] == ["Hel", "lo"]
 
 
 def test_stream_dying_without_finish_reason_is_a_transport_error():

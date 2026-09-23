@@ -108,7 +108,7 @@ class JudgeSettings(BaseSettings):
     reference_prune: bool = True
     milestone_readings: int = 4
     question_readings: int = 3
-    judge_repeats: int = 3
+    judge_repeats: int = 1
     num_questions: int = 50
     question_max_tokens: int = 20000
     simulation_max_tokens: int = 4096

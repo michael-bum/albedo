@@ -324,7 +324,7 @@ def _eval_runs(
         run_id = str(row["eval_run_id"])
         run_artifacts = artifacts.get(run_id, artifacts.get(str(row["submission_id"]), {}))
         by_judge_king: dict[str, float] = {}
-        if verdict.get("scoring_mode") == "binary":
+        if verdict.get("scoring_mode") in ("binary", "graded_20"):
             if run_id in king_cache:
                 by_judge_king = king_cache[run_id]
             elif run_artifacts.get("SCORING_RESULTS"):

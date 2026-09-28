@@ -28,7 +28,7 @@ def test_judge_panel_pins_fast_fp8_providers_no_open_fallback():
         assert JUDGE_LOGPROB_PROVIDER_PINS[model] == {
             "allow_fallbacks": False,
             "quantizations": ["fp8"],
-            "order": ["ambient", "alibaba"],
+            "order": ["alibaba", "digitalocean"],
         }
 
 

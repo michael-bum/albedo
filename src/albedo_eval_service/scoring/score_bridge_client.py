@@ -41,6 +41,7 @@ async def _run_once(settings: ScoreBridgeClientSettings, *, headers: dict[str, s
         base_url=settings.judge_base_url.rstrip("/"),
         headers=judge_headers,
         timeout=httpx.Timeout(settings.request_timeout_seconds),
+        limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
     ) as judge_client:
         async with wsproto(
             settings.remote_ws_url,

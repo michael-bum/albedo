@@ -32,7 +32,7 @@ def test_openrouter_payload_respects_provider_structured_output_support():
     logprob_payload = payloads[2]
     assert logprob_payload["logprobs"] is True
     assert logprob_payload["top_logprobs"] == 20
-    assert logprob_payload["provider"]["order"] == ["ambient", "alibaba"]
+    assert logprob_payload["provider"]["order"] == ["alibaba", "digitalocean"]
     assert logprob_payload["provider"]["quantizations"] == ["fp8"]
     assert logprob_payload["provider"]["allow_fallbacks"] is False
     assert logprob_payload["provider"]["require_parameters"] is True
@@ -112,7 +112,7 @@ def test_logprobs_are_returned_only_when_asked_for():
     plain, asked = asyncio.run(run())
     assert plain.logprobs is None
     assert plain.provider == "streamlake"
-    assert asked.provider == "ambient"
+    assert asked.provider == "alibaba"
     assert [entry["token"] for entry in asked.logprobs] == ['"', "T", '"']
 
 
@@ -698,8 +698,127 @@ def test_stream_dying_without_finish_reason_is_a_transport_error():
     assert result.raw == ""
 
 
+class _Body:
+    def __init__(self, lines: list[bytes], gap: float = 0.0):
+        self.lines = lines
+        self.gap = gap
+        self.started = asyncio.Event()
+        self.exit: str | None = None
+
+    async def __aiter__(self):
+        try:
+            for line in self.lines:
+                self.started.set()
+                yield line
+                await asyncio.sleep(self.gap)
+            self.exit = "exhausted"
+        except asyncio.CancelledError:
+            self.exit = "cancelled"
+            raise
+        except GeneratorExit:
+            self.exit = "closed"
+            raise
+
+
+async def _body_client(body: _Body, **overrides: object) -> JudgeLLMClient:
+    settings = JudgeSettings(
+        openrouter_api_key="test-key", retry_count=0, parse_retries=1, **overrides
+    )
+    client = JudgeLLMClient(settings)
+    await client._client.aclose()
+    client._client = httpx.AsyncClient(
+        base_url=settings.openrouter_base_url.rstrip("/"),
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, content=body
+            )
+        ),
+    )
+    return client
+
+
+_CHUNK = b'data: {"choices":[{"delta":{"content":"x"},"finish_reason":null}]}\n\n'
+_LAST = b'data: {"choices":[{"delta":{"content":"y"},"finish_reason":"stop"}]}\n\n'
+_ASK = [{"role": "user", "content": "x"}]
+
+
+def test_stream_is_read_to_its_end_after_done_so_the_connection_is_reused():
+    body = _Body([_CHUNK, _LAST, b"data: [DONE]\n\n", b"\n"])
+
+    async def run():
+        client = await _body_client(body)
+        try:
+            return await client.score(model="z-ai/glm-5.2", messages=_ASK)
+        finally:
+            await client.aclose()
+
+    result = asyncio.run(run())
+    assert result.raw == "xy"
+    assert body.exit == "exhausted"
+
+
+def test_a_cancelled_caller_stops_its_stream_instead_of_cancelling_it():
+    body = _Body([_CHUNK] * 50 + [_LAST, b"data: [DONE]\n\n"], gap=0.02)
+
+    async def run():
+        client = await _body_client(body)
+        call = asyncio.create_task(client.score(model="z-ai/glm-5.2", messages=_ASK))
+        await body.started.wait()
+        call.cancel()
+        try:
+            await call
+            raise AssertionError("the caller should see its own cancellation")
+        except asyncio.CancelledError:
+            pass
+        async with asyncio.timeout(2):
+            while client._exchanges:
+                await asyncio.sleep(0.01)
+        await client.aclose()
+
+    asyncio.run(run())
+    assert body.exit == "closed"
+
+
+def test_a_stream_past_its_deadline_is_a_timeout_that_closes_it():
+    body = _Body([_CHUNK] * 50 + [_LAST, b"data: [DONE]\n\n"], gap=0.02)
+
+    async def run():
+        client = await _body_client(body, request_timeout_seconds=0.1)
+        try:
+            return await client.score(model="z-ai/glm-5.2", messages=_ASK)
+        finally:
+            await client.aclose()
+
+    result = asyncio.run(run())
+    assert result.error is not None and result.error.startswith("TimeoutError")
+    assert body.exit == "closed"
+
+
 def _hedge_client() -> JudgeLLMClient:
     return JudgeLLMClient(JudgeSettings(openrouter_api_key="test-key"))
+
+
+def test_hedge_cancelled_before_it_fires_cancels_the_primary(monkeypatch):
+    client = _hedge_client()
+    primary_cancelled = asyncio.Event()
+
+    async def _slow(**_kwargs):
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            primary_cancelled.set()
+            raise
+
+    monkeypatch.setattr(client, "_score_once", _slow)
+
+    async def run():
+        try:
+            await asyncio.wait_for(client._score_once_hedged(1.0, provider_shift=0), timeout=0.05)
+        except TimeoutError:
+            pass
+        return primary_cancelled.is_set()
+
+    assert asyncio.run(run())
 
 
 def _response(provider: str):

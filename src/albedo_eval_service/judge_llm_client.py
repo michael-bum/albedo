@@ -30,21 +30,28 @@ class JudgeRawResponse:
 
 ENGY_PURPOSES = frozenset({"reference"})
 
+POOL_WAIT_SECONDS = 30.0
+
+
+class ExchangeStopped(Exception):
+    pass
+
 
 class JudgeLLMClient:
     def __init__(self, settings: JudgeSettings):
         if not settings.openrouter_api_key:
             raise ValueError("ALBEDO_JUDGE_OPENROUTER_API_KEY is required")
         self.settings = settings
-        pool = max(64, (len(JUDGE_MODELS) + 1) * settings.max_concurrency_per_model)
+        pool = max(64, 2 * (len(JUDGE_MODELS) + 1) * settings.max_concurrency_per_model)
         timeout = (
             httpx.Timeout(
                 settings.request_timeout_seconds,
                 connect=10.0,
                 read=settings.stream_stall_seconds,
+                pool=POOL_WAIT_SECONDS,
             )
             if settings.stream_enabled
-            else httpx.Timeout(settings.request_timeout_seconds)
+            else httpx.Timeout(settings.request_timeout_seconds, pool=POOL_WAIT_SECONDS)
         )
         self._client = httpx.AsyncClient(
             base_url=settings.openrouter_base_url.rstrip("/"),
@@ -53,6 +60,7 @@ class JudgeLLMClient:
             limits=httpx.Limits(max_connections=pool, max_keepalive_connections=pool),
         )
         self._semaphores: dict[str, asyncio.Semaphore] = {}
+        self._exchanges: set[asyncio.Task[dict[str, Any]]] = set()
         self._engy = (
             httpx.AsyncClient(
                 base_url=settings.engy_base_url.rstrip("/"),
@@ -293,21 +301,25 @@ class JudgeLLMClient:
         arrive wins and the loser is cancelled. The delayed start keeps the double-spend
         limited to calls that are already slow."""
         primary = asyncio.create_task(self._score_once(**kwargs))
-        done, _ = await asyncio.wait({primary}, timeout=hedge_after)
-        if primary in done:
-            return primary.result()
-        backup = asyncio.create_task(
-            self._score_once(**{**kwargs, "provider_shift": kwargs.get("provider_shift", 0) + 1})
-        )
-        logger.info(
-            "[judge-llm] hedging slow call purpose={} model={} after {:.0f}s",
-            kwargs.get("purpose"),
-            kwargs.get("model"),
-            hedge_after,
-        )
-        pending: set[asyncio.Task[JudgeRawResponse]] = {primary, backup}
+        pending: set[asyncio.Task[JudgeRawResponse]] = {primary}
         error: BaseException | None = None
         try:
+            done, _ = await asyncio.wait(pending, timeout=hedge_after)
+            if primary in done:
+                return primary.result()
+            pending.add(
+                asyncio.create_task(
+                    self._score_once(
+                        **{**kwargs, "provider_shift": kwargs.get("provider_shift", 0) + 1}
+                    )
+                )
+            )
+            logger.info(
+                "[judge-llm] hedging slow call purpose={} model={} after {:.0f}s",
+                kwargs.get("purpose"),
+                kwargs.get("model"),
+                hedge_after,
+            )
             while pending:
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
@@ -323,27 +335,56 @@ class JudgeLLMClient:
                 await asyncio.gather(*pending, return_exceptions=True)
 
     async def _exchange(self, client: httpx.AsyncClient, payload: dict[str, Any]) -> dict[str, Any]:
+        stop = asyncio.Event()
+        exchange = asyncio.create_task(self._exchange_until_stopped(client, payload, stop))
+        self._exchanges.add(exchange)
+        exchange.add_done_callback(self._exchange_finished)
+        try:
+            return await asyncio.shield(exchange)
+        except asyncio.CancelledError:
+            stop.set()
+            raise
+
+    def _exchange_finished(self, exchange: asyncio.Task[dict[str, Any]]) -> None:
+        self._exchanges.discard(exchange)
+        if not exchange.cancelled():
+            exchange.exception()
+
+    async def _exchange_until_stopped(
+        self, client: httpx.AsyncClient, payload: dict[str, Any], stop: asyncio.Event
+    ) -> dict[str, Any]:
         if not self.settings.stream_enabled:
             response = await client.post("/v1/chat/completions", json=payload)
             response.raise_for_status()
             return response.json()
+        deadline = time.monotonic() + self.settings.request_timeout_seconds
         content: list[str] = []
         logprobs: list[dict[str, Any]] = []
         body: dict[str, Any] = {}
         finish: str | None = None
-        async with asyncio.timeout(self.settings.request_timeout_seconds):
-            async with client.stream(
-                "POST", "/v1/chat/completions", json={**payload, "stream": True}
-            ) as response:
-                response.raise_for_status()
-                if not response.headers.get("content-type", "").startswith("text/event-stream"):
-                    return json.loads(await response.aread())  # server ignored stream=True
+        ended = False
+        async with client.stream(
+            "POST", "/v1/chat/completions", json={**payload, "stream": True}
+        ) as response:
+            response.raise_for_status()
+            if not response.headers.get("content-type", "").startswith("text/event-stream"):
+                return json.loads(await response.aread())  # server ignored stream=True
+            try:
                 async for line in response.aiter_lines():
+                    if ended:
+                        continue
+                    if stop.is_set():
+                        raise ExchangeStopped("caller stopped waiting")
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(
+                            f"no complete response in {self.settings.request_timeout_seconds:.0f}s"
+                        )
                     if not line.startswith("data: "):
                         continue
                     data = line[len("data: ") :]
                     if data == "[DONE]":
-                        break
+                        ended = True
+                        continue
                     chunk = json.loads(data)
                     if chunk.get("provider"):
                         body["provider"] = chunk["provider"]
@@ -355,6 +396,9 @@ class JudgeLLMClient:
                             content.append(piece)
                         logprobs.extend((choice.get("logprobs") or {}).get("content") or [])
                         finish = choice.get("finish_reason") or finish
+            except httpx.TransportError:
+                if not ended:
+                    raise
         if finish is None:
             # a stream that dies mid-generation must never be accepted as a complete answer
             raise RuntimeError("stream ended without finish_reason")

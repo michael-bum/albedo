@@ -15,7 +15,7 @@ JUDGE_LOGPROB_PROVIDER_PINS: dict[str, dict[str, object]] = {
     model: {
         "allow_fallbacks": False,
         "quantizations": ["fp8"],
-        "order": ["ambient", "alibaba"],
+        "order": ["alibaba", "digitalocean"],
     }
     for model in JUDGE_MODELS
 }

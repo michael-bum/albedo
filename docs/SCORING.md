@@ -194,10 +194,11 @@ The reading is validated before it is trusted: the sampled token must be the let
 did), the token spans must cover the whole content, and the written letter must be in the list. A
 response that fails any of these is rejected like a parse failure and re-asked on the next pinned
 provider; there is no fallback to letter-only scoring. Because of this, judge calls run on their own
-provider pin (`JUDGE_LOGPROB_PROVIDER_PINS`: ambient, then alibaba — the only fp8 glm-5.2
-endpoints whose top-20 logprobs line up with the sampled token; StreamLake and GMICloud accept the
-parameter but return misaligned arrays), not the general `JUDGE_PROVIDER_PINS` the sanity checks
-use.
+provider pin (`JUDGE_LOGPROB_PROVIDER_PINS`: alibaba, then digitalocean — glm-5.2 endpoints whose
+top-20 logprobs line up with the sampled token; StreamLake, Cloudflare, Parasail and Wafer accept the
+parameter but return misaligned arrays; the pin keeps the fp8 filter, so OpenRouter skips DigitalOcean
+while it reports no quantization and alibaba serves), not the general `JUDGE_PROVIDER_PINS` the sanity
+checks use.
 
 With `ALBEDO_JUDGE_JUDGE_REPEATS` > 1, a question's score is the **mean** of the repeats'
 expectations (not a majority vote); `answers` shows the majority letter and `disputed` counts the

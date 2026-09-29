@@ -396,6 +396,22 @@ def test_bad_turn_is_retried_with_accumulated_feedback(monkeypatch):
     assert generator.prompts[2][0].count("Format error") == 2
 
 
+def test_a_reply_with_two_commands_is_retried_like_a_bench_format_error(monkeypatch):
+    monkeypatch.setattr(
+        "albedo_eval_service.remote.worker.format_messages",
+        lambda messages, **_kwargs: "\n".join(m["content"] for m in messages),
+    )
+    two = "Plan:\n```bash\ncat a.py\n```\n</think>\n\n```bash\nls\n```"
+    good = "THOUGHT: ok\n\n```bash\nls\n```"
+    generator = _ScriptedGenerator([two, good])
+
+    results = _generate_retrying_bad_turns(generator, [_eval_sample()])
+
+    assert results[0].text == good
+    assert len(results[0].retry_feedbacks) == 1
+    assert "found 2 bash commands" in results[0].retry_feedbacks[0]
+
+
 def test_turn_still_unusable_after_all_attempts_becomes_abandonment(monkeypatch):
     monkeypatch.setattr(
         "albedo_eval_service.remote.worker.format_messages",

@@ -440,7 +440,8 @@ albedo-remote-eval-api  (GPU host)
     one thread per trajectory: generate a turn → fetch its observation → next turn, with no lock-step barrier; the engine batches
       whatever is in flight and keeps decoding while other trajectories wait on their observations
     three attempts per turn (MAX_CONSECUTIVE_BAD_TURNS, as mini-swe-agent): a response that hits the
-      ALBEDO_REMOTE_MAX_NEW_TOKENS (4096) cap, comes back empty or has no command is dropped, the model is
+      ALBEDO_REMOTE_MAX_NEW_TOKENS (4096) cap, comes back empty, or has no command or more than one
+      (reasoning included) is dropped, the model is
       told what went wrong and generates the turn again; a turn that recovers costs nothing. A third
       unusable attempt ends the rollout and that side scores 0 for it (see "Degenerate trajectories" below)
     multiturn trajectories: the horizon is stratified per sample — HORIZON_STRATA (12, 16)

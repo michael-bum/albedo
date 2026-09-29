@@ -26,6 +26,7 @@ from albedo_eval_service.shared.observation_format import (
     repair_output,
     repair_to_contract,
     truncation_notice,
+    unusable_turn,
     valid_output,
     with_body,
     wrap,
@@ -522,3 +523,14 @@ def test_a_chain_ending_in_a_named_read_must_print():
     # a redirect or heredoc anywhere still means the chain may be silent
     assert output_expectation("grep x src && sed -n '1,5p' a.py > out.txt") != MUST_PRINT
     assert output_expectation("python3 - <<'EOF'\nprint(1)\nEOF") != MUST_PRINT
+
+
+def test_a_reply_with_more_than_one_command_is_unusable_like_the_bench():
+    one = "THOUGHT: look\n\n```bash\nls\n```"
+    assert unusable_turn(one) == ""
+    assert unusable_turn("The fix:\n```python\nx = 1\n```\n" + one) == ""
+    assert "found 2 bash commands" in unusable_turn(one + "\n```bash\npwd\n```")
+    drafted = "Plan: run\n```bash\ncat a.py\n```\n</think>\n\n" + one
+    assert "found 2 bash commands" in unusable_turn(drafted)
+    tagged = one + "\n<mswea_bash_command>pwd</mswea_bash_command>"
+    assert "found 2 bash commands" in unusable_turn(tagged)

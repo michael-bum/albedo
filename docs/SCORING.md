@@ -174,8 +174,9 @@ worst looped trajectory scoring 0.913 while repeating one `grep` in 10 of its 12
 ### Three attempts per turn
 
 Every response is capped at `ALBEDO_REMOTE_MAX_NEW_TOKENS` (4096) tokens. A response is **unusable**
-when it hits that cap, is empty, or contains no command (neither a ```` ```bash ```` fence nor a
-`<…bash…>` block) — `unusable_turn()` in `shared/observation_format.py`. Like mini-swe-agent's
+when it hits that cap, is empty, contains no command (neither a ```` ```bash ```` fence nor a
+`<…bash…>` block), or contains more than one — reasoning before `</think>` included, since the
+benchmark parses it too — `unusable_turn()` in `shared/observation_format.py`. Like mini-swe-agent's
 `max_consecutive_format_errors`, the worker gives every turn up to `MAX_CONSECUTIVE_BAD_TURNS` (3)
 attempts (`_generate_retrying_bad_turns` in `remote/worker.py`):
 
@@ -197,7 +198,7 @@ How this reads in `generated-samples.jsonl` (`previous_king_turns` / `challenger
 | turn | marker | meaning |
 |---|---|---|
 | user: *"Your previous response reached the output token limit…"* | `"retry_feedback": true` | one attempt hit the cap and was retried — no penalty |
-| user: *"Format error: …"* | `"retry_feedback": true` | one attempt was empty or had no command and was retried — no penalty |
+| user: *"Format error: …"* | `"retry_feedback": true` | one attempt was empty, had no command or had more than one, and was retried — no penalty |
 | last assistant turn: `MODEL_RESPONSE_TOKEN_LIMIT_EXCEEDED: …` | `"truncated": true` | the rollout ended on the cap — the side scores 0 for it |
 | last assistant turn: `CONSECUTIVE_BAD_TURNS_LIMIT_EXCEEDED: …` | `"abandoned": true` | the rollout ended on an unusable turn — the side scores 0 for it |
 | inside an observation: `[... Observation truncated due to length ...]`, or `<warning>` … `<output_head>` | `"environment_observation": true` | the environment clipped a long command output (OpenHands over 30,000 characters, mini-swe-agent over 10,000), keeping head and tail as those scaffolds do — no effect on the score |

@@ -22,6 +22,7 @@ from albedo_eval_service.shared.edit_detection import named_in_removal
 from albedo_eval_service.shared.observation_format import (
     MAX_CONSECUTIVE_BAD_TURNS,
     absent_tool_output,
+    action_blocks,
     canonical_empty,
     claims_tracked_change,
     command_contract,
@@ -874,7 +875,7 @@ def _apply_turn_result(states: list[_TrajectoryState], result: dict[str, Any]) -
             else unusable_turn(response)
         )
         failed = bool(reason)
-        if failed and not _has_bash_command(response):
+        if failed and (not _has_bash_command(response) or len(action_blocks(response)) > 1):
             state.consecutive_bad_turns += 1
             if state.consecutive_bad_turns >= MAX_CONSECUTIVE_BAD_TURNS:
                 state.turns.append(

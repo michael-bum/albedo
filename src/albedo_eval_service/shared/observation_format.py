@@ -240,7 +240,6 @@ _ACTION_BLOCK_RE = re.compile(
 
 
 def action_blocks(text: str) -> list[str]:
-    """The shell commands a turn would actually run, whitespace-normalised for comparison."""
     return [
         " ".join((m.group(1) if m.group(1) is not None else m.group(3)).split())
         for m in _ACTION_BLOCK_RE.finditer(text or "")
@@ -261,6 +260,9 @@ def unusable_turn(text: str, *, truncated: bool = False) -> str:
         return "empty response"
     if not _ACTION_RE.search(text):
         return "no bash command found in the response"
+    count = len(action_blocks(text))
+    if count > 1:
+        return f"found {count} bash commands in the response, expected exactly one"
     return ""
 
 

@@ -285,6 +285,24 @@ def test_trajectory_keeps_heuristic_for_non_command_output():
     assert state.heuristic_reason == "empty response on 3 consecutive turns"
 
 
+def test_trajectory_retries_a_reply_with_two_commands():
+    state = sanity_dispatcher._TrajectoryState(
+        sample_id="sanity-fallback:0",
+        prompt="initial prompt",
+        messages=[{"role": "user", "content": "Fix it."}],
+        turns=[],
+    )
+    two = "Plan:\n```bash\ncat a.py\n```\n</think>\n\n```bash\nls -la\n```"
+
+    sanity_dispatcher._apply_turn_result(
+        [state], {"responses": [two], "heuristics": [{"passed": True}]}
+    )
+
+    assert "found 2 bash commands" in state.retry_reason
+    assert not any(turn.get("score_target") for turn in state.turns)
+    assert state.turns[-1].get("retry_feedback")
+
+
 def test_heuristics_passes_varied_code_responses():
     responses = [
         "def add(a, b): return a + b here",

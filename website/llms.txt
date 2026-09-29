@@ -439,6 +439,10 @@ albedo-remote-eval-api  (GPU host)
       dataset id, so all rollouts of a sample are judged against its one checklist
     one thread per trajectory: generate a turn → fetch its observation → next turn, with no lock-step barrier; the engine batches
       whatever is in flight and keeps decoding while other trajectories wait on their observations
+    three attempts per turn (MAX_CONSECUTIVE_BAD_TURNS, as mini-swe-agent): a response that hits the
+      ALBEDO_REMOTE_MAX_NEW_TOKENS (4096) cap, comes back empty or has no command is dropped, the model is
+      told what went wrong and generates the turn again; a turn that recovers costs nothing. A third
+      unusable attempt ends the rollout and that side scores 0 for it (see "Degenerate trajectories" below)
     multiturn trajectories: the horizon is stratified per sample — HORIZON_STRATA (12, 16)
       assistant turns, assigned round-robin within each phase bucket (evaluator/shared/questions.py);
       ALBEDO_REMOTE_TRAJECTORY_ASSISTANT_TURNS (8) is only the fallback when no horizon is assigned.
@@ -525,8 +529,17 @@ scans the `CANDIDATE OUTPUT` blocks of the document it would see. If the duplica
 ≥ 0.5 or the same command repeats ≥ 4 times consecutively, that side is short-circuited: every question
 is answered `0`, the explanation names the looping commands with their repeat counts, and no judge call
 is made (`parse_ok` stays true, and the record carries `looped`, `loop_reasons`, `loop_commands`). The
-same rule already applies at pre-eval via `sanity_service/tail_check.py`. Truncated output is
-short-circuited the same way.
+same rule already applies at pre-eval via `sanity_service/tail_check.py`. Three checks before it zero a
+side the same way (`corrupted`, `corruption_reason`): the rollout ended on the token cap (the third
+unusable attempt at one turn hit it: *"output truncated mid-generation"*), the rollout ended on a turn with no
+usable action in three attempts (*"turn unusable after repeated attempts"*), or the judged document
+contains a reserved chat-template token (`<tool_call>`, `<function=`, `<|im_end|>`, …). King and
+challenger face the same checks, per rollout. Reading `generated-samples.jsonl`: a user turn with
+`"retry_feedback": true` is an attempt that was dropped and retried (no penalty); a last assistant turn
+`MODEL_RESPONSE_TOKEN_LIMIT_EXCEEDED` (`"truncated": true`) or `CONSECUTIVE_BAD_TURNS_LIMIT_EXCEEDED`
+(`"abandoned": true`) is a rollout that ended there (scored 0); `[... Observation truncated due to
+length ...]` or `<warning>`/`<output_head>` inside an observation is the environment clipping a long
+command output, as the scaffold does (no effect). Full detail: docs/SCORING.md.
 
 **Deterministic sampling:** `shared/sampling.py` (`multi_source_manifest_sample_ids`) draws `sample_count`
 (100) **unique `instance_id`s** pooled across all four sources, one **random source trajectory** per instance,

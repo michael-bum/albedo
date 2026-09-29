@@ -140,12 +140,21 @@ A sample is rejected outright if fewer than `QUESTION_FLOOR` (6) milestone quest
 
 ## Before the judge: degenerate sides are scored 0 outright
 
-Two checks run on a side's document *before* any judge call, in `_side()` in `judge_api.py`. Either
-one short-circuits scoring for that side: every question is answered `A` (score 0), `parse_ok` stays `True` (this
-is a real score, not a parse failure, so it counts toward `min_valid_fraction`), and no tokens are spent.
+Four checks run on a side's document *before* any judge call, in `_side()` in `judge_api.py`, in this
+order. The first that fires short-circuits scoring for that side of that rollout: every question is answered
+`A` (score 0), `parse_ok` stays `True` (this is a real score, not a parse failure, so it counts toward
+`min_valid_fraction`), and no tokens are spent. King and challenger go through the same checks.
 
-1. **Truncated output** (`is_truncated`) — the side is recorded as corrupted.
-2. **Looped trajectory** (`shared/loop_check.py`) — the `CANDIDATE OUTPUT` blocks are scanned for shell
+1. **Truncated** (`is_truncated`) — the rollout ended on the output token cap (see
+   [Three attempts per turn](#three-attempts-per-turn)). Recorded as `corrupted` with
+   `corruption_reason` *"output truncated mid-generation"*.
+2. **Abandoned** (`is_abandoned`) — the rollout ended on a turn that produced no usable action in three
+   attempts. `corruption_reason` *"turn unusable after repeated attempts; the benchmark abandons here"*.
+3. **Reserved token** (`reserved_token_leak` in `judge_core.py`) — the document contains a chat-template
+   token (`<|im_start|>`, `<|im_end|>`, `<|endoftext|>`, `<tool_call>`, `<function=`, `<tool_response>`,
+   the vision pads). The whole document is scanned: the task prefix and the environment observations as
+   well as the candidate's own turns. `corruption_reason` *"reserved template token in output: `<token>`"*.
+4. **Looped trajectory** (`shared/loop_check.py`) — the `CANDIDATE OUTPUT` blocks are scanned for shell
    commands (context turns and environment observations are excluded, so a bash fence in the PR
    description cannot trigger it). A side is looped when either:
    - the duplicate-command ratio is ≥ `DUP_CMD_THRESHOLD` (0.5), or
@@ -161,6 +170,43 @@ This matters because the judge does **not** reliably punish loops on its own: me
 trajectories, looped sides were scoring 0.578 against 0.673 for clean ones — a 0.095 penalty — with the
 worst looped trajectory scoring 0.913 while repeating one `grep` in 10 of its 12 commands.
 `sanity_service/tail_check.py` applies the same heuristic earlier, at pre-eval.
+
+### Three attempts per turn
+
+Every response is capped at `ALBEDO_REMOTE_MAX_NEW_TOKENS` (4096) tokens. A response is **unusable**
+when it hits that cap, is empty, or contains no command (neither a ```` ```bash ```` fence nor a
+`<…bash…>` block) — `unusable_turn()` in `shared/observation_format.py`. Like mini-swe-agent's
+`max_consecutive_format_errors`, the worker gives every turn up to `MAX_CONSECUTIVE_BAD_TURNS` (3)
+attempts (`_generate_retrying_bad_turns` in `remote/worker.py`):
+
+- An unusable attempt is thrown away: it is neither stored nor judged. The model gets a user message
+  saying what was wrong and generates the same turn again.
+- Once an attempt is usable the rollout carries on, and the dropped attempts cost nothing: their feedback
+  messages stay in the model's context for later turns but are removed from the document the judge
+  reads (`scored_output`).
+- If the third attempt is unusable too, the rollout ends at that turn. The final turn becomes
+  `MODEL_RESPONSE_TOKEN_LIMIT_EXCEEDED: …` when that last attempt hit the cap (check 1 above) and
+  `CONSECUTIVE_BAD_TURNS_LIMIT_EXCEEDED: …` otherwise (check 2).
+
+A prompt that no longer fits the context window (262,144 tokens) counts as an attempt that hit the cap.
+Both sides get the same budget, so a trajectory that shows cut-offs but was not zeroed recovered within
+three attempts at each of those turns.
+
+How this reads in `generated-samples.jsonl` (`previous_king_turns` / `challenger_turns`):
+
+| turn | marker | meaning |
+|---|---|---|
+| user: *"Your previous response reached the output token limit…"* | `"retry_feedback": true` | one attempt hit the cap and was retried — no penalty |
+| user: *"Format error: …"* | `"retry_feedback": true` | one attempt was empty or had no command and was retried — no penalty |
+| last assistant turn: `MODEL_RESPONSE_TOKEN_LIMIT_EXCEEDED: …` | `"truncated": true` | the rollout ended on the cap — the side scores 0 for it |
+| last assistant turn: `CONSECUTIVE_BAD_TURNS_LIMIT_EXCEEDED: …` | `"abandoned": true` | the rollout ended on an unusable turn — the side scores 0 for it |
+| inside an observation: `[... Observation truncated due to length ...]`, or `<warning>` … `<output_head>` | `"environment_observation": true` | the environment clipped a long command output (OpenHands over 30,000 characters, mini-swe-agent over 10,000), keeping head and tail as those scaffolds do — no effect on the score |
+
+The eval page flags each zeroed side on its sample row with the reason and the rollout it happened in
+(`chal truncated · r1`, `king abandoned`, `token leak`, `looped`), and inside that rollout says why the
+side was not judged. `scoring-results.jsonl` records carry the dataset sample id without the `#r<n>`
+suffix, in the same order as `generated-samples.jsonl`. A rollout whose generation failed on either side
+has no scoring record, so for that sample the one remaining record may be `#r2`.
 
 
 ## From answers to a score

@@ -75,6 +75,35 @@ function pivotBinary(record) {
   return { judges, king: bySide.previous_king || {}, chal: bySide.challenger || {} };
 }
 
+// a side scoring zeroes without asking the judge (judge_api._side): `label` for the badge,
+// `text` for why; the reasons are matched by the prefix judge_api writes
+function zeroedView(j) {
+  if (j?.looped) return { label: "looped", text: `its commands loop (${(j.loop_reasons || []).join("; ") || "loop check"})` };
+  if (!j?.corrupted) return null;
+  const reason = j.corruption_reason || "";
+  if (reason.startsWith("output truncated")) return {
+    label: "truncated",
+    text: "one turn got no usable response in 3 attempts, the last cut off at the output token limit, so the rollout ended there (a cut-off followed by a usable retry costs nothing)",
+  };
+  if (reason.startsWith("turn unusable")) return {
+    label: "abandoned",
+    text: "one turn got no usable response in 3 attempts (empty or without a command), so the rollout ended there",
+  };
+  const token = reason.match(/^reserved template token in output: (.+)$/)?.[1];
+  if (token) return { label: "token leak", text: `the judged trajectory contains the reserved chat-template token ${token}` };
+  return { label: "zeroed", text: reason || "scored 0 without a judge call" };
+}
+
+// one entry per zeroed side of a rollout: every judge model of that side carries the same verdict
+function zeroedSides(record) {
+  const out = new Map();
+  for (const j of record.judge_results || []) {
+    const z = zeroedView(j);
+    if (z && !out.has(j.side)) out.set(j.side, { side: j.side === "previous_king" ? "king" : "chal", ...z });
+  }
+  return [...out.values()];
+}
+
 
 const LEGACY_TAG_WEIGHTS = {
   "reference:explore": 2.0,
@@ -286,7 +315,7 @@ async function renderSampleScores(r, section, recordsP) {
     el("h2", {}, "samples"),
     el("div", { class: "sample-source" }, sourceLine),
     el("div", { class: "sample-list" }, groups.map((group, i) =>
-      isQuestionMode(group[0].scoring_mode) ? binarySampleCard(group, i) : legacySampleCard(group[0], i))));
+      isQuestionMode(group[0].scoring_mode) ? binarySampleCard(group, i, rollouts) : legacySampleCard(group[0], i))));
 }
 
 function legacySampleCard(record, i) {
@@ -314,7 +343,7 @@ function legacySampleCard(record, i) {
 }
 
 // `group` = every rollout of one sample; the row shows their mean, the body each rollout in turn
-function binarySampleCard(group, i) {
+function binarySampleCard(group, i, rollouts) {
   const record = group[0];
   const jr = group.flatMap(r => r.judge_results || []);
   const okN = jr.filter(j => j.parse_ok).length;
@@ -326,11 +355,17 @@ function binarySampleCard(group, i) {
     : jr.length
       ? el("span", { class: "sample-flag warn", title: unscored[0].error || "partial judge failure" }, "partial")
       : el("span", { class: "sample-flag bad", title: unscored[0].error || "" }, "unscored");
-  const zeroed = jr.filter(j => j.looped || j.corrupted).map(j =>
-    el("span", {
-      class: "sample-flag warn",
-      title: j.corruption_reason || (j.loop_reasons || []).join("; ") || "",
-    }, `${j.side === "previous_king" ? "king" : "chal"} ${j.looped ? "looped" : "truncated"}`));
+  // records carry no rollout id; file order is r1, r2, … only while none was dropped for a
+  // generation error, so a rollout is named (as in generated-samples.jsonl) only in a full group
+  const named = group.length > 1 && group.length === rollouts;
+  const zeroedBy = new Map();
+  group.forEach((r, k) => zeroedSides(r).forEach(z => {
+    const key = `${z.side} ${z.label}`;
+    (zeroedBy.get(key) || zeroedBy.set(key, { z, ks: [] }).get(key)).ks.push(k + 1);
+  }));
+  const zeroed = [...zeroedBy].map(([key, { z, ks }]) =>
+    el("span", { class: "sample-flag warn", title: z.text },
+      named ? `${key} · ${ks.map(k => `r${k}`).join(" ")}` : key));
 
   return lazyDetails({ class: "sample-card binary" },
     [
@@ -358,7 +393,9 @@ function binarySampleBody(record, p) {
   if (!(record.questions || []).length) {
     return [err || el("div", { class: "note" }, "no questions recorded.")];
   }
-  return [err, binaryJudgeTable(p), questionList(record, p)];
+  const zeroed = zeroedSides(record).map(z => el("div", { class: "note warn-note" },
+    `${z.side === "king" ? "King" : "Challenger"} not judged: ${z.text}. Every question scores 0.`));
+  return [err, ...zeroed, binaryJudgeTable(p), questionList(record, p)];
 }
 
 function binaryJudgeTable(p) {
@@ -371,6 +408,9 @@ function binaryJudgeTable(p) {
     el("tbody", {}, p.judges.map(m => {
       const king = p.king[m], chal = p.chal[m];
       const failed = [king, chal].filter(j => j && !j.parse_ok);
+      const skipped = [["king", king], ["chal", chal]]
+        .filter(([, j]) => zeroedView(j))
+        .map(([side, j]) => `${side} not judged: ${zeroedView(j).label}`);
       return el("tr", {},
         el("td", { class: "judge", title: m }, judgeLabel(m)),
         el("td", {}, king?.provider || chal?.provider || "—"),
@@ -378,7 +418,9 @@ function binaryJudgeTable(p) {
         sideCell(chal),
         failed.length
           ? el("td", { class: "bad" }, failed[0].error || "parse error")
-          : el("td", {}, king && chal ? votesText(king, chal) : "—"));
+          : skipped.length
+            ? el("td", { class: "warn" }, skipped.join(" · "))
+            : el("td", {}, king && chal ? votesText(king, chal) : "—"));
     })));
 }
 

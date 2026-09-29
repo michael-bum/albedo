@@ -395,24 +395,31 @@ def _names(text: str, *, code: bool = False) -> set[str]:
     return {n for t in tokens for n in (t.lower(), t.rsplit("/", 1)[-1].lower()) if n}
 
 
-SUBMISSION_LOOP_RUN = 3
+SUBMISSION_LOOP_RUN = 4
+WRONG_SUBMIT_LIMIT = 4
 
 
 def _submit_attempt(content: str) -> bool:
     return bool(ANY_MARKER_RE.search(first_bash_command(content)))
 
 
+def _wrong_submit(turn: dict) -> bool:
+    return not turn.get("submit_accepted") and _submit_attempt(str(turn.get("content") or ""))
+
+
 def submission_loop_issue(state: Any) -> str:
+    replies = [t for t in state.turns if t.get("role") == "assistant" and t.get("score_target")]
     run = 0
-    for turn in reversed(state.turns):
-        if turn.get("role") != "assistant" or not turn.get("score_target"):
-            continue
-        if not _submit_attempt(str(turn.get("content") or "")):
+    for turn in reversed(replies):
+        if not _wrong_submit(turn):
             break
         run += 1
-    if run < SUBMISSION_LOOP_RUN:
-        return ""
-    return f"submission loop: {run} submits in a row with no other command"
+    if run >= SUBMISSION_LOOP_RUN:
+        return f"submission loop: {run} submit attempts in a row were not accepted"
+    wrong = sum(_wrong_submit(turn) for turn in replies)
+    if wrong >= WRONG_SUBMIT_LIMIT:
+        return f"wrong submission: {wrong} submit attempts in this trajectory were not accepted"
+    return ""
 
 
 def empty_submit_count(state: Any, marker: str) -> int:

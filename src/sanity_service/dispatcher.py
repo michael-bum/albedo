@@ -355,7 +355,7 @@ class SanityDispatcher:
                         return
                     _apply_turn_result([state], redo_result)
                 if not (state.error or state.heuristic_reason):
-                    if issue := submission_loop_issue(state):
+                    if issue := _submission_issue(state):
                         state.heuristic_reason = f"chain: {issue}"
                 if turn_index == turn_count - 1:
                     return
@@ -1066,6 +1066,13 @@ def _bench_submitted(state: _TrajectoryState, assistant_output: str) -> bool:
     if not bench_submitted(command, state.submit_marker):
         return False
     return not missing_patch_output(command, issued_commands(state.messages))
+
+
+def _submission_issue(state: _TrajectoryState) -> str:
+    latest = state.turns[-1] if state.turns else {}
+    if latest.get("role") == "assistant":
+        latest["submit_accepted"] = _bench_submitted(state, str(latest.get("content") or ""))
+    return submission_loop_issue(state)
 
 
 def _reject_submission(

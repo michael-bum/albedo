@@ -516,12 +516,22 @@ def test_ungrounded_reason_flags_an_invented_symbol_like_an_invented_path():
     assert not ungrounded_reason("The `true` branch and `utils.go` look fine, submit.", ctx, CLAUSE)
 
 
-def _replies(*commands: str) -> SimpleNamespace:
+def _replies(*commands: str, accepted: tuple[int, ...] = ()) -> SimpleNamespace:
     turns = []
-    for command in commands:
-        turns.append({"role": "assistant", "content": _bash(command), "score_target": True})
+    for i, command in enumerate(commands):
+        turns.append(
+            {
+                "role": "assistant",
+                "content": _bash(command),
+                "score_target": True,
+                "submit_accepted": i in accepted,
+            }
+        )
         turns.append({"role": "user", "content": "Also handle the empty case.", "injected": True})
     return SimpleNamespace(submit_clause=CLAUSE, turns=turns)
+
+
+WRONG = f"python -c 'print(1)' && echo {MARKER}"
 
 
 def test_a_submit_off_protocol_is_not_flagged_like_the_bench():
@@ -537,11 +547,54 @@ def test_a_submit_off_protocol_is_not_flagged_like_the_bench():
         assert submission_loop_issue(_replies("ls", command, "cat a.py", command)) == "", command
 
 
-def test_three_submits_in_a_row_are_a_submission_loop():
+def test_accepted_submits_never_count_as_wrong():
+    from sanity_service.chain import submission_loop_issue
+
+    assert submission_loop_issue(_replies(*[CLAUSE] * 6, accepted=tuple(range(6)))) == ""
+
+
+def test_three_wrong_submits_then_an_accepted_one_is_not_a_loop():
+    from sanity_service.chain import submission_loop_issue
+
+    assert submission_loop_issue(_replies("ls", WRONG, WRONG, WRONG, CLAUSE, accepted=(4,))) == ""
+    assert submission_loop_issue(_replies("ls", WRONG, WRONG, WRONG)) == ""
+
+
+def test_four_wrong_submits_in_a_row_are_a_submission_loop():
     from sanity_service.chain import SUBMISSION_LOOP_RUN, submission_loop_issue
 
-    assert submission_loop_issue(_replies(CLAUSE, "ls", CLAUSE, "cat a.py", CLAUSE)) == ""
-    assert submission_loop_issue(_replies("ls", *[CLAUSE] * (SUBMISSION_LOOP_RUN - 1))) == ""
-    for command in (CLAUSE, f"cd /testbed && {CLAUSE}"):
+    for command in (WRONG, CLAUSE, f"cd /testbed && {CLAUSE}"):
         looped = submission_loop_issue(_replies("ls", *[command] * SUBMISSION_LOOP_RUN))
-        assert looped.startswith(f"submission loop: {SUBMISSION_LOOP_RUN} submits in a row")
+        assert looped.startswith(f"submission loop: {SUBMISSION_LOOP_RUN} submit attempts in a row")
+
+
+def test_a_fourth_wrong_submit_in_the_trajectory_fails_it():
+    from sanity_service.chain import WRONG_SUBMIT_LIMIT, submission_loop_issue
+
+    replies = (WRONG, "ls", WRONG, CLAUSE, WRONG, "cat a.py")
+    assert submission_loop_issue(_replies(*replies, accepted=(3,))) == ""
+    failed = submission_loop_issue(_replies(*replies, WRONG, accepted=(3,)))
+    assert failed.startswith(f"wrong submission: {WRONG_SUBMIT_LIMIT} submit attempts")
+
+
+def test_a_submission_loop_is_reported_before_the_wrong_submission_total():
+    from sanity_service.chain import submission_loop_issue
+
+    assert submission_loop_issue(_replies(WRONG, "ls", *[WRONG] * 4)).startswith("submission loop:")
+
+
+def test_the_dispatcher_accepts_a_correct_submit_before_counting_it():
+    from sanity_service.dispatcher import _submission_issue
+
+    wrong = f"python3 - <<'EOF'\nprint(1)\nEOF\n{CLAUSE}"
+    state = SimpleNamespace(turns=[], messages=[], submit_marker=MARKER)
+
+    def reply(command: str) -> str:
+        text = _bash(command)
+        state.messages.append({"role": "assistant", "content": text})
+        state.turns.append({"role": "assistant", "content": text, "score_target": True})
+        return _submission_issue(state)
+
+    assert [reply(command) for command in ("ls", wrong, wrong, wrong, CLAUSE)] == [""] * 5
+    assert state.turns[-1]["submit_accepted"] and not state.turns[1]["submit_accepted"]
+    assert reply(wrong).startswith("wrong submission: 4 submit attempts")

@@ -52,7 +52,12 @@ from albedo_eval_service.shared.observation_format import (
     wrap,
 )
 from albedo_eval_service.shared.observation_memo import ObservationMemo
-from albedo_eval_service.shared.patch_lint import extract_commands, final_submit_issue
+from albedo_eval_service.shared.patch_lint import (
+    extract_commands,
+    final_submit_issue,
+    issued_commands,
+    missing_patch_output,
+)
 from albedo_eval_service.shared.pip_check import fabricated_pip_error
 from albedo_eval_service.shared.sed_check import fabricated_sed_error, misdiagnosed_sed
 from albedo_eval_service.shared.submit_protocol import (
@@ -956,7 +961,7 @@ async def _append_observations(
         if state.error or state.stopped or state.heuristic_reason:
             continue
         assistant_output = str(state.turns[-1].get("content") or "")
-        if bench_submitted(first_bash_script(assistant_output), state.submit_marker):
+        if _bench_submitted(state, assistant_output):
             submitted.append((state, assistant_output))
         elif not _has_bash_command(assistant_output):
             _append_observation(
@@ -1049,6 +1054,13 @@ async def _append_observations(
         len(active),
         len(submitted),
     )
+
+
+def _bench_submitted(state: _TrajectoryState, assistant_output: str) -> bool:
+    command = first_bash_script(assistant_output)
+    if not bench_submitted(command, state.submit_marker):
+        return False
+    return not missing_patch_output(command, issued_commands(state.messages))
 
 
 def _reject_submission(
@@ -1241,6 +1253,11 @@ async def _simulate_observation_uncached(
     sample_id, prompt, messages = state.sample_id, state.prompt, state.messages
     fmt = detect_format(sample_id, messages)
     command = first_bash_command(assistant_output)
+    missing_patch = missing_patch_output(
+        first_bash_script(assistant_output), issued_commands(messages)
+    )
+    if missing_patch:
+        return wrap(missing_patch, fmt, returncode=1)
 
     # tools the bench image cannot reach answer the same way every time, so the answer is settled
     # here rather than asked for: an inconsistent one has the model retrying pip instead of

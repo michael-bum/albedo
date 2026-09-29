@@ -4,6 +4,9 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Any
+
+from .submit_protocol import ANY_MARKER_RE, bench_submitted
 
 DIFF_HEAD_RE = re.compile(r"^(diff --git|--- |\+\+\+ |Index: )", re.M)
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -304,6 +307,32 @@ def final_submit_issue(commands: list[str], marker: str) -> str:
             return ""
         return "patch file created by copying file content, not a diff"
     return ""
+
+
+def issued_commands(messages: list[dict[str, Any]]) -> list[str]:
+    return [
+        command
+        for message in messages
+        if message.get("role") == "assistant"
+        for command in extract_commands(str(message.get("content") or ""))
+    ]
+
+
+def missing_patch_output(command: str, earlier: list[str]) -> str:
+    found = ANY_MARKER_RE.search(command or "")
+    if not found or not bench_submitted(command, found.group(0)):
+        return ""
+    segments = [segment.strip() for segment in command.split("&&")]
+    marker_i = next(i for i, segment in enumerate(segments) if found.group(0) in segment)
+    rest = segments[marker_i + 1 :]
+    if not rest or re.search(r"\|\||;|\n", " && ".join(rest)):
+        return ""
+    words = rest[0].split()
+    if len(words) != 2 or words[0] != "cat" or not _is_patchlike(words[1]):
+        return ""
+    if _creations(earlier + segments[:marker_i], words[1]):
+        return ""
+    return f"{found.group(0)}\ncat: {words[1]}: No such file or directory"
 
 
 def handbuilt_patch_issues(assistant_texts: list[str]) -> list[str]:

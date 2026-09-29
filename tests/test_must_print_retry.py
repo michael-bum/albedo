@@ -148,6 +148,23 @@ def test_a_submit_the_bench_would_ignore_is_an_ordinary_command():
     assert simulated and not state.submits
 
 
+def test_a_submit_of_a_patch_never_created_gets_the_shells_error():
+    marker = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+    client = _Client(_REAL)
+    assert _simulate(client, f"echo {marker} && cat patch.txt") == (
+        f"<returncode>1</returncode>\n<output>\n{marker}\n"
+        "cat: patch.txt: No such file or directory\n</output>"
+    )
+    assert client.calls == []
+
+    state = _state()
+    state.submit_marker = marker
+    submit = f"```bash\necho {marker} && cat patch.txt\n```"
+    assert not D._bench_submitted(state, submit)
+    state.messages.append({"role": "assistant", "content": "```bash\ngit diff > patch.txt\n```"})
+    assert D._bench_submitted(state, submit)
+
+
 def test_a_read_that_printed_first_time_is_left_alone():
     client = _Client(_REAL)
     assert _simulate(client, _READ) == _REAL

@@ -32,6 +32,7 @@ from ..shared.observation_format import (
     unusable_turn,
     wrap,
 )
+from ..shared.patch_lint import issued_commands, missing_patch_output
 from ..shared.sampling import multi_source_manifest_sample_ids
 from ..shared.submit_protocol import bench_submitted
 from ..simulator.prompt_simulator import COMPLETE_MARKER, missing_command_output
@@ -1011,7 +1012,7 @@ def _merge_trajectory_results(
                     "environment_observation": True,
                 }
             )
-            if _assistant_submitted(sample, result.text):
+            if _assistant_submitted(sample, result.text, turns):
                 break
         if error:
             merged.append(GenerationResult(sample.sample_id, "", error))
@@ -1040,8 +1041,14 @@ def _context_turns(sample: EvalSample) -> list[dict[str, object]]:
     ]
 
 
-def _assistant_submitted(sample: EvalSample, output: str) -> bool:
-    return bench_submitted(first_bash_block(output), sample.submit_marker or COMPLETE_MARKER)
+def _assistant_submitted(
+    sample: EvalSample, output: str, history: list[dict[str, object]] | None = None
+) -> bool:
+    command = first_bash_block(output)
+    if not bench_submitted(command, sample.submit_marker or COMPLETE_MARKER):
+        return False
+    messages = _base_messages(sample) if history is None else history
+    return not missing_patch_output(command, issued_commands(messages))
 
 
 def _completion_observation(sample: EvalSample) -> str:

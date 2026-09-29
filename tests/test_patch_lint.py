@@ -1,4 +1,8 @@
-from albedo_eval_service.shared.patch_lint import final_submit_issue
+from albedo_eval_service.shared.patch_lint import (
+    final_submit_issue,
+    issued_commands,
+    missing_patch_output,
+)
 
 M = "SUBMIT_TASK_F31DF145"
 SUBMIT = f"echo {M} && cat patch.txt"
@@ -55,3 +59,26 @@ def test_hand_written_patch_is_checked_with_git_apply():
 
 def test_no_marked_submission_means_nothing_to_lint():
     assert final_submit_issue(["ls", "cat patch.txt"], M) == ""
+
+
+def test_a_submit_of_a_patch_never_created_gets_the_shells_error():
+    missing = f"{M}\ncat: patch.txt: No such file or directory"
+    assert missing_patch_output(SUBMIT, []) == missing
+    assert missing_patch_output(f"cd /testbed && {SUBMIT}", ["ls"]) == missing
+    assert missing_patch_output(SUBMIT, ["git diff -- a.py > patch.txt"]) == ""
+    assert missing_patch_output(f"git diff > patch.txt && {SUBMIT}", []) == ""
+    assert missing_patch_output(SUBMIT, [f"cat > patch.txt <<'EOF'\n{GOOD_DIFF}\nEOF"]) == ""
+    elsewhere = f"echo {M} && cat /tmp/patch.txt"
+    assert missing_patch_output(elsewhere, ["git diff > /tmp/patch.txt"]) == ""
+    assert missing_patch_output(f"echo {M} && git add -A && git diff --cached", []) == ""
+    assert missing_patch_output(f"echo {M} && cat src/app.py", []) == ""
+    assert missing_patch_output(f"{SUBMIT} || git diff", []) == ""
+    assert missing_patch_output(f"pytest -q && {SUBMIT}", []) == ""
+
+
+def test_issued_commands_reads_only_the_agents_turns():
+    messages = [
+        {"role": "user", "content": "```bash\ngit diff > patch.txt\n```"},
+        {"role": "assistant", "content": "THOUGHT: x\n\n```bash\ngit diff > patch.txt\n```"},
+    ]
+    assert issued_commands(messages) == ["git diff > patch.txt"]

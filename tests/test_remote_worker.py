@@ -611,6 +611,45 @@ def test_submit_echo_bypasses_observation_simulator(tmp_path):
     )
 
 
+def test_a_submit_of_a_patch_never_created_is_simulated_not_accepted(tmp_path):
+    from albedo_eval_service.remote import worker as W
+
+    class RecordingScorer:
+        def __init__(self):
+            self.calls = 0
+
+        def simulate_observation(self, **_kwargs):
+            self.calls += 1
+            return "simulated"
+
+    sample = types.SimpleNamespace(
+        sample_id="mini-coder/data/train-00000.parquet:1:0",
+        prompt="Task",
+        target=None,
+        messages=[{"role": "user", "content": "Task"}],
+        submit_marker="",
+        submit_command="",
+    )
+    submit = "```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt\n```"
+    made = {"role": "assistant", "content": "```bash\ngit diff -- a.py > patch.txt\n```"}
+    assert not W._assistant_submitted(sample, submit)
+    assert W._assistant_submitted(sample, submit, [*sample.messages, made])
+
+    scorer = RecordingScorer()
+    worker = RemoteEvalWorker(
+        RemoteSettings(dataset_root=str(tmp_path), scoring_backend="mock"),
+        generator_factory=lambda side, gpu_ids, model: RecordingGenerator(side=side, calls=[]),
+        scorer=scorer,
+    )
+    observations = worker._simulate_observations(
+        request=_request(),
+        samples_by_side={"challenger": [sample]},
+        results_by_side={"challenger": [GenerationResult(sample.sample_id, submit)]},
+    )
+    assert scorer.calls == 1
+    assert observations[("challenger", sample.sample_id)].observation == "simulated"
+
+
 def test_remote_worker_rejects_overlapping_gpu_groups(tmp_path):
     _write_dataset(tmp_path)
     request = _request()

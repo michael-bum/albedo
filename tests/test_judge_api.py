@@ -272,6 +272,27 @@ def test_observation_simulation_primary_capped_then_fallback():
     assert "retry_count" not in fallback_call
 
 
+def test_a_submit_of_a_patch_never_created_gets_the_shells_error():
+    class NoCalls:
+        async def complete(self, **_kwargs):
+            raise AssertionError("the simulator model must not be asked")
+
+    marker = "SUBMIT_TASK_1234ABCD"
+    request = SimulateObservationRequest(
+        eval_run_id="run",
+        sample_id="sample",
+        prompt="task",
+        messages=_RC_PREFIX,
+        assistant_output=f"```bash\necho {marker} && cat patch.txt\n```",
+    )
+    service = ObservationSimulationService(JudgeSettings(), NoCalls())
+    observation = asyncio.run(service.simulate(request))
+    assert observation == (
+        f"<returncode>1</returncode>\n<output>\n{marker}\n"
+        "cat: patch.txt: No such file or directory\n</output>"
+    )
+
+
 def test_observation_simulation_falls_back_on_invalid_format():
     class BadSimClient:
         async def complete(self, **kwargs):

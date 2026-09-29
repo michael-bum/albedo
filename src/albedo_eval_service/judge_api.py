@@ -111,6 +111,7 @@ from .shared.observation_format import (
     wrap,
 )
 from .shared.observation_memo import ObservationMemo
+from .shared.patch_lint import issued_commands, missing_patch_output
 from .shared.pip_check import fabricated_pip_error
 from .shared.sed_check import fabricated_sed_error, misdiagnosed_sed
 from .shared.submit_protocol import bench_submitted, first_bash_command
@@ -140,8 +141,11 @@ class QuestionPrepSample(BaseModel):
     submit_command: str = ""
 
 
-def _sample_submitted(sample: QuestionPrepSample, text: str) -> bool:
-    return bench_submitted(first_bash_block(text), sample.submit_marker or COMPLETE_MARKER)
+def _sample_submitted(sample: QuestionPrepSample, text: str, history: list[dict[str, Any]]) -> bool:
+    command = first_bash_block(text)
+    if not bench_submitted(command, sample.submit_marker or COMPLETE_MARKER):
+        return False
+    return not missing_patch_output(command, issued_commands(history))
 
 
 class QuestionPrepRequest(BaseModel):
@@ -347,7 +351,7 @@ class ReferenceTrajectoryService:
             text = response.raw.strip()
             turns.append({"role": "assistant", "content": text, "score_target": True})
             last = turn_index == turn_count - 1
-            if _sample_submitted(sample, text):
+            if _sample_submitted(sample, text, convo):
                 if not last:
                     turns.append(
                         {
@@ -860,6 +864,9 @@ class ObservationSimulationService:
                 len(request.assistant_output or ""),
             )
             return missing_command_output(fmt)
+        missing_patch = missing_patch_output(command, issued_commands(request.messages or []))
+        if missing_patch:
+            return wrap(missing_patch, fmt, returncode=1)
         absent = absent_tool_output(command)
         if absent is not None:
             body, returncode = absent

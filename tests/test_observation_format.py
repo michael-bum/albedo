@@ -422,6 +422,17 @@ def test_a_comment_above_the_command_does_not_hide_it():
     assert first_bash_block(f"{fence}# only a note\n```") == "# only a note"
 
 
+def test_first_bash_block_reads_the_benchmark_formats_like_pre_eval():
+    assert (
+        first_bash_block("THOUGHT: x\n\n<mswea_bash_command>ls -la</mswea_bash_command>")
+        == "ls -la"
+    )
+    assert first_bash_block("```shell\nls\n```") == "ls"
+    assert first_bash_block("```\nls\n```") == ""
+    tag_then_fence = "<mswea_bash_command>cat a.py</mswea_bash_command>\n```bash\nls\n```"
+    assert first_bash_block(tag_then_fence) == "cat a.py"
+
+
 def test_a_command_after_a_heredoc_terminator_is_its_own_stage():
     write_then_run = "cat <<'EOF' > /tmp/t.py\nprint(1)\nEOF\npython /tmp/t.py"
     assert command_stages(write_then_run) == [

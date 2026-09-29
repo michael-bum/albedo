@@ -4,6 +4,8 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 
+from .submit_protocol import first_bash_script
+
 RETURNCODE = "returncode"
 SWE_AGENT = "swe_agent"
 OPENHANDS = "openhands"
@@ -554,10 +556,6 @@ def silent_observation(raw: str) -> bool:
     return all(_BARE_LINE_NUMBER.match(line) for line in body.splitlines())
 
 
-_FIRST_BLOCK_RE = re.compile(r"```(?:bash|sh)?[ \t]*\n(.*?)```", re.DOTALL)
-_TAGGED_BLOCK_RE = re.compile(r"```(?:bash|sh)[ \t]*\n(.*?)```", re.DOTALL)
-
-
 _LEADING_COMMENTS = re.compile(r"\A(?:[ \t]*#[^\n]*(?:\n|\Z))+")
 
 
@@ -574,10 +572,8 @@ def strip_leading_comments(command: str) -> str:
 
 
 def first_bash_block(assistant_output: str) -> str:
-    match = _TAGGED_BLOCK_RE.search(assistant_output or "") or _FIRST_BLOCK_RE.search(
-        assistant_output or ""
-    )
-    return strip_leading_comments(match.group(1)) if match else ""
+    script = first_bash_script(assistant_output)
+    return strip_leading_comments(script) if script else ""
 
 
 _QUOTED_SPAN_RE = re.compile(r"'[^']*'|\"[^\"]*\"")

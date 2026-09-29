@@ -379,6 +379,16 @@ def _eval_sample(sample_id: str = "s1") -> EvalSample:
     )
 
 
+def test_a_submit_in_the_benchmark_tag_format_ends_the_rollout():
+    from albedo_eval_service.remote import worker as W
+
+    command = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached"
+    sample = _eval_sample()
+    assert W._assistant_submitted(sample, f"<mswea_bash_command>{command}</mswea_bash_command>")
+    assert W._assistant_submitted(sample, f"```bash\n{command}\n```")
+    assert not W._assistant_submitted(sample, f"```\n{command}\n```")
+
+
 def test_bad_turn_is_retried_with_accumulated_feedback(monkeypatch):
     monkeypatch.setattr(
         "albedo_eval_service.remote.worker.format_messages",

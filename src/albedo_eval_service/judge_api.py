@@ -113,7 +113,7 @@ from .shared.observation_format import (
 from .shared.observation_memo import ObservationMemo
 from .shared.pip_check import fabricated_pip_error
 from .shared.sed_check import fabricated_sed_error, misdiagnosed_sed
-from .shared.submit_protocol import first_bash_command, is_exact_submission
+from .shared.submit_protocol import bench_submitted, first_bash_command
 from .shared.verdict_levels import (
     NO_CREDIT,
     PRUNE_EARNED_MIN,
@@ -141,9 +141,7 @@ class QuestionPrepSample(BaseModel):
 
 
 def _sample_submitted(sample: QuestionPrepSample, text: str) -> bool:
-    if sample.submit_command:
-        return is_exact_submission(text, sample.submit_command)
-    return COMPLETE_MARKER in text
+    return bench_submitted(first_bash_block(text), sample.submit_marker or COMPLETE_MARKER)
 
 
 class QuestionPrepRequest(BaseModel):

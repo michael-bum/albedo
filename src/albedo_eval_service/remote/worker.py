@@ -33,7 +33,7 @@ from ..shared.observation_format import (
     wrap,
 )
 from ..shared.sampling import multi_source_manifest_sample_ids
-from ..shared.submit_protocol import is_exact_submission
+from ..shared.submit_protocol import bench_submitted
 from ..simulator.prompt_simulator import COMPLETE_MARKER, missing_command_output
 from .artifacts import ArtifactUploader, RunArtifactSpool, build_artifact_uploader
 from .dataset import (
@@ -1041,9 +1041,7 @@ def _context_turns(sample: EvalSample) -> list[dict[str, object]]:
 
 
 def _assistant_submitted(sample: EvalSample, output: str) -> bool:
-    if sample.submit_command:
-        return is_exact_submission(output, sample.submit_command)
-    return COMPLETE_MARKER in output
+    return bench_submitted(first_bash_block(output), sample.submit_marker or COMPLETE_MARKER)
 
 
 def _completion_observation(sample: EvalSample) -> str:

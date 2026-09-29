@@ -335,3 +335,14 @@ def asked_submit(command: str) -> bool:
     if not echoed or not ANY_MARKER_RE.match(tail.lstrip()):
         return False
     return not head.strip() or prints_nothing_on_success(head.strip().rstrip("&|;").strip())
+
+
+def bench_submitted(command: str, marker: str) -> bool:
+    """mini-swe-agent's `_check_finished` read off the command: the marker is the first line it
+    prints, i.e. only silent stages run before its echo. Heredoc bodies are data, not stages."""
+    from albedo_eval_service.shared.observation_format import heredoc_bodies
+
+    for body in heredoc_bodies(command):
+        command = command.replace(body, "", 1)
+    tail = command.partition("echo ")[2].lstrip()
+    return asked_submit(command) and bool(re.match(rf"['\"]?{re.escape(marker)}\b", tail))

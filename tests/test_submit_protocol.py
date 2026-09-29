@@ -7,6 +7,7 @@ from albedo_eval_service.shared.submit_protocol import (
     MARKERS,
     TAILS,
     assign_submit,
+    bench_submitted,
     command_for,
     first_bash_command,
     has_native_submission,
@@ -180,6 +181,17 @@ def test_is_exact_submission():
     )
     assert not is_exact_submission("```bash\n\n```", "")
     assert first_bash_command("```\nnot bash\n```") == ""
+
+
+def test_bench_submitted_mirrors_mini_swe_agent():
+    assert bench_submitted(NONCE_COMMAND, NONCE)
+    assert bench_submitted(f"cd /testbed && {NONCE_COMMAND}", NONCE)
+    assert bench_submitted(f"git diff -- a.py > patch.txt && {NONCE_COMMAND}", NONCE)
+    assert bench_submitted(f"echo {NONCE} && git diff --cached --stat", NONCE)
+    assert not bench_submitted(f"pytest -q && {NONCE_COMMAND}", NONCE)
+    assert not bench_submitted(f"python - <<'EOF'\nprint(1 > 0)\nEOF\n{NONCE_COMMAND}", NONCE)
+    assert not bench_submitted(f"echo {CANONICAL_MARKER}", NONCE)
+    assert not bench_submitted("ls", NONCE)
 
 
 def test_marker_from_command():

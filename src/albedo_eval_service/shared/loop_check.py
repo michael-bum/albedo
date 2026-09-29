@@ -11,7 +11,7 @@ from .observation_format import (
     prints_nothing_on_success,
     silent_observation,
 )
-from .submit_protocol import asked_submit, first_bash_command
+from .submit_protocol import ANY_MARKER_RE, bench_submitted, first_bash_command, first_bash_script
 
 DUP_CMD_THRESHOLD = 0.61
 MAX_RUN_THRESHOLD = 5
@@ -81,14 +81,22 @@ def unanswered(command: str, observation: str | None) -> bool:
     return silent_observation(observation) and not prints_nothing_on_success(command)
 
 
-def commands_of(turns: list[str], observations: list[str | None] | None = None) -> list[str]:
+def _loop_blocks(turn: str, marker: str) -> list[str]:
+    if not marker:
+        return [c for c in action_blocks(turn) if not ANY_MARKER_RE.search(c)]
+    return [] if bench_submitted(first_bash_script(turn), marker) else action_blocks(turn)
+
+
+def commands_of(
+    turns: list[str], observations: list[str | None] | None = None, marker: str = ""
+) -> list[str]:
     """With `observations` (index-aligned), an exact re-issue of the previous command after an
     unanswered observation is not counted: re-asking a shell that said nothing is rational, and
     dropping only duplicates keeps both statistics monotone."""
     cmds: list[str] = []
     previous: tuple[list[str], str, str | None] = ([], "", None)
     for index, turn in enumerate(turns):
-        blocks = [c for c in action_blocks(turn) if not asked_submit(c)]
+        blocks = _loop_blocks(turn, marker)
         seen = observations and index < len(observations)
         observation = observations[index] if seen else None
         if not (blocks and blocks == previous[0] and unanswered(previous[1], previous[2])):
@@ -97,8 +105,10 @@ def commands_of(turns: list[str], observations: list[str | None] | None = None) 
     return cmds
 
 
-def loop_stats(turns: list[str], observations: list[str | None] | None = None) -> dict:
-    cmds = commands_of(turns, observations)
+def loop_stats(
+    turns: list[str], observations: list[str | None] | None = None, marker: str = ""
+) -> dict:
+    cmds = commands_of(turns, observations, marker)
     max_run = run = 1
     for prev, cur in zip(cmds, cmds[1:]):
         run = run + 1 if cur == prev else 1
@@ -120,9 +130,11 @@ def _longest_runs(cmds: list[str]) -> dict[str, int]:
     return longest
 
 
-def loop_verdict(turns: list[str], observations: list[str | None] | None = None) -> LoopVerdict:
-    cmds = commands_of(turns, observations)
-    stats = loop_stats(turns, observations)
+def loop_verdict(
+    turns: list[str], observations: list[str | None] | None = None, marker: str = ""
+) -> LoopVerdict:
+    cmds = commands_of(turns, observations, marker)
+    stats = loop_stats(turns, observations, marker)
     counts = Counter(cmds)
     longest = _longest_runs(cmds)
 
@@ -147,9 +159,9 @@ def loop_verdict(turns: list[str], observations: list[str | None] | None = None)
     )
 
 
-def loop_verdict_for_document(document: str) -> LoopVerdict:
+def loop_verdict_for_document(document: str, marker: str = "") -> LoopVerdict:
     turns, observations = candidate_turns_with_observations(document)
-    return loop_verdict(turns, observations)
+    return loop_verdict(turns, observations, marker)
 
 
 def _render_command(entry: LoopingCommand) -> str:

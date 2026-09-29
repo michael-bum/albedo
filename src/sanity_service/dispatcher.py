@@ -58,8 +58,10 @@ from albedo_eval_service.shared.sed_check import fabricated_sed_error, misdiagno
 from albedo_eval_service.shared.submit_protocol import (
     _tail_name,
     assign_submit,
+    bench_submitted,
     command_for,
     first_bash_command,
+    first_bash_script,
     is_exact_submission,
     rewrite_messages,
 )
@@ -954,7 +956,7 @@ async def _append_observations(
         if state.error or state.stopped or state.heuristic_reason:
             continue
         assistant_output = str(state.turns[-1].get("content") or "")
-        if state.submit_marker and state.submit_marker in first_bash_command(assistant_output):
+        if bench_submitted(first_bash_script(assistant_output), state.submit_marker):
             submitted.append((state, assistant_output))
         elif not _has_bash_command(assistant_output):
             _append_observation(

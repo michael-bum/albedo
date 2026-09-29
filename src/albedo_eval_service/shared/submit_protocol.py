@@ -116,6 +116,9 @@ _BACKTICK_RE = re.compile(r"`([^`\n]*)`")
 
 
 _BASH_FENCE_RE = re.compile(r"```(?:bash|sh|shell)[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+_ECHO_RE = re.compile(r"(?<![\w./-])echo[ \t]+")
+_LINE_CONTINUATION_RE = re.compile(r"\\\r?\n")
+_VERBOSE_FLAG_RE = re.compile(r"(?<!\S)(?:-[A-Za-z]*v[A-Za-z]*|--verbose)(?!\S)")
 
 
 def marker_for(name: str, sample_id: str, salt: str) -> str:
@@ -141,18 +144,16 @@ def _norm(command: str) -> str:
     return " ".join((command or "").split())
 
 
-def first_bash_command(text: str) -> str:
+def first_bash_script(text: str) -> str:
     fence = _BASH_FENCE_RE.search(text or "")
     tag = _TAGGED_RE.search(text or "")
-    if fence and tag:
-        return _norm(
-            (fence if fence.start() <= tag.start() else tag).group(
-                1 if fence.start() <= tag.start() else 2
-            )
-        )
-    if fence:
-        return _norm(fence.group(1))
-    return _norm(tag.group(2)) if tag else ""
+    if fence and (not tag or fence.start() <= tag.start()):
+        return fence.group(1)
+    return tag.group(2) if tag else ""
+
+
+def first_bash_command(text: str) -> str:
+    return _norm(first_bash_script(text))
 
 
 def is_exact_submission(text: str, command: str) -> bool:
@@ -328,21 +329,29 @@ def rewrite_messages(
     return [dict(m) for m in messages], "failed"
 
 
-def asked_submit(command: str) -> bool:
-    from albedo_eval_service.shared.observation_format import prints_nothing_on_success
-
-    head, echoed, tail = (command or "").partition("echo ")
-    if not echoed or not ANY_MARKER_RE.match(tail.lstrip()):
-        return False
-    return not head.strip() or prints_nothing_on_success(head.strip().rstrip("&|;").strip())
-
-
 def bench_submitted(command: str, marker: str) -> bool:
     """mini-swe-agent's `_check_finished` read off the command: the marker is the first line it
     prints, i.e. only silent stages run before its echo. Heredoc bodies are data, not stages."""
-    from albedo_eval_service.shared.observation_format import heredoc_bodies
+    from albedo_eval_service.shared.observation_format import (
+        heredoc_bodies,
+        prints_nothing_on_success,
+        strip_leading_comments,
+    )
 
+    if not marker:
+        return False
+    command = strip_leading_comments(command or "")
     for body in heredoc_bodies(command):
         command = command.replace(body, "", 1)
-    tail = command.partition("echo ")[2].lstrip()
-    return asked_submit(command) and bool(re.match(rf"['\"]?{re.escape(marker)}\b", tail))
+    command = _LINE_CONTINUATION_RE.sub(" ", command)
+    alone = re.compile(
+        rf"(['\"]?){re.escape(marker)}\1(?:[ \t]+2>(?:&1|[ \t]*\S+))*"
+        r"(?:[ \t]+#[^\n]*|[ \t\r]*)(?:&&|\|\||;|\n|\Z)"
+    )
+    for echo in _ECHO_RE.finditer(command):
+        if alone.match(command, echo.end()):
+            head = command[: echo.start()].strip().rstrip("&|;").strip()
+            return not head or (
+                prints_nothing_on_success(head) and not _VERBOSE_FLAG_RE.search(head)
+            )
+    return False

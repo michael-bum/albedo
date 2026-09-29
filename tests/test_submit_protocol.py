@@ -194,6 +194,44 @@ def test_bench_submitted_mirrors_mini_swe_agent():
     assert not bench_submitted("ls", NONCE)
 
 
+def test_bench_submitted_reads_the_command_like_the_shell():
+    assert bench_submitted(f"cd /testbed\ngit diff -- a.py > patch.txt\n{NONCE_COMMAND}", NONCE)
+    assert bench_submitted(f"cat > /tmp/r.py <<'EOF'\nprint(1)\nEOF\n{NONCE_COMMAND}", NONCE)
+    assert bench_submitted(f"# submit\n{NONCE_COMMAND}", NONCE)
+    assert bench_submitted(f'echo "{NONCE}" && cat patch.txt', NONCE)
+    assert bench_submitted(f"echo '{NONCE}' && cat patch.txt", NONCE)
+    assert bench_submitted(f"{NONCE_COMMAND} && git diff --stat", NONCE)
+    assert not bench_submitted(f"cat > run.sh <<'EOF'\n{NONCE_COMMAND}\nEOF", NONCE)
+    assert not bench_submitted(f'echo "{NONCE} && cat patch.txt', NONCE)
+    assert not bench_submitted(f"echo {NONCE} done && cat patch.txt", NONCE)
+    assert not bench_submitted(f"echo {NONCE} > /dev/null && git diff", NONCE)
+    assert not bench_submitted(f"echo {NONCE}_X", NONCE)
+    assert not bench_submitted("echo && ls", "")
+
+
+def test_bench_submitted_matches_what_bash_prints_first():
+    assert bench_submitted(f"echo {NONCE} # done", NONCE)
+    assert bench_submitted(f"echo {NONCE} \\\n  && cat patch.txt", NONCE)
+    assert bench_submitted(f"echo {NONCE} 2>&1 && cat patch.txt", NONCE)
+    assert bench_submitted(f"echo {NONCE}\r\ncat patch.txt", NONCE)
+    assert bench_submitted(f"echo hello > note.txt && {NONCE_COMMAND}", NONCE)
+    assert bench_submitted(f"rm -f patch-v2.txt && {NONCE_COMMAND}", NONCE)
+    assert not bench_submitted(f"echo hello && {NONCE_COMMAND}", NONCE)
+    assert not bench_submitted(f"echo {NONCE}#x", NONCE)
+    assert not bench_submitted(f"echo {NONCE} | grep -v {NONCE}", NONCE)
+    assert not bench_submitted(f"cp -v a.py b.py && {NONCE_COMMAND}", NONCE)
+    assert not bench_submitted(f"mkdir -pv out && {NONCE_COMMAND}", NONCE)
+    assert not bench_submitted(f"git add --verbose a.py && {NONCE_COMMAND}", NONCE)
+
+
+def test_bench_submitted_takes_every_assigned_marker():
+    for name in MARKERS:
+        marker = marker_for(name, "mini-coder:1:3", "salt-a")
+        for tail in TAILS:
+            command = f"cd /testbed && {command_for(marker, tail)}"
+            assert bench_submitted(command, marker), (name, tail)
+
+
 def test_marker_from_command():
     assert marker_from(NONCE_COMMAND) == NONCE
     assert marker_from(f"echo {CANONICAL_MARKER}") == CANONICAL_MARKER

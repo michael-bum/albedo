@@ -120,18 +120,9 @@ def test_the_simulator_is_told_not_to_pre_apply_a_pending_request():
 
 
 def test_a_submit_the_harness_would_ignore_is_still_counted():
-    from albedo_eval_service.shared.submit_protocol import asked_submit as _asked_submit
-
-    assert _asked_submit("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")
-    assert _asked_submit("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt")
-    assert _asked_submit("echo SUBMIT_TASK_33360A0E && git add -A && git diff --cached")
-    assert not _asked_submit(
-        "git add -A && git diff --cached && echo FINALIZE_AND_SUBMIT_TASK_OUTPUT"
-    )
-    assert not _asked_submit("git diff && echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")
-
+    marker = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
     marker_last = ["git diff && echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"] * MAX_RUN_THRESHOLD
-    assert looping_reason(_turns(marker_last)), "a spammed unregisterable submit is still a loop"
+    assert looping_reason(_turns(marker_last), marker=marker), "a spammed submit is a loop"
 
 
 def test_a_sample_that_only_ever_submits_is_left_to_the_submit_checks():
@@ -164,7 +155,13 @@ def _state_with(turns: list[dict]):
     from types import SimpleNamespace
 
     return SimpleNamespace(
-        sample_id="s", prompt="task", turns=turns, error="", heuristic_reason="", submit_clause=""
+        sample_id="s",
+        prompt="task",
+        turns=turns,
+        error="",
+        heuristic_reason="",
+        submit_clause="",
+        submit_marker="",
     )
 
 

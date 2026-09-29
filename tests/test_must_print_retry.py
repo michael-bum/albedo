@@ -120,6 +120,34 @@ def test_the_submit_command_never_reaches_the_simulator():
     assert state.submits, "the turn should have been recorded as a submission"
 
 
+def test_a_submit_the_bench_would_ignore_is_an_ordinary_command():
+    marker = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+    state = _state()
+    state.submit_marker = marker
+    state.turns.append(
+        {
+            "role": "assistant",
+            "content": f"```bash\npytest -q && echo {marker}\n```",
+            "score_target": True,
+        }
+    )
+    simulated: list[str] = []
+
+    async def _fake(**kwargs):
+        simulated.append(kwargs["assistant_output"])
+        return _REAL
+
+    import sanity_service.dispatcher as mod
+
+    original = mod._simulate_observation
+    mod._simulate_observation = _fake
+    try:
+        asyncio.run(mod._append_observations([state], "run", 1))
+    finally:
+        mod._simulate_observation = original
+    assert simulated and not state.submits
+
+
 def test_a_read_that_printed_first_time_is_left_alone():
     client = _Client(_REAL)
     assert _simulate(client, _READ) == _REAL

@@ -10,6 +10,7 @@ from albedo_eval_service.shared.loop_check import (
     loop_verdict,
     loop_verdict_for_document,
 )
+from albedo_eval_service.shared.submit_protocol import CANONICAL_MARKER
 
 
 def _turn(command: str) -> str:
@@ -225,3 +226,32 @@ def test_commands_of_without_observations_is_unchanged():
     turns = [_turn("ls"), _turn("ls"), _turn("cat a.py")]
     assert commands_of(turns) == ["ls", "ls", "cat a.py"]
     assert commands_of(turns, [None, None, None]) == ["ls", "ls", "cat a.py"]
+
+
+def test_a_submit_the_bench_ignores_counts_toward_the_preeval_loop():
+    marker = "SUBMIT_TASK_1234ABCD"
+    ignored = [_turn(f"pytest -q && echo {marker} && cat patch.txt")] * MAX_RUN_THRESHOLD
+    assert loop_verdict(ignored, marker=marker).looped
+    wrong_marker = [_turn(f"echo {CANONICAL_MARKER} && cat patch.txt")] * MAX_RUN_THRESHOLD
+    assert not loop_verdict(wrong_marker).looped
+    assert loop_verdict(wrong_marker, marker=marker).looped
+
+
+def test_a_submit_the_bench_accepts_is_not_a_loop_command():
+    marker = "SUBMIT_TASK_1234ABCD"
+    turns = [_turn(f"cd /testbed && echo {marker} && cat patch.txt")] * MAX_RUN_THRESHOLD
+    assert commands_of(turns, marker=marker) == []
+    assert not loop_verdict_for_document(_document([f"echo {marker}"] * 6), marker).looped
+
+
+def test_eval_never_counts_a_submit_attempt_toward_a_loop():
+    for command in (
+        "cd /testbed && echo SUBMIT_TASK_1234ABCD && cat patch.txt",
+        f"pytest -q && echo {CANONICAL_MARKER}",
+        "git diff && echo FINALIZE_AND_SUBMIT_TASK_OUTPUT",
+    ):
+        turns = [_turn(command)] * (MAX_RUN_THRESHOLD + 3)
+        assert commands_of(turns) == [], command
+        assert not loop_verdict(turns).looped, command
+        assert not loop_verdict_for_document(_document([command] * 8)).looped, command
+    assert loop_verdict([_turn("ls -la")] * MAX_RUN_THRESHOLD).looped

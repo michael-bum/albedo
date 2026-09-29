@@ -25,8 +25,10 @@ TAIL_JUDGE_MIN_FAILED_SAMPLES = 2
 Paired = tuple[str, str | None, str | None]  # assistant turn, its observation, requester message
 
 
-def loop_stats(assistant_turns: list[str], observations: list[str | None] | None = None) -> dict:
-    cmds = commands_of(assistant_turns, observations)
+def loop_stats(
+    assistant_turns: list[str], observations: list[str | None] | None = None, marker: str = ""
+) -> dict:
+    cmds = commands_of(assistant_turns, observations, marker)
     max_run = run = 1
     for prev, cur in zip(cmds, cmds[1:]):
         run = run + 1 if cur == prev else 1
@@ -38,8 +40,10 @@ def loop_stats(assistant_turns: list[str], observations: list[str | None] | None
     }
 
 
-def looping_reason(assistant_turns: list[str], observations: list[str | None] | None = None) -> str:
-    stats = loop_stats(assistant_turns, observations)
+def looping_reason(
+    assistant_turns: list[str], observations: list[str | None] | None = None, marker: str = ""
+) -> str:
+    stats = loop_stats(assistant_turns, observations, marker)
     if stats["dup_cmd_ratio"] >= DUP_CMD_THRESHOLD:
         return f"looping: duplicate command ratio {stats['dup_cmd_ratio']:.2f}"
     if stats["max_cmd_run"] >= MAX_RUN_THRESHOLD:
@@ -153,7 +157,7 @@ async def run_tail_check(states, *, client=None) -> list[TailVerdict]:
             continue
         paired = paired_turns(state.turns)
         scored = [turn for turn, _, _ in paired]
-        reason = looping_reason(scored, [result for _, result, _ in paired])
+        reason = looping_reason(scored, [result for _, result, _ in paired], state.submit_marker)
         if reason:
             state.heuristic_reason = f"tail_check: {reason}"
             verdicts.append(TailVerdict(state.sample_id, checked=True, passed=False, reason=reason))

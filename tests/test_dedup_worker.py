@@ -32,15 +32,17 @@ def _run(monkeypatch, tmp_path, result, enforce, reasons="COPY,OWN-COPY"):
     _patch_pipeline(monkeypatch, tmp_path)
     calls = {}
 
-    def fake_run(model_dir, model_uri, hotkey, repo, digest, coldkey=""):
-        calls.update(hotkey=hotkey, coldkey=coldkey, repo=repo, digest=digest)
+    def fake_run(model_dir, model_uri, hotkey, repo, digest, coldkey="", block_number=None):
+        calls.update(
+            hotkey=hotkey, coldkey=coldkey, repo=repo, digest=digest, block_number=block_number
+        )
         return result
 
     monkeypatch.setattr(worker.dedup, "run", fake_run)
     monkeypatch.setattr(worker.config, "DEDUP_ENFORCE", enforce)
     monkeypatch.setattr(gate.config, "DEDUP_ENFORCE", enforce)
     monkeypatch.setattr(gate.config, "DEDUP_ENFORCE_REASONS", reasons)
-    out = worker.process_model("ns/m@" + "a" * 40, "hk", "ck")
+    out = worker.process_model("ns/m@" + "a" * 40, "hk", "ck", block_number=123)
     return out, calls
 
 
@@ -48,7 +50,7 @@ def test_pass_is_done_with_bare_summary(monkeypatch, tmp_path):
     res = GateResult(verdict=Verdict("PASS", None, "root", "TRAINED", ["TRAINED"], {"F": 0.7}))
     out, calls = _run(monkeypatch, tmp_path, res, enforce=True)
     assert out.state == "done" and out.result_summary == {"dedup": "pass"}
-    assert calls == dict(hotkey="hk", coldkey="ck", repo="ns/m", digest="a" * 40)
+    assert calls == dict(hotkey="hk", coldkey="ck", repo="ns/m", digest="a" * 40, block_number=123)
 
 
 def test_exact_copy_enforced_is_a_duplicate_fault(monkeypatch, tmp_path):

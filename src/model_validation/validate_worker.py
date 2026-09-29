@@ -119,6 +119,7 @@ def process_model(
     hotkey: str,
     coldkey: str = "",
     protected_repos: frozenset[str] = frozenset(),
+    block_number: int | None = None,
 ) -> Outcome:
     repo, _, digest = model_uri.partition("@")
     try:
@@ -182,7 +183,9 @@ def process_model(
         return _miner("safetensors_index", msg, {})
 
     try:
-        res = dedup.run(model_dir, model_uri, hotkey, repo, digest, coldkey)
+        res = dedup.run(
+            model_dir, model_uri, hotkey, repo, digest, coldkey, block_number=block_number
+        )
     except Exception as exc:
         return _infra("dedup_failed", f"dedup stage failed: {type(exc).__name__}: {exc}")
     if res.infra_error:
@@ -422,6 +425,7 @@ async def run() -> None:
                     attempt["hotkey"],
                     coldkey=coldkey,
                     protected_repos=protected,
+                    block_number=attempt["block_number"],
                 )
             except Exception as exc:
                 outcome = _infra("unexpected", f"{type(exc).__name__}: {exc}")

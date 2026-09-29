@@ -98,6 +98,7 @@ from sanity_service.chain import (
     same_request,
     segment_has_edit,
     should_reject,
+    submission_loop_issue,
     unread_edited_files,
 )
 from sanity_service.dataset import sample_prompts
@@ -353,6 +354,9 @@ class SanityDispatcher:
                         halt.set()
                         return
                     _apply_turn_result([state], redo_result)
+                if not (state.error or state.heuristic_reason):
+                    if issue := submission_loop_issue(state):
+                        state.heuristic_reason = f"chain: {issue}"
                 if turn_index == turn_count - 1:
                     return
                 await _append_observations(

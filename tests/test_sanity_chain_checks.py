@@ -514,3 +514,34 @@ def test_ungrounded_reason_flags_an_invented_symbol_like_an_invented_path():
     # symbols the session showed, dotted attributes, and plain English in backticks pass
     assert not ungrounded_reason("Please make `ToCamelCase` keep leading underscores.", ctx, CLAUSE)
     assert not ungrounded_reason("The `true` branch and `utils.go` look fine, submit.", ctx, CLAUSE)
+
+
+def _replies(*commands: str) -> SimpleNamespace:
+    turns = []
+    for command in commands:
+        turns.append({"role": "assistant", "content": _bash(command), "score_target": True})
+        turns.append({"role": "user", "content": "Also handle the empty case.", "injected": True})
+    return SimpleNamespace(submit_clause=CLAUSE, turns=turns)
+
+
+def test_a_submit_off_protocol_is_not_flagged_like_the_bench():
+    from sanity_service.chain import submission_loop_issue
+
+    for command in (
+        CLAUSE,
+        f"cd /testbed && {CLAUSE}",
+        "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached",
+        f"python -c 'print(1)' && echo {MARKER}",
+    ):
+        assert submission_loop_issue(_replies("ls", command)) == "", command
+        assert submission_loop_issue(_replies("ls", command, "cat a.py", command)) == "", command
+
+
+def test_three_submits_in_a_row_are_a_submission_loop():
+    from sanity_service.chain import SUBMISSION_LOOP_RUN, submission_loop_issue
+
+    assert submission_loop_issue(_replies(CLAUSE, "ls", CLAUSE, "cat a.py", CLAUSE)) == ""
+    assert submission_loop_issue(_replies("ls", *[CLAUSE] * (SUBMISSION_LOOP_RUN - 1))) == ""
+    for command in (CLAUSE, f"cd /testbed && {CLAUSE}"):
+        looped = submission_loop_issue(_replies("ls", *[command] * SUBMISSION_LOOP_RUN))
+        assert looped.startswith(f"submission loop: {SUBMISSION_LOOP_RUN} submits in a row")

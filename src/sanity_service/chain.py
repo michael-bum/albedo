@@ -10,7 +10,7 @@ from loguru import logger
 
 from albedo_eval_service.shared.edit_detection import WORK_EDIT_RE
 from albedo_eval_service.shared.json_extract import extract_json
-from albedo_eval_service.shared.submit_protocol import first_bash_command
+from albedo_eval_service.shared.submit_protocol import ANY_MARKER_RE, first_bash_command
 
 CHAIN_MICROTASK_PROMPT: str = """You design a tiny warm-up coding request for an agent working in the \
 repository shown below (excerpts from its recent context).
@@ -393,6 +393,26 @@ def _names(text: str, *, code: bool = False) -> set[str]:
     tokens |= {t for t in _NAME_RE.findall(text or "") if any(c in t for c in "_./-")}
     tokens |= {t for t in _NAME_RE.findall(text or "") if not t.islower()}
     return {n for t in tokens for n in (t.lower(), t.rsplit("/", 1)[-1].lower()) if n}
+
+
+SUBMISSION_LOOP_RUN = 3
+
+
+def _submit_attempt(content: str) -> bool:
+    return bool(ANY_MARKER_RE.search(first_bash_command(content)))
+
+
+def submission_loop_issue(state: Any) -> str:
+    run = 0
+    for turn in reversed(state.turns):
+        if turn.get("role") != "assistant" or not turn.get("score_target"):
+            continue
+        if not _submit_attempt(str(turn.get("content") or "")):
+            break
+        run += 1
+    if run < SUBMISSION_LOOP_RUN:
+        return ""
+    return f"submission loop: {run} submits in a row with no other command"
 
 
 def empty_submit_count(state: Any, marker: str) -> int:

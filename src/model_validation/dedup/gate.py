@@ -8,6 +8,7 @@ from loguru import logger as log
 
 from albedo_config import get_model_validation_settings
 from model_validation.dedup import bank
+from model_validation.dedup.canon import ExpertAlign
 from model_validation.dedup.secret import load_secret
 from model_validation.dedup.signals import mats, rel_dist
 from model_validation.dedup.sketch import fingerprint
@@ -75,6 +76,16 @@ def fault_code(reason: str | None) -> str:
     return "duplicate"
 
 
+def align_params() -> ExpertAlign | None:
+    if not config.DEDUP_ALIGN_EXPERTS:
+        return None
+    return ExpertAlign(
+        max_router_ident=config.DEDUP_PERMUTED_MAX_IDENT,
+        sure=config.DEDUP_ALIGN_SURE,
+        floor=config.DEDUP_ALIGN_MIN,
+    )
+
+
 def device() -> torch.device:
     """No CPU fallback on purpose: torch's CPU and CUDA RNGs differ for the same seed, so a CPU
     sketch uses a different projection basis and, unscoped by device, would poison the bank."""
@@ -123,29 +134,49 @@ def _own_copy(doc: dict, coldkey: str) -> Verdict | None:
     return None
 
 
+def _with_layout_notes(verdict: Verdict, doc: dict) -> Verdict:
+    if doc.get("realigned_layers"):
+        verdict.notes.insert(
+            0, f"EXPERT ORDER REALIGNED in {len(doc['realigned_layers'])} layer(s)"
+        )
+    return verdict
+
+
 def run(
-    model_dir: str, model_uri: str, hotkey: str, repo: str, digest: str, coldkey: str = ""
+    model_dir: str,
+    model_uri: str,
+    hotkey: str,
+    repo: str,
+    digest: str,
+    coldkey: str = "",
+    block_number: int | None = None,
 ) -> GateResult:
     try:
         # Both before ref_dir(), which downloads the seed model when DEDUP_REF_DIR is unset.
         dev = device()
         secret = load_secret(config.DEDUP_SECRET, config.DEDUP_SECRET_FILE)
-        doc = fingerprint(model_dir, ref_dir(), secret, dev, model_uri=model_uri)
+        doc = fingerprint(
+            model_dir, ref_dir(), secret, dev, model_uri=model_uri, align=align_params()
+        )
     except Exception as exc:
         return GateResult(infra_error=f"dedup fingerprint failed: {type(exc).__name__}: {exc}")
     log.info(
-        "dedup fingerprint {} — {} tensors, identity_frac={}, {}s",
+        "dedup fingerprint {} — {} tensors, identity_frac={}, realigned {} layer(s), {}s",
         model_uri,
         doc["n_tensors"],
         doc["identity_frac"],
+        len(doc.get("realigned_layers", [])),
         doc["secs"],
     )
-    store = dict(hotkey=hotkey, coldkey=coldkey, repo=repo, digest=digest)
+    store = dict(
+        hotkey=hotkey, coldkey=coldkey, repo=repo, digest=digest, block_number=block_number
+    )
     try:
-        exact = bank.find_exact(doc, hotkey, coldkey)
+        exact = bank.find_exact(doc, hotkey, coldkey, block_number)
         if exact:
-            verdict = Verdict(
-                "REJECT", "COPY", exact["model_uri"], "identical weights (tensors_hash)"
+            verdict = _with_layout_notes(
+                Verdict("REJECT", "COPY", exact["model_uri"], "identical weights (tensors_hash)"),
+                doc,
             )
             bank.put_doc(doc, status=bank.STATUS_AUDIT, verdict=asdict(verdict), **store)
             return GateResult(verdict=verdict, doc=doc, exact_of=exact)
@@ -161,7 +192,7 @@ def run(
                     "— bootstrap the bank first"
                 ),
             )
-        near = bank.nearest(doc, hotkey, config.DEDUP_NEAREST_K, coldkey)
+        near = bank.nearest(doc, hotkey, config.DEDUP_NEAREST_K, coldkey, block_number)
         root = bank.root_id(doc)
         ids = [m for m, _ in near]
         if root and root not in ids:
@@ -172,8 +203,9 @@ def run(
     if not docs:
         return GateResult(doc=doc, infra_error="dedup nearest search returned no documents")
     if not near:
-        verdict = Verdict(
-            "PASS", None, root or "", "no other miner's model in the bank to compare with"
+        verdict = _with_layout_notes(
+            Verdict("PASS", None, root or "", "no other miner's model in the bank to compare with"),
+            doc,
         )
         bank.put_doc(doc, status=bank.STATUS_BANK, verdict=asdict(verdict), **store)
         return GateResult(verdict=verdict, doc=doc)
@@ -184,6 +216,7 @@ def run(
     verdict.metrics["opensearch_nearest"] = near
     verdict.metrics["ancestor_hotkey"] = docs.get(verdict.ancestor, {}).get("hotkey", "")
     verdict.metrics["hotkeys_by_model"] = {m: d.get("hotkey", "") for m, d in docs.items()}
+    verdict = _with_layout_notes(verdict, doc)
     try:
         bank.put_doc(
             doc,

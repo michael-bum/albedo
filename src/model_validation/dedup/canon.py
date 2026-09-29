@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import torch
 from safetensors import safe_open
@@ -8,9 +10,17 @@ from model_validation.dedup.layout import (
     COL_HIDDEN,
     EMBED,
     RES_ROWS,
+    ROUTER,
     ROW_HIDDEN,
     tensor_names,
 )
+
+
+@dataclass(frozen=True)
+class ExpertAlign:
+    max_router_ident: float
+    sure: float
+    floor: float
 
 
 class Provider:
@@ -98,3 +108,30 @@ def canonicalize(
         w = w[:, idx]
         info = dict(ident=ident, cos=cos)
     return w, info
+
+
+def expert_order(
+    prov: Provider, ref: Provider, layer: str, perm_res: torch.Tensor
+) -> tuple[torch.Tensor, float]:
+    idx, _, ident = match(prov.get(layer + ROUTER)[:, perm_res], ref.get(layer + ROUTER))
+    return idx, ident
+
+
+def align_experts(
+    c: str,
+    w: torch.Tensor,
+    wb: torch.Tensor,
+    perm_res: torch.Tensor,
+    order: tuple[torch.Tensor, float],
+    align: ExpertAlign,
+) -> tuple[torch.Tensor, dict]:
+    idx, ident = order
+    if ident >= align.max_router_ident:
+        return canonicalize(c, w, wb, perm_res)
+    moved, moved_info = canonicalize(c, w[idx.to(w.device)], wb, perm_res)
+    if moved_info["cos"] >= align.sure:
+        return moved, dict(moved_info, realigned=True)
+    kept, kept_info = canonicalize(c, w, wb, perm_res)
+    if moved_info["cos"] >= align.floor and moved_info["cos"] > kept_info["cos"]:
+        return moved, dict(moved_info, realigned=True)
+    return kept, kept_info

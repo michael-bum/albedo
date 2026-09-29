@@ -41,7 +41,7 @@ from albedo_config import get_model_validation_settings  # noqa: E402
 from albedo_config.chain_spec import SEED_DIGEST, SEED_REPO  # noqa: E402
 from model_validation import db, dedup  # noqa: E402
 from model_validation.dedup import bank  # noqa: E402
-from model_validation.dedup.gate import device, ref_dir  # noqa: E402
+from model_validation.dedup.gate import align_params, device, ref_dir  # noqa: E402
 from model_validation.dedup.secret import load_secret  # noqa: E402
 from model_validation.dedup.sketch import fingerprint  # noqa: E402
 from model_validation.storage import cache_dir, download_full, make_ref  # noqa: E402
@@ -109,7 +109,7 @@ def index_root() -> None:
         return
     secret = load_secret(config.DEDUP_SECRET, config.DEDUP_SECRET_FILE)
     rd = ref_dir()
-    doc = fingerprint(rd, rd, secret, device(), model_uri=uri)
+    doc = fingerprint(rd, rd, secret, device(), model_uri=uri, align=align_params())
     bank.put_doc(doc, status=bank.STATUS_BANK, repo=SEED_REPO, digest=SEED_DIGEST, is_root=True)
     log.info("root indexed: {} ({} tensors, {}s)", uri, doc["n_tensors"], doc["secs"])
 

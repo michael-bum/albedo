@@ -11,8 +11,22 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from model_validation.dedup.canon import Provider, canonicalize, residual_perm
-from model_validation.dedup.layout import EMBED, WS_VERSION, arch_key, read_header, ttype
+from model_validation.dedup.canon import (
+    ExpertAlign,
+    Provider,
+    align_experts,
+    canonicalize,
+    expert_order,
+    residual_perm,
+)
+from model_validation.dedup.layout import (
+    EMBED,
+    WS_VERSION,
+    arch_key,
+    expert_layer,
+    read_header,
+    ttype,
+)
 from model_validation.dedup.secret import key_id, seed_for
 
 K = 64
@@ -84,6 +98,7 @@ def fingerprint(
     *,
     model_uri: str = "",
     text_set_sha: str = "",
+    align: ExpertAlign | None = None,
 ) -> dict:
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=1) as pool:
@@ -92,6 +107,7 @@ def fingerprint(
         ref = Provider(ref_dir, device)
         perm_res, ident_res = residual_perm(prov.get(EMBED), ref.get(EMBED))
         tensors, idents, shapes = [], {}, {}
+        orders, realigned = {}, set()
         vec = torch.zeros(VEC_DIM, dtype=torch.float32, device=device)
         total = 0
         for c in prov.keys():
@@ -101,7 +117,15 @@ def fingerprint(
                 continue
             w = prov.get(c)
             wb = ref.get(c)
-            w, info = canonicalize(c, w, wb, perm_res)
+            layer = expert_layer(c) if align else None
+            if layer:
+                if layer not in orders:
+                    orders[layer] = expert_order(prov, ref, layer, perm_res)
+                w, info = align_experts(c, w, wb, perm_res, orders[layer], align)
+                if info.get("realigned"):
+                    realigned.add(layer)
+            else:
+                w, info = canonicalize(c, w, wb, perm_res)
             del wb
             s, wn, x, k = sketch(w, c, secret)
             del w
@@ -116,7 +140,7 @@ def fingerprint(
         identity = {k: round(float(np.mean(v)), 3) for k, v in idents.items()}
         identity["residual"] = round(ident_res, 3)
         thash = hash_job.result()
-    return dict(
+    doc = dict(
         model_uri=model_uri,
         ws_version=WS_VERSION,
         key_id=key_id(secret, text_set_sha),
@@ -128,3 +152,6 @@ def fingerprint(
         secs=round(time.time() - t0, 1),
         tensors=tensors,
     )
+    if realigned:
+        doc["realigned_layers"] = sorted(realigned, key=lambda layer: int(layer.split(".")[1]))
+    return doc

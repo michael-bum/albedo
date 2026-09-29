@@ -472,6 +472,9 @@ class ModelValidationSettings(BaseSettings):
     DEDUP_REUSE_COS: float = 0.8
     DEDUP_TOPK_PARTNERS: int = 5
     DEDUP_PERMUTED_MAX_IDENT: float = 0.5
+    DEDUP_ALIGN_EXPERTS: bool = True
+    DEDUP_ALIGN_SURE: float = 0.5
+    DEDUP_ALIGN_MIN: float = 0.15
     POLL_INTERVAL_S: float = Field(5.0, validation_alias=AliasChoices("ALBEDO_HV_POLL_S"))
     LEASE_SECONDS: int = Field(600, validation_alias=AliasChoices("ALBEDO_HV_LEASE_S"))
     HEARTBEAT_S: float = Field(30.0, validation_alias=AliasChoices("ALBEDO_HV_HEARTBEAT_S"))

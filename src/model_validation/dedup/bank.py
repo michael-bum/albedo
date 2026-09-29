@@ -29,6 +29,7 @@ _MAPPING = {
             "tensors_hash": {"type": "keyword"},
             "status": {"type": "keyword"},
             "is_root": {"type": "boolean"},
+            "block_number": {"type": "long"},
             "created_at": {"type": "date"},
             "secs": {"type": "float"},
             "n_tensors": {"type": "integer"},
@@ -109,6 +110,12 @@ def _own(hotkey: str, coldkey: str) -> list[dict]:
     return terms
 
 
+def _before(block: int | None) -> list[dict]:
+    if block is None:
+        return []
+    return [{"bool": {"must_not": [{"range": {"block_number": {"gte": block}}}]}}]
+
+
 def put_doc(
     doc: dict,
     *,
@@ -119,6 +126,7 @@ def put_doc(
     digest: str = "",
     verdict: dict | None = None,
     is_root: bool = False,
+    block_number: int | None = None,
 ) -> None:
     body = {
         **doc,
@@ -129,6 +137,7 @@ def put_doc(
         "status": status,
         "is_root": is_root,
         "verdict": verdict or {},
+        "block_number": block_number,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     get_client().index(index=ensure_index(), id=doc["model_uri"], body=body)
@@ -144,9 +153,13 @@ def _exact(filters: list[dict], must_not: list[dict]) -> dict | None:
     return hits[0]["_source"] if hits else None
 
 
-def find_exact(doc: dict, hotkey: str, coldkey: str = "") -> dict | None:
+def find_exact(doc: dict, hotkey: str, coldkey: str = "", block: int | None = None) -> dict | None:
     return _exact(
-        [{"term": {"tensors_hash": doc["tensors_hash"]}}, {"term": {"status": STATUS_BANK}}],
+        [
+            {"term": {"tensors_hash": doc["tensors_hash"]}},
+            {"term": {"status": STATUS_BANK}},
+            *_before(block),
+        ],
         _own(hotkey, coldkey),
     )
 
@@ -167,9 +180,14 @@ def count_scope(doc: dict) -> int:
     return int(get_client().count(index=ensure_index(), body=body)["count"])
 
 
-def nearest(doc: dict, hotkey: str, k: int, coldkey: str = "") -> list[tuple[str, float]]:
+def nearest(
+    doc: dict, hotkey: str, k: int, coldkey: str = "", block: int | None = None
+) -> list[tuple[str, float]]:
     return _nearest(
-        doc, k, [*_scope(doc), {"term": {"status": STATUS_BANK}}], _own(hotkey, coldkey)
+        doc,
+        k,
+        [*_scope(doc), {"term": {"status": STATUS_BANK}}, *_before(block)],
+        _own(hotkey, coldkey),
     )
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import struct
 from pathlib import Path
 
@@ -25,6 +26,8 @@ ROW_HIDDEN = (
 COL_HIDDEN = ("o_proj", "out_proj", "shared_expert.down_proj")
 RES_ROWS = ("o_proj", "out_proj", "shared_expert.down_proj", "experts.down_proj")
 TYPES = ("experts", "shared_expert", "linear_attn", "self_attn", "embed_tokens", "lm_head")
+_EXPERT_TENSOR = re.compile(r"^(layers\.\d+\.mlp\.)experts\.(gate_up_proj|down_proj)$")
+ROUTER = "gate.weight"
 BODY_TYPES = ("self_attn", "linear_attn", "shared_expert", "experts")
 EMBED_TYPES = ("embed_tokens", "lm_head")
 
@@ -33,6 +36,11 @@ def canon(name: str) -> str | None:
     if name == HEAD:
         return name
     return name[len(LM_PREFIX) :] if name.startswith(LM_PREFIX) else None
+
+
+def expert_layer(c: str) -> str | None:
+    m = _EXPERT_TENSOR.match(c)
+    return m.group(1) if m else None
 
 
 def ttype(c: str) -> str:

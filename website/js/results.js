@@ -59,12 +59,16 @@ function referenceLabel(repo) {
 export function mergeDistributedResults(data, manifest) {
   const runsByRepo = new Map();
   const references = new Map();
+  const nonetRepos = new Set(Object.values(manifest?.results || {}).flat()
+    .filter(row => isReferenceRow(row) && String(row.model_key || "").endsWith("-nonet"))
+    .map(row => row.model_repo));
   for (const benchmark of manifest?.benchmarks || []) {
     if (!benchmark.enabled) continue;
     for (const row of manifest.results?.[benchmark.name] || []) {
       if (!row.model_repo || !row.model_key) continue;
       const run = distributedRun(benchmark, row);
       if (isReferenceRow(row)) {
+        if (nonetRepos.has(row.model_repo) && !row.model_key.endsWith("-nonet")) continue;
         const ref = references.get(row.model_key) || {
           id: `reference:${row.model_key}`,
           label: referenceLabel(row.model_repo),

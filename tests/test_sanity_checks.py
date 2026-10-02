@@ -383,7 +383,7 @@ def test_run_prompts_does_not_leak_unclosed_think(monkeypatch):
     assert out == [unclosed_think_block_notice()]
 
 
-def test_run_prompts_strips_qwen_thinking_tail(monkeypatch):
+def test_run_prompts_keeps_the_reasoning_the_way_eval_stores_it(monkeypatch):
     raw = "Thinking Process: choose ls\n</think>\n\n```bash\nls -la\n```"
 
     class _Response:
@@ -422,7 +422,32 @@ def test_run_prompts_strips_qwen_thinking_tail(monkeypatch):
     )()
 
     out = asyncio.run(engine._run_prompts("model-name", ["prompt"], 77))
-    assert out == ["```bash\nls -la\n```"]
+    assert out == [raw]
+
+
+def test_heuristics_judge_the_answer_without_its_reasoning():
+    answer = "THOUGHT: list the files\n```bash\nls -la\n```"
+    raw = "I should look around first, the task mentions files.\n</think>\n\n" + answer
+    assert _heuristics([raw] * 3, _req()) == _heuristics([answer] * 3, _req())
+
+
+def test_reasoning_absent_on_most_turns_is_logged_but_does_not_fail_pre_eval():
+    """Eval scores an amputated chain of thought with a multiplier; pre-eval must not be stricter.
+    The turns are stored raw, so the check sees the `</think>` eval sees."""
+    state = sanity_dispatcher._TrajectoryState(
+        sample_id="sanity-fallback:0",
+        prompt="initial prompt",
+        messages=[{"role": "user", "content": "Fix it."}],
+        turns=[],
+    )
+    bare = "</think>\n\nTHOUGHT: go\n```bash\nls\n```"
+    sanity_dispatcher._apply_turn_result(
+        [state], {"responses": [bare], "heuristics": [{"passed": True}]}
+    )
+    assert state.turns[-1]["content"] == bare
+    assert sanity_dispatcher.amputated_thinking(state)
+    sanity_dispatcher._run_chain_checks([state], 1)
+    assert "reasoning" not in state.heuristic_reason
 
 
 def test_run_prompts_uses_raw_completions(monkeypatch):

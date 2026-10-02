@@ -294,6 +294,7 @@ class SanityDispatcher:
         turn_count = max(1, int(request.assistant_turns))
         states = _trajectory_states(request)
         await _inject_microtasks(states)
+        await _redraw_failed_microtasks(self.settings, request, states)
         judge_settings = get_judge_settings()
         repo_context = (
             RepoContextClient(judge_settings) if judge_settings.repo_context_url else None
@@ -743,6 +744,44 @@ def _trajectory_states(request: SanityRunRequest) -> list[_TrajectoryState]:
     return states
 
 
+MICROTASK_REDRAWS = 2
+
+
+async def _redraw_failed_microtasks(
+    settings: SanitySettings, request: SanityRunRequest, states: list[_TrajectoryState]
+) -> None:
+    """Give a slot whose warm-up found no grounded function a fresh sample before the run
+    starts, instead of driving the others for 20 minutes and retrying the whole attempt."""
+    for redraw in range(MICROTASK_REDRAWS):
+        failed = [i for i, s in enumerate(states) if s.error.startswith("microtask_generation_")]
+        if not failed:
+            return
+        drawn = sample_prompts(
+            seed=f"{request.run_id}:redraw:{redraw}",
+            n=len(states) + len(failed),
+            manifest_path=settings.dataset_manifest_path,
+            manifest_hash=settings.dataset_manifest_hash,
+            dataset_root=settings.dataset_root,
+        )
+        used = {state.sample_id for state in states}
+        swaps = list(zip(failed, [s for s in drawn if s.sample_id not in used]))
+        if not swaps:
+            return
+        prompts, ids = list(request.prompts), list(request.sample_ids or [])
+        messages = list(request.prompt_messages or [])
+        for i, sample in swaps:
+            prompts[i], ids[i] = sample.prompt, sample.sample_id
+            messages[i] = sample.messages or [{"role": "user", "content": sample.prompt}]
+        request = request.model_copy(
+            update={"prompts": prompts, "sample_ids": ids, "prompt_messages": messages}
+        )
+        rebuilt = _trajectory_states(request)
+        await _inject_microtasks([rebuilt[i] for i, _ in swaps])
+        for i, _ in swaps:
+            logger.info("[sanity-dispatch] microtask redraw {} -> {}", states[i].sample_id, ids[i])
+            states[i] = rebuilt[i]
+
+
 async def _inject_microtasks(states: list[_TrajectoryState]) -> None:
     settings = get_judge_settings()
     client = make_client(settings)
@@ -830,12 +869,15 @@ def _run_chain_checks(states: list[_TrajectoryState], turn_count: int) -> None:
             )
         elif empty_submit_count(state, state.submit_marker) > max(1, 2 * _edit_turns(state)):
             state.heuristic_reason = "chain: repeated submissions without doing any work"
-        elif amputated_thinking(state):
-            state.heuristic_reason = "chain: reasoning absent on majority of turns"
         elif unread := unread_edited_files(state):
             state.heuristic_reason = f"chain: files edited without being read first: {unread[:3]}"
         elif malformed_structure(state):
             state.heuristic_reason = f"chain: {malformed_structure(state)}"
+        if amputated_thinking(state):
+            # eval scores this with AMPUTATED_THINKING_MULTIPLIER rather than failing the run
+            logger.warning(
+                "[sanity-dispatch] {} reasoning absent on the majority of turns", state.sample_id
+            )
         if state.heuristic_reason:
             logger.warning("[sanity-dispatch] {} {}", state.sample_id, state.heuristic_reason)
     for state in states:

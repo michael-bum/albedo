@@ -1199,3 +1199,213 @@ def test_resolve_sha_ignores_cache_entries_written_under_an_older_rule(tmp_path,
     assert json.loads(cache_file.read_text())["rule"] == _SHA_RULE
     assert service._resolve_sha(ref) == ("swesmith", "BurntSushi__ripgrep.3b7fd442", HEAD_SHA)
     assert len(calls) == 1
+
+
+def _format_patch(sha: str, subject: str, diff: list[str]) -> str:
+    return "\n".join(
+        [
+            f"From {sha} Mon Sep 17 00:00:00 2001",
+            "From: swesmith <swesmith@swesmith.ai>",
+            "Date: Sat, 12 Jul 2025 17:08:47 +0000",
+            f"Subject: [PATCH] {subject}",
+            "",
+            "---",
+            " a.py | 2 +-",
+            " 1 file changed, 1 insertion(+), 1 deletion(-)",
+            "",
+            *diff,
+            "",
+        ]
+    )
+
+
+_BUG_DIFF = [
+    "diff --git a/a.py b/a.py",
+    "index 1111111..2222222 100644",
+    "--- a/a.py",
+    "+++ b/a.py",
+    "@@ -1,2 +1,2 @@",
+    " def add(a, b):",
+    "-    return a + b",
+    "+    return a - b",
+]
+_F2P_DIFF = [
+    "diff --git a/tests/test_a.py b/tests/test_a.py",
+    "deleted file mode 100644",
+    "index 3333333..0000000",
+    "--- a/tests/test_a.py",
+    "+++ /dev/null",
+    "@@ -1,2 +0,0 @@",
+    "-def test_add():",
+    "-    assert add(1, 2) == 3",
+]
+
+
+def _fake_github(
+    monkeypatch,
+    service,
+    history: list[tuple[str, str]],
+    patches: dict[str, str],
+    upstream: dict[str, dict] | None = None,
+):
+    calls = []
+
+    def fake_json(path):
+        calls.append(path)
+        if path in (upstream or {}):
+            return upstream[path]
+        if "/commits?" in path:
+            return [{"sha": sha, "commit": {"message": subject}} for sha, subject in history]
+        if "/commits/" in path:
+            raise _NotFound(path)
+        return {"default_branch": "main"}
+
+    def fake_text(path, accept):
+        calls.append(path)
+        rev = path.rsplit("/", 1)[-1]
+        return next((text for sha, text in patches.items() if sha.startswith(rev)), "")
+
+    monkeypatch.setattr(service, "_github_json", fake_json)
+    monkeypatch.setattr(service, "_github_text", fake_text)
+    return calls
+
+
+def test_smith_mirror_history_is_served_as_one_squashed_commit(tmp_path, monkeypatch):
+    service = make_service(tmp_path)
+    snapshot = make_snapshot(service, {"a.py": "def add(a, b):\n    return a - b\n"})
+    mirror = "BurntSushi__ripgrep.3b7fd442"
+    monkeypatch.setattr(service, "_resolve_sha", lambda ref: ("swesmith", mirror, HEAD_SHA))
+    monkeypatch.setattr(service, "_ensure_snapshot", lambda owner, repo, sha: snapshot)
+    calls = _fake_github(
+        monkeypatch,
+        service,
+        [(HEAD_SHA, "Remove F2P Tests"), (BUG_SHA, "Bug Patch"), (INITIAL_SHA, "Initial commit")],
+        {
+            HEAD_SHA: _format_patch(HEAD_SHA, "Remove F2P Tests", _F2P_DIFF),
+            BUG_SHA: _format_patch(BUG_SHA, "Bug Patch", _BUG_DIFF),
+        },
+    )
+
+    def ground(command):
+        return service.repo_context_for_instance("mini-coder", SMITH_ID, f"```bash\n{command}\n```")
+
+    squashed = f"{HEAD_SHA[:7]} Initial commit"
+    assert ground("git log --oneline -5").exact_output == squashed
+    assert ground("git log --oneline -- a.py").exact_output == squashed
+    upstream = "https://github.com/BurntSushi/ripgrep"
+    assert ground("git remote -v").exact_output == (
+        f"origin\t{upstream} (fetch)\norigin\t{upstream} (push)"
+    )
+    for command in (
+        f"git show {BUG_SHA[:7]}",
+        f"git show {HEAD_SHA[:7]}",
+        f"git show {BUG_SHA[:7]} --stat",
+        "git log --oneline --all",
+        "git log -p",
+    ):
+        result = ground(command)
+        assert result.exact_output is None, command
+        for leak in ("Bug Patch", "Remove F2P Tests", "return a + b", "test_add"):
+            assert leak not in (result.context or ""), (command, leak)
+    assert not any(path.startswith("/repos/swesmith/") and "/commits" in path for path in calls)
+    assert calls.count("/repos/BurntSushi/ripgrep/commits/3b7fd442") == 1
+
+
+def _smith_service(tmp_path, monkeypatch, mirror: str):
+    service = make_service(tmp_path)
+    snapshot = make_snapshot(service, {"a.py": "def add(a, b):\n    return a - b\n"})
+    monkeypatch.setattr(service, "_resolve_sha", lambda ref: ("swesmith", mirror, HEAD_SHA))
+    monkeypatch.setattr(service, "_ensure_snapshot", lambda owner, repo, sha: snapshot)
+    return service
+
+
+def test_smith_mirror_shows_the_upstream_commit_it_was_built_from(tmp_path, monkeypatch):
+    service = _smith_service(tmp_path, monkeypatch, "BurntSushi__ripgrep.3b7fd442")
+    upstream_sha = "3b7fd442" + "9" * 32
+    lookup = "/repos/BurntSushi/ripgrep/commits/3b7fd442"
+    calls = _fake_github(
+        monkeypatch,
+        service,
+        [(HEAD_SHA, "Remove F2P Tests"), (BUG_SHA, "Bug Patch"), (INITIAL_SHA, "Initial commit")],
+        {BUG_SHA: _format_patch(BUG_SHA, "Bug Patch", _BUG_DIFF)},
+        upstream={lookup: {"sha": upstream_sha, "commit": {"message": "Release 14.1.0\n\nnotes"}}},
+    )
+
+    def ground(command):
+        return service.repo_context_for_instance("mini-coder", SMITH_ID, f"```bash\n{command}\n```")
+
+    assert ground("git log --oneline -5").exact_output == f"{upstream_sha[:7]} Release 14.1.0"
+    assert ground("git log --oneline -- a.py").exact_output == f"{upstream_sha[:7]} Release 14.1.0"
+    assert ground("git rev-parse HEAD").exact_output == upstream_sha
+    for command in (f"git show {upstream_sha[:7]}", f"git show {BUG_SHA[:7]}", "git show HEAD"):
+        result = ground(command)
+        assert result.exact_output is None, command
+        for leak in ("Bug Patch", "Remove F2P Tests", "return a + b", "swesmith"):
+            assert leak not in (result.context or ""), (command, leak)
+    assert calls.count(lookup) == 1
+
+
+@pytest.mark.parametrize(("age_days", "looked_up"), [(2, False), (6.9, False), (7.1, True)])
+def test_a_missing_upstream_commit_is_remembered_for_seven_days(
+    tmp_path, monkeypatch, age_days, looked_up
+):
+    service = _smith_service(tmp_path, monkeypatch, "BurntSushi__ripgrep.3b7fd442")
+    marker = service.cache_dir / "upstream" / "BurntSushi__ripgrep__3b7fd442.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    failed_at = time.time() - age_days * 24 * 3600
+    marker.write_text(json.dumps({"sha": None, "failed_at": failed_at, "kind": "absent"}))
+    calls = _fake_github(monkeypatch, service, [], {})
+    service.repo_context_for_instance("mini-coder", SMITH_ID, "```bash\ngit log --oneline\n```")
+    assert ("/repos/BurntSushi/ripgrep/commits/3b7fd442" in calls) is looked_up
+
+
+@pytest.mark.parametrize(
+    ("message", "shows_upstream"),
+    [("Merge pull request #329 from x/fix", False), ("Merge pull request #3290 from x/y", True)],
+)
+def test_smith_pr_mirror_never_shows_an_upstream_commit_naming_its_pr(
+    tmp_path, monkeypatch, message, shows_upstream
+):
+    service = _smith_service(tmp_path, monkeypatch, "jawah__charset_normalizer.1fdd6463")
+    upstream_sha = "1fdd6463" + "8" * 32
+    lookup = "/repos/jawah/charset_normalizer/commits/1fdd6463"
+    _fake_github(
+        monkeypatch,
+        service,
+        [],
+        {},
+        upstream={lookup: {"sha": upstream_sha, "commit": {"message": message}}},
+    )
+    result = service.repo_context_for_instance(
+        "mini-coder", "jawah__charset_normalizer.1fdd6463.pr_329", "```bash\ngit log --oneline\n```"
+    )
+    squashed = f"{HEAD_SHA[:7]} Initial commit"
+    assert result.exact_output == (f"{upstream_sha[:7]} {message}" if shows_upstream else squashed)
+
+
+def test_git_show_renders_only_commits_from_the_served_history(tmp_path, monkeypatch):
+    service = make_service(tmp_path)
+    make_snapshot(service, {"a.py": "def add(a, b):\n    return a - b\n"})
+    monkeypatch.setattr(service, "_resolve_sha", lambda ref: ("o", "r", FULL_SHA))
+    older, fix = "6" * 40, "7" * 40
+    calls = _fake_github(
+        monkeypatch,
+        service,
+        [(FULL_SHA, "Base"), (older, "Older change")],
+        {
+            older: _format_patch(older, "Older change", _BUG_DIFF),
+            fix: _format_patch(fix, "Fix the reported bug", _BUG_DIFF),
+        },
+    )
+
+    def ground(command):
+        return service.repo_context_for_instance("swe-zero", "o__r-1", f"```bash\n{command}\n```")
+
+    served = ground(f"git show {older[:7]}")
+    assert served.exact_output is not None
+    assert "Older change" in served.exact_output
+
+    refused = ground(f"git show {fix[:7]}")
+    assert refused.exact_output is None
+    assert "Fix the reported bug" not in (refused.context or "")
+    assert not any(path.endswith(f"/commits/{fix[:7]}") for path in calls)

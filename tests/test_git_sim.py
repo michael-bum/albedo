@@ -374,3 +374,74 @@ def test_a_renamed_file_edited_afterwards_is_one_rm_row_in_short_status():
     messages = _turn("git mv README.md notes.md") + _turn("echo more >> notes.md")
     result, _ = _run("git status --short", messages)
     assert result.output == "RM README.md -> notes.md"
+
+
+def test_git_show_of_a_file_at_head_prints_its_committed_text():
+    """`git show HEAD:<path>` is the file as committed, before this session's edits; a path git
+    does not track there fails the way git does, and other commits are left to the simulator."""
+    edited = EDIT + _turn("git log --oneline -1", "a1b2c3d Fix the parser")
+    assert _run("git show HEAD:src/app.py", edited)[0].output == BASE["src/app.py"].rstrip("\n")
+    assert _run("git show HEAD:src/app.py | head -1", edited)[0].output == "def main():"
+    assert _run("git show a1b2c3d:./README.md", edited)[0].output == "# demo"
+    missing = _run("git show HEAD:src/gone.py")[0]
+    assert (missing.output, missing.returncode) == (
+        "fatal: path 'src/gone.py' does not exist in 'HEAD'",
+        128,
+    )
+    created = _run("git show HEAD:notes.txt", CREATE)[0]
+    assert created.output == "fatal: path 'notes.txt' exists on disk, but not in 'HEAD'"
+    assert _run("git show HEAD:src/gone.py 2>/dev/null")[0].output == ""
+    assert isinstance(_run("git show HEAD~1:src/app.py")[0], ParseFailure)
+
+
+def test_the_simulator_is_told_git_show_of_a_file_is_its_text_not_a_commit():
+    from repo_context_service.git_sim import explain_git
+
+    overlay = build_overlay([], LISTING, _read_base)
+    note = explain_git("git show HEAD:src/app.py | awk '/main/'", overlay, LISTING, _read_base)
+    assert "prints the text of that file" in note and "commit header" in note
+
+
+def test_the_one_served_commit_of_a_mirror_is_shown_with_its_real_header():
+    """A swesmith mirror is served as one upstream commit: the simulator gets the header git
+    prints for it and is told it is a root commit, so it neither invents a history nor an author."""
+    from repo_context_service.git_sim import explain_git, root_commit_header
+
+    header = root_commit_header(
+        {
+            "sha": META.sha,
+            "subject": "Reduce default LM retries to 3",
+            "author": "Jane Doe <jane@example.com>",
+            "date": "2025-01-03T20:00:00Z",
+            "body": "",
+        }
+    )
+    assert header == (
+        f"commit {META.sha}",
+        "Author: Jane Doe <jane@example.com>",
+        "Date:   Fri Jan 3 20:00:00 2025 +0000",
+        "",
+        "    Reduce default LM retries to 3",
+    )
+    meta = replace(META, root_header=header)
+    overlay = build_overlay([], LISTING, _read_base)
+    shown = explain_git("git show a1b2c3d", overlay, LISTING, _read_base, meta)
+    assert "exactly ONE commit" in shown and "Author: Jane Doe <jane@example.com>" in shown
+    logged = explain_git("git log -p -S main -- src/app.py", overlay, LISTING, _read_base, meta)
+    assert "lists that commit and no other" in logged and "Reduce default LM" in logged
+
+
+def test_a_log_whose_refs_are_unknown_still_gives_the_simulator_the_history():
+    """Where it is not known whether git prints `(HEAD)` beside a commit, the history is still
+    shown bare, so a `git log -5` is not left to invent four commits; a directory pathspec and a
+    `git log -p` are given the commit list too."""
+    from repo_context_service.git_sim import git_evidence
+
+    meta = replace(META, abbrev=None, decorate=None, detached=True, history=lambda path: HISTORY)
+    overlay = build_overlay([], LISTING, _read_base)
+    evidence = git_evidence("git log --oneline -5", overlay, _read_base, LISTING, meta)
+    assert "a1b2c3d Fix the parser\nbbbbbbb Start" in evidence and "(HEAD)" in evidence
+    scoped = git_evidence("git log --oneline -- src", overlay, _read_base, LISTING, meta)
+    assert "a1b2c3d Fix the parser" in scoped
+    patched = git_evidence("git log -p -S main -- src/app.py", overlay, _read_base, LISTING, meta)
+    assert "a1b2c3d Fix the parser" in patched and "one line per commit" in patched

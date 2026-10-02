@@ -29,7 +29,11 @@ def _drop_filters(args: list[str]) -> list[str]:
 
 
 def _relaxed(plan: GitPlan) -> GitPlan:
-    return GitPlan(sub=plan.sub, args=_drop_filters(plan.args), raw=plan.raw)
+    args = _drop_filters(plan.args)
+    if plan.sub == "log" and "--oneline" not in args:
+        # the commits a log in another format walks, one line each, are raw material for it
+        args = ["--oneline", *(arg for arg in args if not arg.startswith(("--format", "--pretty")))]
+    return GitPlan(sub=plan.sub, args=args, raw=plan.raw)
 
 
 def git_evidence(
@@ -44,6 +48,10 @@ def git_evidence(
     if unsure_abbrev:
         # shown at git's shortest length; which length this repository prints is not known
         meta = replace(meta, abbrev=DEFAULT_ABBREV)
+    unsure_refs = meta.decorate is None
+    if unsure_refs:
+        # whether git names refs beside a commit here is not known: show the commits bare
+        meta = replace(meta, decorate=False)
     fragments: list[str] = []
     for stage in git_stages(command):
         label = stage.text
@@ -71,6 +79,13 @@ def git_evidence(
             )
         if isinstance(result, ParseFailure) or not result.exact or not result.output:
             continue
+        if plan.sub == "log" and "--oneline" not in plan.args:
+            label += "   (listed one line per commit: print each in the command's own format)"
+        if unsure_refs and plan.sub == "log":
+            label += (
+                "   (shown without ref names: on a terminal git may print one beside the "
+                "checked-out commit, such as (HEAD))"
+            )
         if unsure_abbrev:
             label += (
                 f"   (short hashes shown with {DEFAULT_ABBREV} characters: git prints more in a "

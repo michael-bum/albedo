@@ -61,6 +61,9 @@ class GitMeta:
     tracking: str = ""
     history: object = None
     commit_patch: object = None
+    # the header `git show` prints for the one served commit of a swesmith mirror, a root
+    # commit whose patch adds every tracked file; () when it is not known
+    root_header: tuple[str, ...] = ()
 
     @property
     def short(self) -> str:

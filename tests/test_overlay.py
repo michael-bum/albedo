@@ -166,8 +166,9 @@ def test_a_git_read_redirected_out_of_the_repo_keeps_its_source_grounded():
     assert not outward.is_dirty(PATH)
     assert outward.opaque == []
 
+    # git reads the committed text, not the file the shell just truncated: it is restored
     inward = _sed(f"git show HEAD:{PATH} > {PATH}")
-    assert inward.is_dirty(PATH)
+    assert inward.read(PATH) == SOURCE
 
 
 def test_git_checkout_takes_back_a_sed_the_overlay_had_applied():

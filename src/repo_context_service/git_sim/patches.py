@@ -92,6 +92,31 @@ def commit_header(patch: dict) -> list[str]:
     return lines
 
 
+def root_commit_header(point: dict) -> tuple[str, ...]:
+    """The header `git show` prints for a commit GitHub describes (sha, subject, author, ISO
+    author date, body); () when the author or the date is missing."""
+    from datetime import datetime
+
+    try:
+        moment = datetime.fromisoformat(str(point.get("date") or "").replace("Z", "+00:00"))
+    except ValueError:
+        return ()
+    if not point.get("author") or moment.tzinfo is None:
+        return ()
+    body = [line.rstrip() for line in str(point.get("body") or "").split("\n")]
+    return tuple(
+        commit_header(
+            {
+                "sha": point["sha"],
+                "author": point["author"],
+                "date": f"{moment:%a %b} {moment.day} {moment:%H:%M:%S %Y} {moment:%z}",
+                "subject": point["subject"],
+                "body": body if any(body) else [],
+            }
+        )
+    )
+
+
 def reabbrev(diff: list[str], abbrev: int) -> list[str]:
     def shorten(match):
         old, new, tail = match.group(1), match.group(2), match.group(3)

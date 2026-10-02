@@ -92,6 +92,7 @@ _PATCH_NAME = ".albedo-commit.{key}.patch"
 _MAX_PATCH_CHARS = 400_000
 _NEGATIVE_TTL_SECONDS = 24 * 3600.0
 _TRANSIENT_TTL_SECONDS = 900.0
+_UPSTREAM_ABSENT_TTL_SECONDS = 7 * 24 * 3600.0
 _MAX_MEMBER_BYTES = 2 * 1024 * 1024
 _MAX_MEMBERS = 200_000
 _MAX_MISSING_PATHS = 10
@@ -485,6 +486,8 @@ def parse_instance(source: str, instance_id: str) -> RepoRef | None:
 
 _SMITH_MIRROR_OWNER = "swesmith"
 _SMITH_REMOVE_F2P_SUBJECT = "Remove F2P Tests"
+_SMITH_SQUASHED_SUBJECT = "Initial commit"
+_SMITH_PR_ID = re.compile(r"\.pr_(\d+)$")
 _SHA_RULE = 2
 
 
@@ -504,6 +507,20 @@ def _smith_env_is_bug_patch(ref: RepoRef, head: dict) -> bool:
         return False
     message = str((head.get("commit") or {}).get("message") or "")
     return message.startswith(_SMITH_REMOVE_F2P_SUBJECT) and bool(head.get("parents"))
+
+
+def _squashed_history(sha: str, subject: str = _SMITH_SQUASHED_SUBJECT) -> dict:
+    return {"commits": [{"sha": sha, "subject": subject}], "complete": True}
+
+
+def _smith_upstream(mirror_repo: str) -> tuple[str, str]:
+    owner, _, rest = mirror_repo.partition("__")
+    return owner, rest.rpartition(".")[0]
+
+
+def _names_mirrored_pr(subject: str, instance_id: str) -> bool:
+    match = _SMITH_PR_ID.search(instance_id or "")
+    return bool(match) and re.search(rf"#{match.group(1)}(?!\d)", subject) is not None
 
 
 def _read_cached_sha(path: Path) -> dict | None:
@@ -801,6 +818,7 @@ class RepoContextService:
         self.settings = settings
         self.cache_dir = Path(settings.cache_dir).expanduser()
         self._shas_dir = self.cache_dir / "shas"
+        self._upstream_dir = self.cache_dir / "upstream"
         self._snapshots_dir = self.cache_dir / "snapshots"
         self._client = httpx.Client(
             timeout=httpx.Timeout(60.0),
@@ -909,7 +927,7 @@ class RepoContextService:
         overlay.editor = scaffold.editor
         overlay.errors = scaffold.errors
         listing = overlay.listing()
-        meta = self.git_meta(snapshot, source, owner, repo, sha, scaffold)
+        meta = self.git_meta(snapshot, source, owner, repo, sha, scaffold, instance_id)
         command = first_bash_block(assistant_output)
         attested = attested_paths(messages)
         block, exact, returncode = self._build_repo_block(
@@ -1082,11 +1100,22 @@ class RepoContextService:
         repo: str,
         sha: str,
         scaffold: Scaffold = Scaffold(),
+        instance_id: str = "",
     ) -> GitMeta:
+        # a swesmith mirror's own history is the task's answer (`Bug Patch`, `Remove F2P Tests`):
+        # it is served as one commit, the upstream commit the mirror was built from when GitHub
+        # still has it and its subject does not name the mirrored PR
+        mirrored = owner == _SMITH_MIRROR_OWNER
+        shown_owner, shown_repo = _smith_upstream(repo) if mirrored else (owner, repo)
+        head, subject = sha, _SMITH_SQUASHED_SUBJECT
+        if mirrored:
+            point = self._upstream_point(shown_owner, shown_repo, repo.rpartition(".")[2])
+            if point is not None and not _names_mirrored_pr(point[1], instance_id):
+                head, subject = point
         return GitMeta(
-            sha=sha,
-            owner=owner,
-            repo=repo,
+            sha=head,
+            owner=shown_owner,
+            repo=shown_repo,
             # a squashed history is a local repository on the branch its upstream is named for
             branch=DEFAULT_BRANCH
             if scaffold.squashed
@@ -1096,9 +1125,62 @@ class RepoContextService:
             decorate=scaffold.decorate,
             squashed=scaffold.squashed,
             tracking=scaffold.tracking,
-            history=lambda path: self._commit_history(snapshot, owner, repo, sha, path),
-            commit_patch=lambda rev: self._commit_patch(snapshot, owner, repo, rev),
+            history=(
+                (lambda path: _squashed_history(head, subject))
+                if mirrored
+                else (lambda path: self._commit_history(snapshot, owner, repo, sha, path))
+            ),
+            commit_patch=(
+                None
+                if mirrored
+                else (lambda rev: self._served_patch(snapshot, owner, repo, sha, rev))
+            ),
         )
+
+    def _served_patch(
+        self, snapshot: Path, owner: str, repo: str, sha: str, rev: str
+    ) -> str | None:
+        served = [self._commit_history(snapshot, owner, repo, sha, None)]
+        served += [_read_json(path) for path in snapshot.glob(_HISTORY_NAME.format(key="*"))]
+        if not any(
+            entry["sha"].startswith(rev)
+            for payload in served
+            if isinstance(payload, dict)
+            for entry in payload.get("commits") or []
+        ):
+            return None
+        return self._commit_patch(snapshot, owner, repo, rev)
+
+    def _upstream_point(self, owner: str, repo: str, short: str) -> tuple[str, str] | None:
+        cache_path = self._upstream_dir / f"{_safe_name(owner)}__{_safe_name(repo)}__{short}.json"
+        cached = _read_json(cache_path)
+        if isinstance(cached, dict):
+            if cached.get("sha"):
+                return cached["sha"], cached["subject"]
+            absent = cached.get("kind") == "absent"
+            ttl = _UPSTREAM_ABSENT_TTL_SECONDS if absent else _TRANSIENT_TTL_SECONDS
+            if time.time() - float(cached.get("failed_at", 0)) < ttl:
+                return None
+        try:
+            data = self._github_json(f"/repos/{owner}/{repo}/commits/{short}")
+            full = str(data.get("sha") or "")
+            subject = str((data.get("commit") or {}).get("message") or "").split("\n")[0].strip()
+            if not (short and full.startswith(short) and subject):
+                raise _NotFound(f"{owner}/{repo}@{short}")
+        except Exception as exc:
+            kind = "absent" if _is_permanent_github_error(exc) else "transient"
+            logger.info(
+                "repo_context_upstream_point_unavailable repo={}/{} commit={} kind={} error={}",
+                owner,
+                repo,
+                short,
+                kind,
+                f"{type(exc).__name__}: {exc}",
+            )
+            _write_json_atomic(cache_path, {"sha": None, "failed_at": time.time(), "kind": kind})
+            return None
+        _write_json_atomic(cache_path, {"sha": full, "subject": subject})
+        return full, subject
 
     def _commit_patch(self, snapshot: Path, owner: str, repo: str, rev: str) -> str | None:
         cache_path = snapshot / _PATCH_NAME.format(key=_hashed(rev))

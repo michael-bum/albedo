@@ -41,7 +41,9 @@ async def _run_once(settings: ScoreBridgeClientSettings, *, headers: dict[str, s
         base_url=settings.judge_base_url.rstrip("/"),
         headers=judge_headers,
         timeout=httpx.Timeout(settings.request_timeout_seconds),
-        limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
+        limits=httpx.Limits(
+            max_connections=None, max_keepalive_connections=None, keepalive_expiry=2.0
+        ),
     ) as judge_client:
         async with wsproto(
             settings.remote_ws_url,
@@ -80,13 +82,7 @@ async def _handle_score_request(
             raise ValueError("score_request payload must be an object")
         if endpoint not in {"/score-batch", "/category-prep", "/simulate-observation"}:
             raise ValueError(f"unsupported score bridge endpoint: {endpoint}")
-        body = await _post_json_with_429_retry(
-            judge_client,
-            endpoint,
-            payload,
-            retry_count=settings.retry_count,
-            base_backoff_seconds=settings.retry_backoff_seconds,
-        )
+        body = await _post_json(settings, judge_client, endpoint, payload, request_id)
         await websocket.send(
             json.dumps({"type": "score_response", "request_id": request_id, "body": body})
         )
@@ -103,6 +99,44 @@ async def _handle_score_request(
                 }
             )
         )
+
+
+_TRANSPORT_ERRORS = (
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+    httpx.ConnectError,
+)
+
+
+async def _post_json(
+    settings: ScoreBridgeClientSettings,
+    judge_client: httpx.AsyncClient,
+    endpoint: str,
+    payload: dict[str, Any],
+    request_id: str,
+) -> dict[str, Any]:
+    """The judge's answer, asked again once on a fresh connection when the first connection
+    dropped. A request the judge did receive is then done twice, which costs one batch of judge
+    calls; failing it would cost the whole evaluation run."""
+    for attempt in range(2):
+        try:
+            return await _post_json_with_429_retry(
+                judge_client,
+                endpoint,
+                payload,
+                retry_count=settings.retry_count,
+                base_backoff_seconds=settings.retry_backoff_seconds,
+            )
+        except _TRANSPORT_ERRORS as exc:
+            if attempt:
+                raise
+            logger.warning(
+                f"[score-bridge-client] judge connection dropped request_id={request_id} "
+                f"endpoint={endpoint}: {type(exc).__name__}: {exc}; retrying once"
+            )
+            await asyncio.sleep(0.5)
+    raise AssertionError("unreachable")
 
 
 async def _post_json_with_429_retry(

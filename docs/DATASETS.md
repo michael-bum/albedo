@@ -113,7 +113,13 @@ resolves each turn in this order:
    - `command_search.py` executes `find` / `grep` / `ls` / `sed` / `cat` and friends — BRE→Python
      translation, `-prune`/`-o` rewriting, `-name`/`-iname`/`-path`, POSIX classes, `2>/dev/null`.
    - `git_sim/` executes a subset of `git` (log, show, diff, status, branch…) against the snapshot,
-     including patch/diff rendering and a session view of the working tree.
+     including patch/diff rendering and a session view of the working tree. `git show <sha>` only
+     renders commits from the history already served for the task. A swesmith mirror's history is
+     served as a single commit with no parent and no commit patches, because its `Bug Patch` and
+     `Remove F2P Tests` commits are the answer and the hidden tests. That commit is the upstream
+     commit the mirror was built from (real sha and subject, cached under `<cache>/upstream/`); it
+     falls back to the mirror head as `Initial commit` when GitHub no longer has that commit or, for
+     a `pr_<N>` task, when its subject names `#N`. `git remote -v` names the upstream repository.
    - `overlay.py` keeps an in-memory write overlay, so the candidate's *own* edits — including full
      `sed -i` emulation — are visible to its later reads.
 

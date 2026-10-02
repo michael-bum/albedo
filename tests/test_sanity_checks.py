@@ -327,14 +327,16 @@ _CURSED_RAW_WITH_CODE = (
 )
 
 
-def test_heuristics_passes_cursed_think_output():
+def test_heuristics_fail_a_think_block_that_never_closes_without_a_command():
+    """The worker hands such a turn on as its notice, and the heuristics judge the turn as the
+    worker's `_strip_thinking` reads it, so the raw text fails the same way the notice does."""
     responses = [
         _CURSED_RAW_WITH_CODE,
         "<think>\nTHOUGHT: read the file first\nACTION: cat pkg/version/version.go\n",
         "<think>\nTHOUGHT: verify the change\nACTION: grep VERSION pkg/version/version.go\n",
     ]
     out = _heuristics(responses, _req())
-    assert all(v["passed"] for v in out), out
+    assert all(v["reason"] == "response contains an unclosed think block" for v in out), out
 
 
 def test_heuristics_empty_vllm_still_fails():
@@ -423,6 +425,24 @@ def test_run_prompts_keeps_the_reasoning_the_way_eval_stores_it(monkeypatch):
 
     out = asyncio.run(engine._run_prompts("model-name", ["prompt"], 77))
     assert out == [raw]
+
+
+def test_simulator_transcript_shows_assistant_turns_as_their_command_like_eval():
+    transcript = sanity_dispatcher._simulation_transcript(
+        messages=[
+            {"role": "user", "content": "task"},
+            {
+                "role": "assistant",
+                "content": "weighing options\n</think>\nTHOUGHT: a\n```bash\nls\n```",
+            },
+            {"role": "user", "content": "a.py"},
+        ],
+        prompt="task",
+        assistant_output="more weighing\n</think>\n\nTHOUGHT: b\n```bash\ncat a.py\n```",
+    )
+    assert "weighing" not in transcript and "THOUGHT" not in transcript
+    assert "### assistant\n```bash\nls\n```" in transcript
+    assert transcript.endswith("### assistant\n```bash\ncat a.py\n```")
 
 
 def test_heuristics_judge_the_answer_without_its_reasoning():

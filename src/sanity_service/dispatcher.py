@@ -1611,8 +1611,18 @@ def _simulation_transcript(
         role = str(message.get("role") or "user").lower()
         if role not in {"system", "user", "assistant"}:
             role = "user"
-        sections.append(f"### {role}\n{str(message.get('content') or '').rstrip()}")
+        content = str(message.get("content") or "").rstrip()
+        if role == "assistant":
+            content = _command_only(content)
+        sections.append(f"### {role}\n{content}")
     return "\n\n".join(sections).rstrip()
+
+
+def _command_only(text: str) -> str:
+    """The turn as the command the environment runs, as judge_api shows it to the simulator: the
+    model's reasoning and prose never reach it."""
+    script = first_bash_script(text)
+    return f"```bash\n{script.strip()}\n```" if script else text
 
 
 def _evaluator_provider(settings: JudgeSettings) -> dict[str, Any]:

@@ -13,12 +13,12 @@ def _overlay(command: str, observation: str, base: str = TRUE):
         {"role": "assistant", "content": f"```bash\n{command}\n```"},
         {"role": "user", "content": observation},
     ]
-    return build_overlay(messages, [PATH], {"big.py": PATH}, lambda rel: base)
+    return build_overlay(messages, [PATH], lambda rel: base)
 
 
 def _overlay_from(assistant_texts: list[str]):
     messages = [{"role": "assistant", "content": text} for text in assistant_texts]
-    return build_overlay(messages, [PATH], {"big.py": PATH}, lambda rel: TRUE)
+    return build_overlay(messages, [PATH], lambda rel: TRUE)
 
 
 def _search_replace(path: str, old: str, new: str) -> str:
@@ -37,10 +37,6 @@ def _returncode_clip(text: str) -> str:
     )
 
 
-def test_an_intact_read_is_adopted():
-    assert _overlay("cat pkg/big.py", SMALL, base=SMALL).read(PATH) == SMALL
-
-
 def test_a_clipped_read_is_never_adopted():
     for observation in (
         _openhands_clip(TRUE),
@@ -55,7 +51,7 @@ def test_a_file_the_agent_wrote_enters_the_listing_with_its_content():
     overlay = _overlay_from([f"```bash\ncat <<'EOF' > test_x.py\n{body}\nEOF\n```"])
     assert overlay.created == {"test_x.py"}
     assert overlay.read("test_x.py") == body + "\n"
-    assert "test_x.py" in overlay.listing([PATH])
+    assert "test_x.py" in overlay.listing()
 
 
 def test_a_full_rewrite_clears_dirt():
@@ -73,11 +69,11 @@ def test_a_heredoc_does_not_mask_a_later_edit_in_the_same_turn():
     overlay = _overlay_from(
         [
             f"```bash\ncat <<'EOF' > {PATH}\nSEEDED\nEOF\n```",
-            f"```bash\ncat <<'EOF' > fresh.py\nX\nEOF\nsed -i 's/q/r/' {PATH}\n```",
+            f"```bash\ncat <<'EOF' > fresh.py\nX\nEOF\nsed -i 's/SEEDED/EDITED/' {PATH}\n```",
         ]
     )
     assert overlay.read("fresh.py") == "X\n"
-    assert overlay.is_dirty(PATH)
+    assert overlay.read(PATH) == "EDITED\n"
 
 
 SOURCE = "def go():\n    return tuple(x for x in o)\nSIZE = 1\nTAIL = 2\n"
@@ -85,7 +81,7 @@ SOURCE = "def go():\n    return tuple(x for x in o)\nSIZE = 1\nTAIL = 2\n"
 
 def _sed(command: str, base: str = SOURCE):
     messages = [{"role": "assistant", "content": f"```bash\n{command}\n```"}]
-    return build_overlay(messages, [PATH], {"big.py": PATH}, lambda rel: base)
+    return build_overlay(messages, [PATH], lambda rel: base)
 
 
 def test_an_in_place_sed_is_applied_rather_than_forgotten():
@@ -104,11 +100,26 @@ def test_an_in_place_sed_we_cannot_model_still_marks_the_file_dirty():
     for command in (
         f"sed -i '/SIZE/d' {PATH}",  # pattern address
         f"sed -i 's/SIZE = 1/&& extra/' {PATH}",  # backreference in the replacement
-        f"sed -i 's/SIZE = 1/SIZE = 2/' {PATH} && sed -i '3d' {PATH}",  # two edits, one path
     ):
         overlay = _sed(command)
         assert overlay.is_dirty(PATH), command
         assert overlay.read(PATH) is None, command
+
+
+def test_an_in_place_sed_is_applied_in_a_chain_a_pipe_and_before_a_missing_operand():
+    edited = SOURCE.replace("SIZE = 1", "SIZE = 2")
+    for command in (
+        f"sed -i 's/SIZE = 1/SIZE = 2/' {PATH} && python -m pytest tests/",
+        f"cd /testbed && sed -i -e 's/SIZE = 1/SIZE = 2/' {PATH} | head -1",
+        # GNU sed edits each operand in turn, and only then fails on the missing one
+        f"sed -i 's/SIZE = 1/SIZE = 2/' {PATH} other/mod.py",
+    ):
+        assert _sed(command).text(PATH) == edited, command
+    # a form the model does not reproduce leaves the file present with unknown text
+    unmodelled = _sed(f"sed -i '/SIZE/s/1/2/' {PATH}")
+    assert unmodelled.is_dirty(PATH) and unmodelled.kind(PATH) == "file"
+    # the script is not a file operand: `s/a/pkg/big.py/` names no file to forget
+    assert not _sed(f"sed -n 's/a/{PATH}/p' notes.txt").is_dirty(PATH)
 
 
 def test_several_expressions_in_one_sed_are_applied_in_order():
@@ -167,7 +178,7 @@ def test_git_checkout_takes_back_a_sed_the_overlay_had_applied():
         {"role": "assistant", "content": f"```bash\ngit checkout -- {PATH}\n```"},
         {"role": "user", "content": done},
     ]
-    overlay = build_overlay(messages, [PATH], {"big.py": PATH}, lambda rel: SOURCE)
+    overlay = build_overlay(messages, [PATH], lambda rel: SOURCE)
     assert overlay.read(PATH) == SOURCE
     assert not overlay.is_dirty(PATH)
 
@@ -178,7 +189,7 @@ def _git(*commands):
     for command in commands:
         messages.append({"role": "assistant", "content": f"```bash\n{command}\n```"})
         messages.append({"role": "user", "content": done})
-    return build_overlay(messages, [PATH], {"big.py": PATH}, lambda rel: SOURCE)
+    return build_overlay(messages, [PATH], lambda rel: SOURCE)
 
 
 def test_a_git_command_we_cannot_model_retires_every_key():
@@ -211,3 +222,114 @@ def test_a_heredoc_behind_a_relative_cd_is_left_untracked():
     overlay = _overlay_from(["```bash\ncd subdir && cat > x.py <<'EOF'\nprint(1)\nEOF\n```"])
     assert overlay.read("x.py") is None
     assert overlay.read("subdir/x.py") is None
+
+
+def test_a_heredoc_written_to_a_dot_slash_path_is_the_file_a_later_read_resolves():
+    overlay = _overlay_from([f"```bash\ncat <<'EOF' > ./{PATH}\nNEW\nEOF\n```"])
+    assert overlay.read(PATH) == "NEW\n"
+    assert PATH not in overlay.created
+
+
+def test_a_copy_from_outside_leaves_its_target_unknown_and_a_move_carries_the_text():
+    assert _overlay_from([f"```bash\ncp /tmp/fixed.py {PATH}\n```"]).is_dirty(PATH)
+    moved = _overlay_from([f"```bash\nmv {PATH} pkg/moved.py\n```"])
+    assert moved.kind(PATH) is None
+    assert moved.text("pkg/moved.py") == TRUE
+    backup = _overlay_from([f"```bash\ncp {PATH} {PATH}.bak\n```"])
+    assert backup.text(PATH) == backup.text(f"{PATH}.bak") == TRUE
+
+
+def test_a_search_replace_edit_is_applied_to_the_file():
+    old, new = "line_0003 = 3  # real source content here", "line_0003 = 33"
+    overlay = _overlay_from([_search_replace(PATH, old, new)])
+    assert overlay.read(PATH) == TRUE.replace(old, new)
+
+
+def test_an_editor_view_is_adopted_without_its_closing_line_number():
+    view = (
+        f"Here's the result of running `cat -n` on /workspace/repo/{PATH}:\n"
+        "     1\timport os\n     2\timport sys\n     3"
+    )
+    assert _overlay(f"cat -n {PATH}", view).text(PATH) == SMALL
+
+
+def _returncode(code: int, output: str = "") -> str:
+    return f"<returncode>{code}</returncode>\n<output>\n{output}</output>"
+
+
+def test_a_simulated_read_after_an_unfollowed_edit_is_never_adopted():
+    """Adopting what a simulated `cat` showed would make one wrong answer the file's text for
+    the rest of the session; only reads recorded on a real machine settle an unknown file."""
+    unfollowed = "perl -pi -e 's/line_/row_/' pkg/big.py"
+    messages = [
+        {"role": "assistant", "content": f"```bash\n{unfollowed}\n```"},
+        {"role": "user", "content": _returncode(0)},
+        {"role": "assistant", "content": "```bash\ncat pkg/big.py\n```"},
+        {"role": "user", "content": _returncode(0, SMALL)},
+    ]
+    assert build_overlay(messages, [PATH], lambda rel: TRUE, recorded=2).text(PATH) == SMALL
+    assert build_overlay(messages, [PATH], lambda rel: TRUE, recorded=1).text(PATH) is None
+
+
+def test_shell_code_is_not_replayed_and_leaves_what_it_may_change_unknown():
+    """Shell code run by `bash -c` or a script the session wrote is not replayed: a script that
+    calls itself must not recurse, and one that edits a file must not leave its old text."""
+    looping = _overlay_from(
+        ["```bash\nprintf 'bash loop.sh\\n' > loop.sh\n```", "```bash\nbash loop.sh\n```"]
+    )
+    assert looping.text(PATH) == TRUE
+    edited = _overlay(f"bash -c \"sed -i 's/line_/row_/' {PATH}\"", _returncode(0))
+    assert edited.text(PATH) is None
+
+
+def test_a_command_of_only_a_comment_is_replayed_without_failing():
+    """A turn whose command is only a comment runs nothing; failing on it would leave every
+    later turn of the session without grounding."""
+    overlay = _overlay(
+        "# look at the tests first", "<returncode>0</returncode>\n<output>\n</output>"
+    )
+    assert overlay.text(PATH) == TRUE
+
+
+def test_a_read_whose_first_line_is_indented_is_learned_with_its_indentation():
+    """Adopting a read without its first line's indentation would make every later exact
+    answer about the file wrong, in every scaffold's format."""
+    indented = "    return helper(x)\nprint(1)\n"
+    blank_first = "\n    x = 1\n"
+    messages = [
+        {"role": "assistant", "content": f"```bash\nperl -pi -e 's/a/b/' {PATH}\n```"},
+        {"role": "user", "content": "<returncode>0</returncode>\n<output>\n</output>"},
+        {"role": "assistant", "content": f"```bash\ncat {PATH}\n```"},
+        {
+            "role": "user",
+            "content": f"<returncode>0</returncode>\n<output>\n{blank_first}</output>",
+        },
+    ]
+    assert build_overlay(messages, [PATH], lambda rel: TRUE).text(PATH) == blank_first
+    for observation in (
+        f"<returncode>0</returncode>\n<output>\n{indented}</output>",
+        f"{indented}\n[The command completed with exit code 0.]\n"
+        "[Command finished with exit code 0]",
+    ):
+        messages = [
+            {"role": "assistant", "content": f"```bash\nperl -pi -e 's/a/b/' {PATH}\n```"},
+            {"role": "user", "content": "<returncode>0</returncode>\n<output>\n</output>"},
+            {"role": "assistant", "content": f"```bash\ncat {PATH}\n```"},
+            {"role": "user", "content": observation},
+        ]
+        assert build_overlay(messages, [PATH], lambda rel: TRUE).text(PATH) == indented
+
+
+def test_a_file_the_editor_created_holds_the_text_without_the_heredoc_line_break():
+    """A heredoc the openhands editor reports creating wrote the text exactly as given: a view
+    of the file numbers no empty line after its last one."""
+    messages = [
+        {"role": "assistant", "content": "```bash\ncat > new.py <<'EOF'\nx = 1\nEOF\n```"},
+        {"role": "user", "content": "File created successfully at: new.py"},
+    ]
+    assert build_overlay(messages, [PATH], lambda rel: TRUE).text("new.py") == "x = 1"
+    plain = [
+        messages[0],
+        {"role": "user", "content": "<returncode>0</returncode>\n<output>\n</output>"},
+    ]
+    assert build_overlay(plain, [PATH], lambda rel: TRUE).text("new.py") == "x = 1\n"

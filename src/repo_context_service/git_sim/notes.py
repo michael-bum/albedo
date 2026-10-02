@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from ..command_search import split_chain
 from .models import GitMeta, GitPlan, GitState
-from .parse import _GIT_HEAD, _SHORT_STATUS, _STASH_RESTORE, _subcommand_of, parse_git
-from .render import _head_line, _status_sets
-from .templates import DEFAULT_BRANCH, GIT_LEDGER_HEADER, UNCERTAIN_STATE_LINE
-from .views import _Views
+from .parse import GIT_HEAD, SHORT_STATUS, STASH_RESTORE, git_stages, parse_git, subcommand_of
+from .render import head_line, status_sets
+from .templates import DEFAULT_ABBREV, DEFAULT_BRANCH, GIT_LEDGER_HEADER, UNCERTAIN_STATE_LINE
+from .views import Views
 
 _EFFECT_LABELS = {
     "staged": "staged",
@@ -103,13 +102,13 @@ _NOTES = {
     "branch": (
         'git status in this checkout reports "{head}", and git branch must agree with that '
         "line — no other local branch exists.",
-        "Do not invent remote branches: this checkout has no remote-tracking refs.",
+        "{remotes}",
     ),
 }
 
 
-def _state_line(views: _Views, state: GitState) -> str:
-    staged, unstaged, untracked, uncertain = _status_sets(views)
+def _state_line(views: Views, state: GitState) -> str:
+    staged, unstaged, untracked, uncertain = status_sets(views)
     if state.unknown or uncertain:
         return UNCERTAIN_STATE_LINE
     return (
@@ -129,18 +128,15 @@ def _fmt_list(paths: list[str], limit: int = 6) -> str:
 def explain_git(
     command: str, overlay, listing: list[str], read_base, meta: GitMeta | None = None
 ) -> str:
-    if not _GIT_HEAD.search(command or ""):
+    if not GIT_HEAD.search(command or ""):
         return ""
-    stages = split_chain(command) or [command]
     subs: list[str] = []
-    for stage in stages:
-        if not _GIT_HEAD.search(stage):
-            continue
+    for stage in (stage.text for stage in git_stages(command)):
         plan = parse_git(stage)
-        sub = plan.sub if isinstance(plan, GitPlan) else _subcommand_of(stage)
-        if sub == "status" and _SHORT_STATUS.search(stage):
+        sub = plan.sub if isinstance(plan, GitPlan) else subcommand_of(stage)
+        if sub == "status" and SHORT_STATUS.search(stage):
             sub = "status_short"
-        elif sub == "stash" and _STASH_RESTORE.search(stage):
+        elif sub == "stash" and STASH_RESTORE.search(stage):
             sub = "stash_pop"
         if sub in _NOTES and sub not in subs:
             subs.append(sub)
@@ -148,9 +144,14 @@ def explain_git(
         return ""
     meta = meta or GitMeta()
     state = getattr(overlay, "git", None) or GitState()
-    views = _Views(overlay, state, read_base, listing, state.abbrev or meta.abbrev)
+    views = Views(overlay, state, read_base, listing, state.abbrev or meta.abbrev or DEFAULT_ABBREV)
     values = {
-        "head": _head_line(views, meta),
+        "head": head_line(views, meta),
+        "remotes": (
+            "Its one remote-tracking ref is origin/main, one commit apart from main each way."
+            if meta.tracking
+            else "Do not invent remote branches: this checkout has no remote-tracking refs."
+        ),
         "short": state.head_short or meta.short or "the checked-out commit",
         "state_line": _state_line(views, state),
         "stash_depth": str(len(state.stash)),

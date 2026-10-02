@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import random
-import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -67,7 +66,7 @@ from .judge_core import (
 )
 from .judge_llm_client import JudgeLLMClient, JudgeRawResponse
 from .remote.generation import format_scored_trajectory
-from .repo_context_client import Grounding, RepoContextClient
+from .repo_context_client import Grounding, RepoContextClient, stitch_parts
 from .shared.edit_detection import any_shows_work, named_in_removal
 from .shared.json_extract import extract_json
 from .shared.loop_check import LoopVerdict, loop_explanation, loop_verdict_for_document
@@ -77,8 +76,10 @@ from .shared.observation_format import (
     CommandContract,
     absent_tool_output,
     canonical_empty,
+    cap_last_stage,
     claims_tracked_change,
     command_contract,
+    command_stages,
     contract_violation,
     correct_returncode,
     degenerate_observation,
@@ -96,6 +97,8 @@ from .shared.observation_format import (
     leaked_turn,
     narrated_observation,
     no_output_notice,
+    observation_body,
+    observed_returncode,
     output_expectation,
     pipeline_returncode_override,
     prints_nothing_on_success,
@@ -868,22 +871,10 @@ class ObservationSimulationService:
         if missing_patch:
             return wrap(missing_patch, fmt, returncode=1)
         absent = absent_tool_output(command)
-        if absent is not None:
-            body, returncode = absent
-            # a refusal reached through a head/tail pipe still exits with the filter's code, so
-            # the shape has to be settled here: this path returns before correct_returncode runs
-            override = pipeline_returncode_override(command)
-            if override is not None:
-                returncode = override
-            logger.info(
-                "observation_simulation_absent_tool eval_run_id={} sample_id={} command={!r}",
-                request.eval_run_id,
-                request.sample_id,
-                command[:80],
-            )
-            return wrap(body, fmt, returncode=returncode)
         resolved = Grounding(None, None, None, "")
-        if self.repo_context is not None:
+        # a chain goes to grounding even when one stage is a canned tool: grounding answers that
+        # stage itself, and the stages around it still print
+        if self.repo_context is not None and (absent is None or len(command_stages(command)) > 1):
             resolved = await self.repo_context.context_for(
                 request.sample_id, request.assistant_output, request.messages
             )
@@ -896,8 +887,6 @@ class ObservationSimulationService:
                 fmt, exact_output, exact_returncode, command, request.messages
             )
             if observation is not None:
-                # a computed status still passes the shape check: only the last stage of a
-                # pipeline owns the exit code, and a read failure fixes it regardless
                 observation = correct_returncode(observation, fmt, command)
                 logger.info(
                     "observation_simulation_exact eval_run_id={} sample_id={} fmt={} chars={}",
@@ -916,9 +905,30 @@ class ObservationSimulationService:
                 exact_returncode,
                 command[:80],
             )
+        if absent is not None:
+            body, returncode = absent
+            # a refusal reached through a head/tail pipe still exits with the filter's code, so
+            # the shape has to be settled here: this path returns before correct_returncode runs
+            override = pipeline_returncode_override(command)
+            if override is not None:
+                returncode = override
+            logger.info(
+                "observation_simulation_absent_tool eval_run_id={} sample_id={} command={!r}",
+                request.eval_run_id,
+                request.sample_id,
+                command[:80],
+            )
+            return wrap(body, fmt, returncode=returncode)
         if not state:
             return await self._simulate_uncached(
-                request, command, fmt, context_block, exact_output, exact_returncode
+                request,
+                command,
+                fmt,
+                context_block,
+                exact_output,
+                exact_returncode,
+                resolved.leading_output,
+                resolved.parts,
             )
         key = hashlib.sha1(
             "\0".join((request.sample_id, fmt, state, command)).encode("utf-8", "replace")
@@ -926,10 +936,60 @@ class ObservationSimulationService:
         return await self._observe(
             key,
             lambda: self._simulate_uncached(
-                request, command, fmt, context_block, exact_output, exact_returncode
+                request,
+                command,
+                fmt,
+                context_block,
+                exact_output,
+                exact_returncode,
+                resolved.leading_output,
+                resolved.parts,
             ),
             store=lambda observation: _cacheable_observation(observation, fmt, command),
         )
+
+    async def _simulate_parts(
+        self, request: SimulateObservationRequest, command: str, fmt: str, parts: list[dict]
+    ) -> str | None:
+        """The observation for a command the repository answers in part: the exact parts and the
+        gaps run as the shell runs them, each gap that runs simulated on its own with its own
+        context (see `stitch_parts`). None, so the command is simulated whole, when a gap's
+        simulated exit status is not known where it decides what runs, or when the scaffold's
+        wrapper for the stitched output cannot be derived."""
+        simulated: list[str] = []
+
+        async def answer(gap: dict) -> tuple[str, int | None]:
+            raw = await self._simulate_uncached(
+                request.model_copy(update={"assistant_output": f"```bash\n{gap['command']}\n```"}),
+                gap["command"],
+                fmt,
+                gap["context"],
+                None,
+            )
+            simulated.append(gap["command"])
+            return observation_body(raw, fmt), observed_returncode(raw)
+
+        stitched = await stitch_parts(parts, answer)
+        if stitched is None:
+            logger.info(
+                "observation_simulation_parts_undecided eval_run_id={} sample_id={} gap={!r}",
+                request.eval_run_id,
+                request.sample_id,
+                simulated[-1][:80],
+            )
+            return None
+        text, returncode = stitched
+        observation = grounded_observation(fmt, text, returncode, command, request.messages)
+        if observation is None:
+            return None
+        logger.info(
+            "observation_simulation_stitched eval_run_id={} sample_id={} parts={} gaps={}",
+            request.eval_run_id,
+            request.sample_id,
+            len(parts),
+            len(simulated),
+        )
+        return correct_returncode(observation, fmt, command)
 
     async def _simulate_uncached(
         self,
@@ -939,7 +999,13 @@ class ObservationSimulationService:
         context_block: str | None,
         exact_output: str | None,
         exact_returncode: int | None = None,
+        leading_output: str | None = None,
+        parts: list[dict] | None = None,
     ) -> str:
+        if parts:
+            stitched = await self._simulate_parts(request, command, fmt, parts)
+            if stitched is not None:
+                return stitched
         computed = bool(context_block) and context_block.lstrip().startswith(COMPUTED_BLOCK_MARKER)
         transcript = (
             f"$ {command}"
@@ -1108,6 +1174,7 @@ class ObservationSimulationService:
                 )
                 observation = without_tracked_changes(observation, fmt)
         observation = renumbered_view(command, observation)
+        observation = cap_last_stage(observation, fmt, command, leading_output)
         if (
             require_content
             and exact_output is None
@@ -1371,14 +1438,11 @@ async def _questions_for(
     return await prep_store.service.prepare(sample)
 
 
-_COMMAND_BLOCK_RE = re.compile(r"```(?:bash|sh)?[ \t]*\n(.*?)```", re.DOTALL)
-
-
 def _command_only(text: str) -> str:
-    match = _COMMAND_BLOCK_RE.search(text or "")
-    if match:
-        return f"```bash\n{match.group(1).strip()}\n```"
-    return text
+    """The turn as the command the environment runs: the block simulate() extracts, so the
+    simulator is never shown a code snippet from the reasoning in its place."""
+    command = first_bash_block(text)
+    return f"```bash\n{command.strip()}\n```" if command else text
 
 
 def _simulation_transcript(

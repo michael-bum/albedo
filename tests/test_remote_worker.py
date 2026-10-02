@@ -809,7 +809,9 @@ def test_prefetch_repo_context_fires_only_when_configured(monkeypatch):
     assert recorded["json"] == {"sample_ids": ["data/train-00000.parquet:0:0"]}
 
     posted.clear()
-    disabled = RemoteEvalWorker(RemoteSettings(upload_artifacts=False, scoring_backend="mock"))
+    disabled = RemoteEvalWorker(
+        RemoteSettings(repo_context_url="", upload_artifacts=False, scoring_backend="mock")
+    )
     disabled._prefetch_repo_context(_request(), samples)
     assert not posted.wait(0.2)
 

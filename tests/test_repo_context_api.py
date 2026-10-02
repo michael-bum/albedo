@@ -53,6 +53,8 @@ def test_repo_context_happy_path():
         "exact_output": None,
         "exact_returncode": None,
         "state": "",
+        "leading_output": None,
+        "parts": None,
     }
 
 
@@ -67,6 +69,8 @@ def test_repo_context_returns_none_kind_on_failure():
         "exact_output": None,
         "exact_returncode": None,
         "state": "",
+        "leading_output": None,
+        "parts": None,
     }
 
 

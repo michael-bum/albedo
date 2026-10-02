@@ -1,65 +1,12 @@
 from __future__ import annotations
 
-from copy import deepcopy
+from dataclasses import replace
 
-from ..command_search import ParseFailure, parse_search, run_search
+from ..command_search import ParseFailure
 from .execute import run_git
-from .models import GitMeta, GitPlan, GitResult
-from .parse import _CD_ONLY, _GIT_HEAD, chain_stages, mutation_stages, parse_git
-from .session import apply_git
-from .templates import GIT_EVIDENCE_HEADER
-
-
-def run_git_chain(
-    cmd: str,
-    overlay,
-    read_base,
-    listing: list[str],
-    meta: GitMeta | None = None,
-    file_text=None,
-    file_size=None,
-) -> GitResult | ParseFailure:
-    stages = chain_stages(cmd)
-    if stages is None:
-        return ParseFailure("unsupported_shell", "control operators")
-    if not any(_GIT_HEAD.search(stage) for stage in stages):
-        return ParseFailure("not_git", "no git stage")
-    working = deepcopy(overlay)
-    read_work = (lambda rel: file_text(working, rel)) if file_text else None
-    size_work = (lambda rel: file_size(working, rel)) if file_size else None
-    parts: list[str] = []
-    returncode = 0
-    for stage in stages:
-        text = stage.strip()
-        if _CD_ONLY.match(text):
-            continue
-        if _GIT_HEAD.search(text):
-            plan = parse_git(text)
-            if isinstance(plan, ParseFailure):
-                return plan
-            result = run_git(plan, working, read_base, listing, meta)
-            if isinstance(result, ParseFailure):
-                return result
-            if not result.exact:
-                return ParseFailure("unsupported_form", "git content unknown")
-            if result.output:
-                parts.append(result.output)
-            returncode = result.returncode
-            if returncode:
-                break
-            apply_git(working, text, "", listing, read_base)
-            continue
-        if read_work is None:
-            return ParseFailure("unsupported_form", "chain stage not executable")
-        plan = parse_search(text)
-        if isinstance(plan, ParseFailure):
-            return plan
-        result = run_search(plan, read_work, listing, size_file=size_work)
-        if isinstance(result, ParseFailure) or result.empty or result.incomplete or result.missing:
-            return ParseFailure("unsupported_form", "chain stage output unknown")
-        parts.append(result.output)
-    return GitResult(output="\n".join(parts), returncode=returncode, empty=not parts)
-
+from .models import GitMeta, GitPlan
+from .parse import GIT_HEAD, git_stages, parse_git
+from .templates import DEFAULT_ABBREV, GIT_EVIDENCE_HEADER
 
 _RELAXABLE = {"--all", "--graph", "--decorate", "--no-merges", "-p", "--patch", "-i", "--follow"}
 _RELAXABLE_PREFIX = ("--grep", "--since", "--until", "--author", "--committer", "-S", "-G")
@@ -85,31 +32,27 @@ def _relaxed(plan: GitPlan) -> GitPlan:
     return GitPlan(sub=plan.sub, args=_drop_filters(plan.args), raw=plan.raw)
 
 
-def _before_pipe(stage: str) -> str:
-    from ..command_search import _split_top_level_pipes
-
-    return _split_top_level_pipes(stage)[0].strip()
-
-
 def git_evidence(
     command: str, overlay, read_base, listing: list[str], meta: GitMeta | None = None
 ) -> str:
-    if not _GIT_HEAD.search(command or ""):
+    if not GIT_HEAD.search(command or ""):
         return ""
     meta = meta or GitMeta()
-    stages = chain_stages(command) or mutation_stages(command)
+    unsure_abbrev = meta.abbrev is None and not getattr(
+        getattr(overlay, "git", None), "abbrev", None
+    )
+    if unsure_abbrev:
+        # shown at git's shortest length; which length this repository prints is not known
+        meta = replace(meta, abbrev=DEFAULT_ABBREV)
     fragments: list[str] = []
-    for stage in stages:
-        if not _GIT_HEAD.search(stage):
-            continue
-        label = stage.strip()
-        plan = parse_git(stage)
+    for stage in git_stages(command):
+        label = stage.text
+        plan = parse_git(stage.text)
         partial = False
         if isinstance(plan, ParseFailure):
-            head = _before_pipe(stage)
-            if head == stage.strip():
+            if len(stage.pipeline) == 1:
                 continue
-            plan = parse_git(head)
+            plan = parse_git(stage.command.text)
             if isinstance(plan, ParseFailure):
                 continue
             partial = True
@@ -128,6 +71,11 @@ def git_evidence(
             )
         if isinstance(result, ParseFailure) or not result.exact or not result.output:
             continue
+        if unsure_abbrev:
+            label += (
+                f"   (short hashes shown with {DEFAULT_ABBREV} characters: git prints more in a "
+                "larger repository, so keep the prefixes and choose their length)"
+            )
         fragments.append(f"$ {label}\n{result.output}")
     if not fragments:
         return ""

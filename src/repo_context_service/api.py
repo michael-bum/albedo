@@ -25,6 +25,8 @@ class RepoContextResponse(BaseModel):
     exact_output: str | None = None
     exact_returncode: int | None = None
     state: str = ""
+    leading_output: str | None = None
+    parts: list[dict] | None = None
 
 
 class PrefetchRequest(BaseModel):
@@ -90,6 +92,8 @@ def create_app(
             exact_output=result.exact_output,
             exact_returncode=result.exact_returncode,
             state=result.state,
+            leading_output=result.leading_output,
+            parts=result.parts,
         )
 
     return app

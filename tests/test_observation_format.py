@@ -10,6 +10,7 @@ from albedo_eval_service.shared.observation_format import (
     TRUNCATION_SENTINEL,
     absent_tool_output,
     classify,
+    command_chain,
     command_contract,
     command_stages,
     contract_violation,
@@ -371,7 +372,7 @@ def test_openhands_reuses_the_trailer_block_its_own_session_prints():
     assert grounded_observation(OPENHANDS, "README.md", 0, "grep -rn x src/", None) is None
 
 
-def test_openhands_declines_when_the_command_moves_the_working_directory():
+def test_openhands_follows_an_absolute_cd_and_declines_a_move_it_cannot_spell():
     # a cd into the directory the session already reports leaves the trailer correct
     stays = grounded_observation(
         OPENHANDS,
@@ -381,9 +382,17 @@ def test_openhands_declines_when_the_command_moves_the_working_directory():
         OPENHANDS_SESSION,
     )
     assert stays is not None and "[Current working directory: /workspace/o__r__1.0]" in stays
-    # any real move lands somewhere this cannot spell
-    for command in ("cd /tmp/scratch && grep -rn x src/", "cd sub && grep -rn x src/"):
-        assert grounded_observation(OPENHANDS, "README.md", 0, command, OPENHANDS_SESSION) is None
+    # an absolute target states exactly where the session lands, so the trailer is rewritten to
+    # it rather than the whole observation being thrown away
+    moved = grounded_observation(
+        OPENHANDS, "README.md", 0, "cd /tmp/scratch && grep -rn x src/", OPENHANDS_SESSION
+    )
+    assert moved is not None and "[Current working directory: /tmp/scratch]" in moved
+    # a relative hop names a directory only the session itself could resolve
+    relative = grounded_observation(
+        OPENHANDS, "README.md", 0, "cd sub && grep -rn x src/", OPENHANDS_SESSION
+    )
+    assert relative is None
 
 
 def test_a_numbered_read_renders_as_an_openhands_view_with_no_trailer():
@@ -442,6 +451,26 @@ def test_a_command_after_a_heredoc_terminator_is_its_own_stage():
     # the run prints, so the pair is not silent on success even though the write alone would be
     assert not prints_nothing_on_success(write_then_run)
     assert prints_nothing_on_success("cat <<'EOF' > /tmp/t.py\nprint(1)\nEOF")
+
+
+def test_a_command_after_the_heredoc_opener_on_its_line_is_its_own_stage():
+    # the body starts on the next line, so `&& python3 a.py` is shell, not heredoc data, and the
+    # body stays with the `cat` that writes it
+    write_then_run = "cat <<'EOF' > a.py && python3 a.py\nprint(1)\nEOF"
+    assert command_chain(write_then_run) == [
+        ("", "cat <<'EOF' > a.py\nprint(1)\nEOF"),
+        ("&&", "python3 a.py"),
+    ]
+    assert not prints_nothing_on_success(write_then_run)
+    # each of two heredocs opened on one line reads its own body, in order
+    assert command_stages("cat <<A > a && cat <<B > b\n1\nA\n2\nB") == [
+        "cat <<A > a\n1\nA",
+        "cat <<B > b\n2\nB",
+    ]
+    # a separator inside the body is still data
+    assert command_stages("cat > a.py <<'EOF'\nx = 1; y = 2\nEOF") == [
+        "cat > a.py <<'EOF'\nx = 1; y = 2\nEOF"
+    ]
 
 
 def test_a_heredoc_alone_is_not_a_silent_write():
@@ -534,6 +563,20 @@ def test_a_chain_ending_in_a_named_read_must_print():
     # a redirect or heredoc anywhere still means the chain may be silent
     assert output_expectation("grep x src && sed -n '1,5p' a.py > out.txt") != MUST_PRINT
     assert output_expectation("python3 - <<'EOF'\nprint(1)\nEOF") != MUST_PRINT
+
+
+def test_a_git_read_that_found_nothing_is_never_turned_into_a_missing_git():
+    """`git diff` on a clean tree prints nothing: an empty answer is kept, not replaced by the
+    failure notice for a program the environment lacks (`bash: git: command not found`)."""
+    from albedo_eval_service.shared.observation_format import MAY_BE_SILENT, output_expectation
+
+    for command in (
+        "git diff",
+        "git diff --cached",
+        "cd /testbed && git diff HEAD",
+        "git ls-files x",
+    ):
+        assert output_expectation(command) == MAY_BE_SILENT, command
 
 
 def test_a_reply_with_more_than_one_command_is_unusable_like_the_bench():

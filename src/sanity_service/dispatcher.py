@@ -16,7 +16,7 @@ from loguru import logger
 
 from albedo_config import JudgeSettings, SanitySettings, get_judge_settings, get_sanity_settings
 from albedo_eval_service.remote.dataset import format_messages
-from albedo_eval_service.repo_context_client import Grounding, RepoContextClient
+from albedo_eval_service.repo_context_client import Grounding, RepoContextClient, stitch_parts
 from albedo_eval_service.shared.edit_detection import REMOVAL_RE as _REMOVAL_RE
 from albedo_eval_service.shared.edit_detection import named_in_removal
 from albedo_eval_service.shared.observation_format import (
@@ -24,8 +24,10 @@ from albedo_eval_service.shared.observation_format import (
     absent_tool_output,
     action_blocks,
     canonical_empty,
+    cap_last_stage,
     claims_tracked_change,
     command_contract,
+    command_stages,
     correct_returncode,
     degenerate_observation,
     deleted_files,
@@ -37,6 +39,8 @@ from albedo_eval_service.shared.observation_format import (
     impossible_success,
     leaked_turn,
     narrated_observation,
+    observation_body,
+    observed_returncode,
     pipeline_returncode_override,
     prints_nothing_on_success,
     renumbered_view,
@@ -1303,7 +1307,10 @@ async def _simulate_observation_uncached(
     state: _TrajectoryState,
     assistant_output: str,
     repo_context: RepoContextClient | None = None,
+    grounding: Grounding | None = None,
 ) -> str:
+    """`grounding` stands in for the repository's answer when the caller already holds it: the
+    context of one gap of a command answered in parts (see `_simulate_parts`)."""
     sample_id, prompt, messages = state.sample_id, state.prompt, state.messages
     fmt = detect_format(sample_id, messages)
     command = first_bash_command(assistant_output)
@@ -1315,25 +1322,12 @@ async def _simulate_observation_uncached(
 
     # tools the bench image cannot reach answer the same way every time, so the answer is settled
     # here rather than asked for: an inconsistent one has the model retrying pip instead of
-    # working the task. Runs before grounding, which cannot speak to an absent tool either.
+    # working the task. A chain still goes to grounding, which answers the canned stage itself
+    # while the stages around it print (mirrors judge_api's ObservationSimulationService.simulate)
     absent = absent_tool_output(command)
-    if absent is not None:
-        body, returncode = absent
-        # a refusal reached through a head/tail pipe still exits with the filter's code, so the
-        # shape has to be settled here: this path returns before correct_returncode runs
-        override = pipeline_returncode_override(command)
-        if override is not None:
-            returncode = override
-        logger.info(
-            "[sanity-dispatch] observation_simulation_absent_tool sample_id={} rc={} command={!r}",
-            sample_id,
-            returncode,
-            command[:80],
-        )
-        return wrap(body, fmt, returncode=returncode)
-
-    resolved = Grounding(None, None, None, "")
-    if repo_context is not None:
+    resolved = grounding or Grounding(None, None, None, "")
+    chained = absent is None or len(command_stages(command)) > 1
+    if grounding is None and repo_context is not None and chained:
         resolved = await repo_context.context_for(sample_id, assistant_output, messages)
 
     # exact tier: computed against the real snapshot, so it is returned unsimulated and ungated.
@@ -1351,6 +1345,32 @@ async def _simulate_observation_uncached(
                 len(observation),
             )
             return observation
+    if resolved.parts:
+        stitched = await _simulate_parts(
+            client=client,
+            settings=settings,
+            eval_run_id=eval_run_id,
+            state=state,
+            command=command,
+            fmt=fmt,
+            parts=resolved.parts,
+        )
+        if stitched is not None:
+            return stitched
+    if absent is not None:
+        body, returncode = absent
+        # a refusal reached through a head/tail pipe still exits with the filter's code, so the
+        # shape has to be settled here: this path returns before correct_returncode runs
+        override = pipeline_returncode_override(command)
+        if override is not None:
+            returncode = override
+        logger.info(
+            "[sanity-dispatch] observation_simulation_absent_tool sample_id={} rc={} command={!r}",
+            sample_id,
+            returncode,
+            command[:80],
+        )
+        return wrap(body, fmt, returncode=returncode)
 
     # context tier: a computed block means the answer is already known, so the simulator is asked
     # to transcribe it against the bare command rather than improvise from the transcript
@@ -1473,6 +1493,7 @@ async def _simulate_observation_uncached(
             )
             observation = corrected
     observation = repair_to_contract(observation, fmt, command_contract(command))
+    observation = cap_last_stage(observation, fmt, command, resolved.leading_output)
     observation = renumbered_view(command, canonical_empty(observation, fmt))
     # a return code the shell could not have produced, on simulated output as well as exact
     observation = correct_returncode(observation, fmt, command)
@@ -1492,6 +1513,56 @@ async def _simulate_observation_uncached(
             observation=observation,
         )
     return observation
+
+
+async def _simulate_parts(
+    *,
+    client: Any,
+    settings: JudgeSettings,
+    eval_run_id: str,
+    state: _TrajectoryState,
+    command: str,
+    fmt: str,
+    parts: list[dict],
+) -> str | None:
+    """The observation for a command the repository answers in part: the exact parts and the gaps
+    run as the shell runs them, each gap that runs simulated alone with its own context (see
+    `stitch_parts`). None, so the command is simulated whole, when a gap's simulated exit status
+    is unknown where it decides what runs, or the scaffold's wrapper cannot be derived. Mirrors
+    judge_api's ObservationSimulationService._simulate_parts."""
+    simulated: list[str] = []
+
+    async def answer(gap: dict) -> tuple[str, int | None]:
+        raw = await _simulate_observation_uncached(
+            client=client,
+            settings=settings,
+            eval_run_id=eval_run_id,
+            state=state,
+            assistant_output=f"```bash\n{gap['command']}\n```",
+            grounding=Grounding(gap["context"], None, None, ""),
+        )
+        simulated.append(gap["command"])
+        return observation_body(raw, fmt), observed_returncode(raw)
+
+    stitched = await stitch_parts(parts, answer)
+    if stitched is None:
+        logger.info(
+            "[sanity-dispatch] observation_simulation_parts_undecided sample_id={} gap={!r}",
+            state.sample_id,
+            simulated[-1][:80] if simulated else "",
+        )
+        return None
+    text, returncode = stitched
+    observation = grounded_observation(fmt, text, returncode, command, state.messages)
+    if observation is None:
+        return None
+    logger.info(
+        "[sanity-dispatch] observation_simulation_stitched sample_id={} parts={} gaps={}",
+        state.sample_id,
+        len(parts),
+        len(simulated),
+    )
+    return correct_returncode(observation, fmt, command)
 
 
 async def _retry_for_output(

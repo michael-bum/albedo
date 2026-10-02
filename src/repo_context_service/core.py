@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -22,42 +24,63 @@ from loguru import logger
 
 from albedo_config import RepoContextSettings
 from albedo_eval_service.remote.dataset import (
-    _content,
-    _extract_turns,
-    _parse_sample_id,
-    _read_parquet_row,
-    _role,
-    _unwrap_column,
+    extract_turns,
+    parse_sample_id,
+    read_parquet_row,
+    turn_content,
+    turn_role,
+    unwrap_column,
 )
 from albedo_eval_service.shared.dataset_manifest import load_manifest_file
 from albedo_eval_service.shared.observation_format import (
+    OPENHANDS,
     OPENHANDS_TRUNCATION_NOTICE,
-    command_stages,
+    RETURNCODE,
+    SWE_AGENT,
+    absent_tool_output,
+    command_contract,
     detect_format,
+    first_bash_block,
     heredoc_bodies,
-    strip_leading_comments,
 )
 from albedo_eval_service.shared.submit_protocol import ANY_MARKER_RE
 
 from .command_search import (
     ParseFailure,
     SearchResult,
-    _mask_quoted,
-    _number_lines,
+    number_lines,
     parse_search,
+    repo_path,
     run_search,
-    split_chain,
+    session_path,
 )
 from .git_sim import (
+    DEFAULT_ABBREV,
     DEFAULT_BRANCH,
     GitMeta,
+    GitResult,
     explain_git,
     git_evidence,
     is_git_command,
     ledger_block,
-    run_git_chain,
+    parse_git,
+    run_git,
 )
-from .overlay import Overlay, attested_paths, build_overlay, session_root, strip_sandbox
+from .overlay import (
+    FILE,
+    Overlay,
+    apply_stage,
+    attested_paths,
+    build_overlay,
+    cd_outcome,
+    cd_target,
+    errexit_after,
+    quiet_outcome,
+    session_root,
+    unwrapped,
+    writable,
+)
+from .shell import AND, OR, Stage, Unsupported, parse_command
 
 _API_BASE = "https://api.github.com"
 _DONE_MARKER = ".albedo-repo-context-done"
@@ -75,8 +98,140 @@ _MAX_MISSING_PATHS = 10
 _RETRIES = 3
 
 _DETACHED_SOURCE = re.compile(r"re[-_]?bench", re.I)
-_COMMAND_BLOCK_RE = re.compile(r"```(?:bash|sh)?[ \t]*\n(.*?)```", re.DOTALL)
-_TAGGED_BLOCK_RE = re.compile(r"```(?:bash|sh)[ \t]*\n(.*?)```", re.DOTALL)
+
+
+# what the openhands editor shows of a file too long to show whole, in the two versions the
+# datasets were recorded with
+_EDITOR_LIMIT = 16000
+_EDITOR_RETRY = (
+    "You should retry this tool after you have searched inside the file with `grep -n` in order "
+    "to find the line numbers of what you are looking for.</NOTE>"
+)
+_EDITOR_CLIPPED = (
+    "<response clipped><NOTE>Due to the max output limit, only part of this file has been shown "
+    f"to you. {_EDITOR_RETRY}"
+)
+_EDITOR_CLIPPED_TO_SAVE = (
+    f"<response clipped><NOTE>To save on context only part of this file has been shown to you. "
+    f"{_EDITOR_RETRY}"
+)
+
+
+@dataclass(frozen=True)
+class Scaffold:
+    """How the machine a dataset's trajectories ran on prints what they ask, as the recorded
+    trajectories of that dataset show.
+
+    `columns` holds the terminal widths `ls` may lay names out for (None: one name per line);
+    `decorate` whether git names refs beside commits, as it does on a terminal (None: not known);
+    `detached` whether the checkout is at a detached HEAD; `abbrev` the length of a short hash
+    (None: it grows with the repository, so only an observation shows it); `squashed` whether
+    the history is one local commit whose hash only an observation shows; `tracking` what
+    `git status` says of the upstream after the branch line; `pycache` whether `__pycache__`
+    directories may be there before the session runs Python; `editor` the note the openhands
+    editor ends a clipped view with, when a `cat -n` of a file is that editor's view of it (see
+    `_editor_view`), "" when it is bash's own output; `errors` what bash puts before its own
+    error messages.
+    """
+
+    columns: tuple[int, ...] | None = None
+    decorate: bool | None = False
+    detached: bool = False
+    abbrev: int | None = DEFAULT_ABBREV
+    squashed: bool = False
+    tracking: str = ""
+    pycache: bool = False
+    editor: str = ""
+    errors: str = "bash: "
+
+
+# a terminal at least as wide as the narrowest one these datasets were recorded on
+_ANY_WIDTH = tuple(range(80, 1001))
+# bash running the command as a script (`bash -c`) names the line of an error
+_SCRIPT_ERRORS = "bash: line 1: "
+_DIVERGED = (
+    "Your branch and 'origin/main' have diverged,\n"
+    "and have 1 and 1 different commits each, respectively.\n"
+    '  (use "git pull" to merge the remote branch into yours)'
+)
+SCAFFOLDS = {
+    ("mini-coder", RETURNCODE): Scaffold(errors=_SCRIPT_ERRORS),
+    ("mini-coder-rs", RETURNCODE): Scaffold(
+        squashed=True, tracking=_DIVERGED, errors=_SCRIPT_ERRORS
+    ),
+    ("mini-coder-rs", OPENHANDS): Scaffold(squashed=True, tracking=_DIVERGED),
+    ("open-swe-traces", OPENHANDS): Scaffold(
+        columns=_ANY_WIDTH, decorate=True, detached=True, abbrev=None, editor=_EDITOR_CLIPPED
+    ),
+    ("open-swe-traces", SWE_AGENT): Scaffold(
+        columns=_ANY_WIDTH,
+        decorate=None,
+        detached=True,
+        abbrev=None,
+        editor=_EDITOR_CLIPPED_TO_SAVE,
+    ),
+    ("swe-hero", OPENHANDS): Scaffold(
+        columns=_ANY_WIDTH,
+        decorate=True,
+        detached=True,
+        abbrev=None,
+        pycache=True,
+        editor=_EDITOR_CLIPPED,
+    ),
+}
+
+
+# the commands a trajectory's editor views were converted to: a whole file, or a range of it
+_EDITOR_READ = re.compile(r"cat -n (\S+)|sed -n '(\d+),(\d+|\$)p' (\S+) \| cat -n")
+
+
+def _editor_view(
+    text: str, first: int = 1, last: int | None = None, clipped: str = _EDITOR_CLIPPED
+) -> str | None:
+    """The body of the openhands editor's view of a file, or of its lines `first` to `last`:
+    the text clipped at the editor's limit and every piece between line breaks numbered from
+    `first` (the empty one after a final line break too, for the whole file); the scaffold
+    drops the trailing blanks and adds the header itself. None for a range the editor refuses,
+    which it answers with an error, and for one ending on the empty piece after a final line
+    break, which some versions of the editor show and later ones refuse."""
+    lines = text.split("\n")
+    certain = len(lines) - (lines[-1] == "")
+    if first < 1 or first > len(lines) or (last is not None and not first <= last <= certain):
+        return None
+    shown = "\n".join(lines[first - 1 : last])
+    if len(shown) > _EDITOR_LIMIT:
+        shown = shown[:_EDITOR_LIMIT] + clipped
+    numbered = enumerate(shown.split("\n"), first)
+    return "\n".join(f"{number:6}\t{line}" for number, line in numbered).rstrip()
+
+
+def _absolute_search(text: str) -> bool:
+    """Whether a search names only absolute paths, so that where the shell is does not matter."""
+    plan = parse_search(text)
+    return (
+        not isinstance(plan, ParseFailure)
+        and bool(plan.targets)
+        and all(target.startswith("/") for target in plan.targets)
+    )
+
+
+def _editor_answer(overlay: Overlay, viewed: re.Match) -> str | None:
+    """The editor's view a converted read asks for, when the file's text is known and the
+    editor shows it; None for a directory, a missing file or a range the editor refuses."""
+    path = session_path(viewed.group(1) or viewed.group(4), overlay.cwd, overlay.root)
+    text = overlay.text(path) if path is not None else None
+    if text is None:
+        return None
+    first, last = viewed.group(2), viewed.group(3)
+    if first is None:
+        return _editor_view(text, clipped=overlay.editor)
+    return _editor_view(text, int(first), None if last == "$" else int(last), overlay.editor)
+
+
+def _emptied_blank_lines(text: str | None, fmt: str) -> str | None:
+    """The openhands scaffold prints a line of only blanks as an empty line."""
+    return re.sub(r"(?m)^[ \t]+$", "", text) if text and fmt == OPENHANDS else text
+
 
 _TRUNCATION_WARNING = (
     "The output of your last command was too long.\n"
@@ -91,11 +246,12 @@ _TRUNCATION_WARNING = (
 _SCAFFOLD_LIMIT = {"returncode": 10_000, "openhands": 30_000}
 
 
-def _scaffold_truncate(text: str, fmt: str) -> str:
+def _scaffold_truncate(raw: str, fmt: str) -> str:
+    """What the scaffold shows of a command's whole output `raw` (its final line break
+    included, when it printed one), without the final line break."""
     limit = _SCAFFOLD_LIMIT.get(fmt)
-    raw = text + "\n"
     if limit is None or len(raw) <= limit:
-        return text
+        return raw.removesuffix("\n")
     half = limit // 2
     if fmt == "openhands":
         return f"{raw[:half]}\n{OPENHANDS_TRUNCATION_NOTICE}\n{raw[-half:]}"
@@ -145,6 +301,11 @@ applying the command's filters and pipe limits:
 """
 )
 
+UNCERTAIN_LISTING_NOTE = """Except for these paths, which earlier commands in this session changed in ways
+not reproduced here: what exists at or under each of them may differ from this listing, so do not
+claim it present or absent from the listing alone, and derive it from the transcript instead:
+"""
+
 SESSION_PATHS_HEADER = """PATHS ALREADY ESTABLISHED — earlier observations in this session showed each path below
 exists. They are outside the tracked listing because the listing covers only what the repository
 tracks at this commit, while the machine also holds harness scripts, build output, vendored
@@ -187,38 +348,36 @@ result is a normal outcome for a search. Reply with exactly the empty observatio
 specifies:
 """
 
-COMPUTED_GIT_HEADER = """COMMAND OUTPUT — this git command was executed against the repository at this commit
-with the working-tree changes made earlier in this session applied, so the text below is the
-command's exact output. Reply with it verbatim inside the OUTPUT FORMAT. Do not add, reorder or
-omit lines, and do not explain it:
-"""
-
-COMPUTED_GIT_EMPTY = """COMMAND OUTPUT — this git command was executed against the repository at this commit
-with the working-tree changes made earlier in this session applied, and it printed NOTHING: zero
-lines of output. That is the verified result, not a gap in what you were given. Reply with exactly
-the empty observation the OUTPUT FORMAT specifies:
-"""
-
 GIT_SEMANTICS_HEADER = """GIT SEMANTICS — how this git command behaves in this checkout; both lines are facts about
 the repository state you are simulating, not guidance to repeat in the output:
 """
 
-CHAIN_EVIDENCE_HEADER = """CHAIN STAGES ALREADY EXECUTED — this command joins several stages with &&. The stages
-below were executed against the repository at this commit, so the text under each one is that
-stage's exact output. Reproduce those parts unchanged in your reply and derive the remaining
-stages yourself; the stages shown are not the whole observation. Each stage was executed on its
-own, so a stage shown here may follow one whose success could not be checked; keep that in mind
-if an earlier stage would have stopped the chain:
+CHAIN_EVIDENCE_HEADER = """CHAIN STAGES — this command joins several stages, listed below in order, each with the
+`&&` or `||` that joins it to the one before. A stage with text under it was executed against the
+repository at this commit, after the changes of the stages before it: that text is its exact
+output, to reproduce unchanged in your reply. A stage marked as not executed is yours to derive:
 """
+
+CHAIN_GAP = "(not executed here — derive this stage's output yourself)"
+CHAIN_MAYBE_GAP = (
+    "(not executed here, and it runs only if the stage before it ended the way its `&&` or `||`"
+    " requires — derive whether it runs and what it prints yourself)"
+)
+CHAIN_NO_OUTPUT = "(no output)"
+PRIOR_STAGES_HEADER = """EARLIER STAGES OF THIS COMMAND — the command you are answering is the rest of a longer one.
+These stages ran before it, in this order, with this output; the repository below is as they left
+it. Do not repeat their output: answer only the command shown to you:
+"""
+CHAIN_MAYBE_RUN = (
+    "(this is what it prints if it runs; it runs only if the stage before it ended the way its"
+    " `&&` or `||` requires)"
+)
+_MAX_GAP_GROUPS = 3
 
 PRE_EDIT_SUFFIX = (
     "   (as of this commit — the session has since edited this file in a way that could "
     "not be reproduced, so the text below is the version BEFORE those edits)"
 )
-
-COMPUTED_PARTIAL = """NOTE — the following files are listed in the repository but their contents are not
-available at this commit, so the output above may be missing matches from them:
-"""
 
 TRAJECTORY_HEADER = """REFERENCE EXCHANGES — real command -> observation exchanges recorded in this
 repository during a reference session on the same task. Use them ONLY to derive real paths, file
@@ -245,6 +404,24 @@ class GroundingContext:
     exact_output: str | None = None
     exact_returncode: int | None = None
     state: str = ""
+    # exact output of every stage before the last of an `&&` chain whose last stage is capped by a
+    # trailing `| head -N` / `| tail -N` (see cap_last_stage); None unless all of them ran and succeeded
+    leading_output: str | None = None
+    # the command split into what the repository answers and what is left to simulate (see
+    # RepoContextService._parts); None when it is not split
+    parts: list[dict] | None = None
+
+
+@dataclass
+class _Ran:
+    """A stage of a command as `_execute` ran it: its exact answer (None when not computed),
+    whether it surely runs, its position in the command, and the checkout as it found it."""
+
+    stage: Stage
+    answer: tuple[str, int] | None
+    surely: bool
+    index: int
+    before: Overlay
 
 
 class _NotFound(Exception):
@@ -337,9 +514,50 @@ def _read_cached_sha(path: Path) -> dict | None:
     return cached
 
 
-def _first_command(text: str) -> str:
-    match = _TAGGED_BLOCK_RE.search(text or "") or _COMMAND_BLOCK_RE.search(text or "")
-    return strip_leading_comments(match.group(1)) if match else ""
+def _gap_groups(executed: list[_Ran]) -> list[list[_Ran]]:
+    """Runs of consecutive stages this could not answer, each run gated as one by the separator of
+    its first stage. A run gated by `&&` or `||` holds only stages joined by that same separator:
+    bash decides a `;` stage, or one joined the other way, against the last status on its own, so
+    such a stage starts a run of its own."""
+    groups: list[list[_Ran]] = []
+    for position, ran in enumerate(executed):
+        if ran.answer is not None:
+            continue
+        leading = groups[-1][0].stage.separator if groups else None
+        continues = position and executed[position - 1].answer is None
+        if continues and (leading not in (AND, OR) or ran.stage.separator == leading):
+            groups[-1].append(ran)
+        else:
+            groups.append([ran])
+    return groups
+
+
+def _joined_text(stages: list[Stage]) -> str:
+    """Stages as one command, each joined to the one before by its own `&&`, `||` or `;`. A stage
+    spanning several lines (a heredoc) is grouped in braces, so what follows can join it."""
+    text = ""
+    for position, stage in enumerate(stages):
+        if position:
+            text += f" {stage.separator} " if stage.separator in (AND, OR) else "; "
+        text += f"{{ {stage.text}\n}}" if "\n" in stage.text else stage.text
+    return text
+
+
+def _canned(stage: Stage) -> tuple[str, int] | None:
+    """The answer of a program this environment does not have (pytest, a package install),
+    decided from the words of the stage's first command. Piped on into `head` or `tail`, the
+    message passes through and the pipeline succeeds; any other pipe is not answered."""
+    command = unwrapped(stage.command)
+    argv = command.argv
+    python = bool(re.fullmatch(r"python[\d.]*", command.name))
+    runs_tool = command.name in ("pytest", "py.test") or re.fullmatch(r"pip[\d.]*", command.name)
+    if not (runs_tool or (python and argv[1:2] == ("-m",))):
+        return None
+    canned = absent_tool_output(shlex.join(argv))
+    rest = [c.name for c in stage.pipeline[1:]]
+    if canned is None or any(name not in ("head", "tail") for name in rest):
+        return None
+    return canned[0] + "\n", 0 if rest else canned[1]
 
 
 def _name_patterns(cmd: str) -> list[str]:
@@ -364,77 +582,100 @@ def _filter_listing(paths: list[str], cmd: str) -> tuple[list[str], bool]:
     return kept, True
 
 
-@lru_cache(maxsize=16)
-def _suffix_index(listing: tuple[str, ...]) -> dict[str, str]:
-    owners: dict[str, str | None] = {}
-    for path in listing:
-        segments = path.split("/")
-        for index in range(len(segments)):
-            suffix = "/".join(segments[index:])
-            if suffix in owners:
-                if owners[suffix] != path:
-                    owners[suffix] = None
-            else:
-                owners[suffix] = path
-    return {suffix: path for suffix, path in owners.items() if path is not None}
-
-
-def _resolve_path(token: str, listing_set: set[str], index: dict[str, str]) -> str | None:
-    if token in listing_set:
-        return token
-    segments = token.lstrip("/").split("/")
-    for start in range(len(segments)):
-        resolved = index.get("/".join(segments[start:]))
-        if resolved is not None:
-            return resolved
-    return None
-
-
 _WRITE_TARGET = re.compile(r">>?\s*[^\s|;&()\"'<>]+")
-_WRITE_DEST = re.compile(r"\b(?:cp|mv|install)\s+(?:-\S+\s+)*\S+\s+(\S+)|\btee\s+(?:-\S+\s+)*(\S+)")
-_CD_ONLY = re.compile(r"^cd\s+\S+$")
-# a stage that changes the tree, or sends its output into it: composing a chain around one would
-# answer a later stage from a world the earlier stage has already left behind
-_CHAIN_MUTATES = re.compile(
-    r"^(?:rm|mkdir|rmdir|mv|cp|install|touch|chmod|chown|ln|tee|patch|truncate"
-    r"|sed\s+(?:-i|--in-place)"
-    r"|git\s+(?:add|apply|checkout|restore|stash|commit|reset|rm|mv|clean))\b"
+_WRITE_DEST = re.compile(
+    r"\b(?:cp|mv|install)\s+(?:-\S+\s+)*\S+\s+(\S+)|\b(?:tee|touch|mkdir)\s+(?:-\S+\s+)*(\S+)"
 )
-_CHAIN_REDIRECTS = re.compile(r"(?<![0-9<>])>>?[ \t]*\S")
 
 
-def _sed_scripts(cmd: str) -> list[str]:
-    """The script arguments of every `sed` stage: the patterns, not the files they run against."""
-    scripts: list[str] = []
-    for stage in command_stages(cmd):
-        try:
-            tokens = shlex.split(stage)
-        except ValueError:  # an unbalanced quote is not a sed script this can read
-            continue
-        if not tokens or tokens[0].rsplit("/", 1)[-1] != "sed":
-            continue
-        expecting = False
-        taken = False
-        for token in tokens[1:]:
-            if expecting:
-                scripts.append(token)
-                expecting, taken = False, True
+# commands whose first operand, or the value of these options, is data rather than a path
+_DATA_OPERAND = {"sed": ("-e", "--expression"), "grep": ("-e", "--regexp"), "rg": ("-e",),
+                 "awk": (), "egrep": ("-e",), "fgrep": ("-e",)}  # fmt: skip
+_CODE_OPTION = {"python": "-c", "node": "-e", "perl": "-e", "bash": "-c", "sh": "-c"}
+
+
+def _data_words(cmd: str) -> list[str]:
+    """The arguments of a command that are data, not files: a sed script, a grep or awk pattern,
+    the code of `python -c`, `node -e` or `sh -c`. Tokenising them as shell words invents paths
+    out of the text they match or run (`s/self.font.bold/None/`, `from pkg.util import x`)."""
+    parsed = parse_command(cmd)
+    if isinstance(parsed, Unsupported):
+        return []
+    data: list[str] = []
+    for stage in parsed.stages:
+        for command in stage.pipeline:
+            name = re.sub(r"[\d.]+$", "", command.name)
+            args = list(command.args)
+            if name in _CODE_OPTION and _CODE_OPTION[name] in args[:-1]:
+                data.append(args[args.index(_CODE_OPTION[name]) + 1])
+            if name not in _DATA_OPERAND:
                 continue
-            if token in ("-e", "-f", "--expression", "--file"):
-                expecting = True
-                continue
-            if token.startswith("-"):
-                continue
-            if not taken:
-                scripts.append(token)
-                taken = True
-    return scripts
+            valued = [args[i + 1] for i, a in enumerate(args[:-1]) if a in _DATA_OPERAND[name]]
+            operands = [a for a in args if not a.startswith("-")]
+            data += valued or operands[:1]
+    return data
 
 
-def _referenced_paths(cmd: str, listing: list[str]) -> tuple[list[str], list[str]]:
+def _python_sources(cmd: str, read) -> list[tuple[str, str]]:
+    """The Python code a command runs, with the directory its imports also resolve from: the
+    code of `-c`, a heredoc fed to the interpreter, a script (its text read with `read`), or the
+    module of `-m`."""
+    parsed = parse_command(cmd)
+    if isinstance(parsed, Unsupported):
+        return []
+    sources: list[tuple[str, str]] = []
+    for stage in parsed.stages:
+        for command in stage.pipeline:
+            if not re.fullmatch(r"python[\d.]*", command.name):
+                continue
+            args = list(command.args)
+            if "-c" in args[:-1]:
+                sources.append((args[args.index("-c") + 1], ""))
+            elif "-m" in args[:-1]:
+                sources.append((f"import {args[args.index('-m') + 1]}", ""))
+            elif command.heredoc is not None and command.heredoc.literal:
+                sources.append((command.heredoc.literal, ""))
+            elif (script := next((a for a in args if not a.startswith("-")), None)) is not None:
+                path = repo_path(script)
+                if path is not None and (text := read(path)) is not None:
+                    sources.append((text, posixpath.dirname(path)))
+    return sources
+
+
+def _imported_files(sources: list[tuple[str, str]], listing: set[str], read) -> list[str]:
+    """The checkout's files that Python code imports, and those they import in turn (two levels
+    deep): each module looked for from the checkout root, `src/`, and the importing file's
+    directory, as a module file or a package's `__init__.py`."""
+    found: list[str] = []
+    for _ in range(2):
+        following: list[tuple[str, str]] = []
+        for code, directory in sources:
+            try:
+                tree = ast.parse(code)
+            except (SyntaxError, ValueError):
+                continue
+            names: list[str] = []
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    names += [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                    names += [node.module] + [f"{node.module}.{a.name}" for a in node.names]
+            for name in names:
+                base = name.replace(".", "/")
+                for root in ("", "src", directory):
+                    for candidate in (f"{base}.py", f"{base}/__init__.py"):
+                        path = posixpath.join(root, candidate) if root else candidate
+                        if path in listing and path not in found:
+                            found.append(path)
+                            if (text := read(path)) is not None:
+                                following.append((text, posixpath.dirname(path)))
+        sources = following
+    return found
+
+
+def _referenced_paths(cmd: str, listing: list[str], read=None) -> tuple[list[str], list[str]]:
     listing_set = set(listing)
     top_dirs = {p.split("/", 1)[0] for p in listing_set if "/" in p}
-    index = _suffix_index(tuple(listing))
     present: list[str] = []
     missing: list[str] = []
     # a copy/move/tee destination does not exist yet, which is normal rather than an error
@@ -445,20 +686,16 @@ def _referenced_paths(cmd: str, listing: list[str]) -> tuple[list[str], list[str
     # missing file is a fabrication that invites it to invent a failure.
     # a sed script is data too: `s/self.font.bold/None/` and `/has_metadata_file/d` are patterns,
     # and tokenising them invents paths out of the text being matched
-    data = list(heredoc_bodies(cmd)) + _sed_scripts(cmd)
+    data = list(heredoc_bodies(cmd)) + _data_words(cmd)
     in_data = {token for span in data for token in re.split(r"[\s|;&<>()\"']+", span) if token}
     for tok in re.split(r"[\s|;&<>()\"']+", _WRITE_TARGET.sub(" ", cmd)):
         if not tok or tok.startswith("-"):
             continue
-        p = tok[2:] if tok.startswith("./") else tok
-        if tok.startswith("/"):
-            p = strip_sandbox(tok)
-        if "://" not in tok and not any(ch in tok for ch in "*?[]{}$`="):
-            resolved = _resolve_path(p, listing_set, index)
-            if resolved is not None:
-                if resolved not in present:
-                    present.append(resolved)
-                continue
+        p = repo_path(tok) or tok
+        if "://" not in tok and not any(ch in tok for ch in "*?[]{}$`=") and p in listing_set:
+            if p not in present:
+                present.append(p)
+            continue
         if "://" in tok or any(ch in tok for ch in "*?[]{}$`="):
             continue
         norm = p.rstrip("/")
@@ -468,10 +705,16 @@ def _referenced_paths(cmd: str, listing: list[str]) -> tuple[list[str], list[str
             continue
         if tok in in_data:
             continue
-        if tok.startswith(("/", "..")):
+        # only the checkout's own paths are known absent: an installed package, /tmp or the
+        # home directory holds whatever the machine put there
+        if repo_path(tok) is not None and (
+            tok.startswith("/") or _plausible_repo_path(norm, top_dirs)
+        ):
             missing.append(norm)
-        elif _plausible_repo_path(norm, top_dirs):
-            missing.append(norm)
+    if read is not None:
+        # what a program imports decides what it prints, as much as the file it runs
+        imported = _imported_files(_python_sources(cmd, read), listing_set, read)
+        present += [path for path in imported if path not in present]
     return present, missing[:_MAX_MISSING_PATHS]
 
 
@@ -486,11 +729,11 @@ def _split_attested(missing: list[str], attested: set[str] | None) -> tuple[list
     """
     if not attested:
         return missing, []
-    known = {strip_sandbox(path): path for path in attested}
+    known = {repo_path(path) or path: path for path in attested}
     kept: list[str] = []
     vouched: list[str] = []
     for path in missing:
-        hit = known.get(path) or known.get(strip_sandbox(path))
+        hit = known.get(path) or known.get(repo_path(path) or path)
         if hit is None:
             kept.append(path)
         elif hit not in vouched:
@@ -597,7 +840,7 @@ class RepoContextService:
         instances: dict[str, str] = {}
         for sample_id in sample_ids:
             try:
-                shard_name, row_idx, _ = _parse_sample_id(sample_id)
+                shard_name, row_idx, _ = parse_sample_id(sample_id)
             except ValueError:
                 continue
             source_iid = self._iid_for(shard_name, row_idx)
@@ -641,7 +884,10 @@ class RepoContextService:
         assistant_output: str,
         messages: list[dict[str, str]] | None = None,
         fmt: str = "",
+        recorded: int | None = None,
     ) -> GroundingContext:
+        """The grounding for a command of an instance's session. `recorded` is how many of the
+        transcript's commands ran on a real machine (the rest were answered by the simulator)."""
         ref = parse_instance(source, instance_id)
         if ref is None:
             return GroundingContext(context=None, kind="none", reason="instance_unparsed")
@@ -653,45 +899,64 @@ class RepoContextService:
         if snapshot is None:
             return GroundingContext(context=None, kind="none", reason="snapshot_unavailable")
         base = list(_load_listing(str(snapshot / _LISTING_NAME)))
+        root = session_root(messages)
         overlay = build_overlay(
-            messages,
-            base,
-            _suffix_index(tuple(base)),
-            lambda rel: self._read_snapshot_file(snapshot, rel),
+            messages, base, lambda rel: self._read_snapshot_file(snapshot, rel), root, recorded
         )
-        listing = overlay.listing(base)
-        command = _first_command(assistant_output)
+        scaffold = SCAFFOLDS.get((source, fmt), Scaffold())
+        overlay.columns = scaffold.columns
+        overlay.pycache = overlay.pycache or scaffold.pycache
+        overlay.editor = scaffold.editor
+        overlay.errors = scaffold.errors
+        listing = overlay.listing()
+        meta = self.git_meta(snapshot, source, owner, repo, sha, scaffold)
+        command = first_bash_block(assistant_output)
+        attested = attested_paths(messages)
         block, exact, returncode = self._build_repo_block(
             snapshot,
             listing,
             command,
             overlay,
             fmt,
-            self.git_meta(snapshot, source, owner, repo, sha),
-            root=session_root(messages),
-            attested=attested_paths(messages),
+            meta,
+            root=root,
+            attested=attested,
         )
         present, missing = _referenced_paths(command, listing)
+        parts = None
+        if exact is None and not (overlay.editor and _EDITOR_READ.fullmatch(command.strip())):
+            parts = self._parts(snapshot, command, overlay, fmt, meta, root, attested)
+        for part in parts or []:
+            if part["kind"] == "exact":
+                part["output"] = _emptied_blank_lines(part["output"], fmt)
         return GroundingContext(
             context=block,
             kind="repo",
-            exact_output=exact,
+            exact_output=_emptied_blank_lines(exact, fmt),
             exact_returncode=returncode,
             state=overlay.state(block, set(present) | set(missing)),
+            leading_output=None
+            if exact is not None
+            else self._leading_output(snapshot, command, overlay, meta, root),
+            parts=parts,
         )
 
     def _context_for(
         self, sample_id: str, assistant_output: str, messages: list[dict[str, str]] | None = None
     ) -> GroundingContext:
         try:
-            shard_name, row_idx, turn_idx = _parse_sample_id(sample_id)
+            shard_name, row_idx, turn_idx = parse_sample_id(sample_id)
         except ValueError:
             return GroundingContext(context=None, kind="none", reason="bad_sample_id")
         reason = "iid_unresolved"
         source_iid = self._iid_for(shard_name, row_idx)
         if source_iid is not None:
             result = self.repo_context_for_instance(
-                *source_iid, assistant_output, messages, detect_format(sample_id, messages)
+                *source_iid,
+                assistant_output,
+                messages,
+                detect_format(sample_id, messages),
+                recorded=turn_idx,
             )
             if result.context is not None:
                 return result
@@ -809,13 +1074,28 @@ class RepoContextService:
         ttl = _NEGATIVE_TTL_SECONDS if cached.get("kind") == "permanent" else _TRANSIENT_TTL_SECONDS
         return time.time() - float(cached.get("failed_at", 0)) < ttl
 
-    def git_meta(self, snapshot: Path, source: str, owner: str, repo: str, sha: str) -> GitMeta:
+    def git_meta(
+        self,
+        snapshot: Path,
+        source: str,
+        owner: str,
+        repo: str,
+        sha: str,
+        scaffold: Scaffold = Scaffold(),
+    ) -> GitMeta:
         return GitMeta(
             sha=sha,
             owner=owner,
             repo=repo,
-            branch=self._default_branch(snapshot, owner, repo),
-            detached=_DETACHED_SOURCE.search(source or "") is not None,
+            # a squashed history is a local repository on the branch its upstream is named for
+            branch=DEFAULT_BRANCH
+            if scaffold.squashed
+            else self._default_branch(snapshot, owner, repo),
+            detached=scaffold.detached or _DETACHED_SOURCE.search(source or "") is not None,
+            abbrev=scaffold.abbrev,
+            decorate=scaffold.decorate,
+            squashed=scaffold.squashed,
+            tracking=scaffold.tracking,
             history=lambda path: self._commit_history(snapshot, owner, repo, sha, path),
             commit_patch=lambda rev: self._commit_patch(snapshot, owner, repo, rev),
         )
@@ -1029,14 +1309,15 @@ class RepoContextService:
             for member in tar:
                 if len(paths) >= _MAX_MEMBERS:
                     raise _SnapshotTooLarge(f"tarball has more than {_MAX_MEMBERS} files")
-                if not member.isreg() or member.name.startswith("/"):
+                if not (member.isreg() or member.issym()) or member.name.startswith("/"):
                     continue
                 parts = PurePosixPath(member.name).parts
                 if len(parts) < 2 or any(part in ("..", "") for part in parts):
                     continue
                 if parts[1] in (_LISTING_NAME, _DONE_MARKER):
                     continue
-                if member.size > _MAX_MEMBER_BYTES:
+                if member.issym() or member.size > _MAX_MEMBER_BYTES:
+                    # listed without its text: a link, or a file too large to keep
                     paths.append("/".join(parts[1:]))
                     continue
                 total += member.size
@@ -1056,194 +1337,259 @@ class RepoContextService:
     _LISTING_MIN_CHARS = 8000
 
     def _run_command(
-        self,
-        snapshot_dir: Path,
-        listing: list[str],
-        cmd: str,
-        overlay: Overlay,
-        attested: set[str] | None = None,
-        root: str = "",
+        self, snapshot_dir: Path, cmd: str, overlay: Overlay, root: str, terminal: bool = True
     ) -> SearchResult | None:
         plan = parse_search(cmd)
         if isinstance(plan, ParseFailure):
             return None
         result = run_search(
             plan,
-            lambda rel: self._file_text(snapshot_dir, rel, overlay),
-            listing,
+            overlay.text,
+            overlay.listing(),
             size_file=lambda rel: self._file_size(snapshot_dir, rel, overlay),
             root=root,
+            overlay=overlay,
+            terminal=terminal,
         )
-        if isinstance(result, ParseFailure):
-            return None
-        if result.missing and _split_attested(list(result.missing), attested)[1]:
-            # the search ran against the tracked commit, which does not know about harness
-            # scripts or build output: a "No such file" it derives for a path the transcript
-            # already showed is a fabrication, so decline and let the grounded block answer
-            return None
-        return result
+        return None if isinstance(result, ParseFailure) else result
 
-    def _chain_evidence(
+    def _stage_answer(
         self,
         snapshot_dir: Path,
-        listing: list[str],
-        cmd: str,
-        overlay: Overlay,
-        attested: set[str] | None = None,
-        root: str = "",
-    ) -> str:
-        stages = split_chain(cmd)
-        if stages is None:
-            return ""
-        fragments: list[str] = []
-        for stage in stages:
-            if _CD_ONLY.match(stage):
-                continue
-            result = self._run_command(snapshot_dir, listing, stage, overlay, attested, root)
-            if result is None:
-                continue
-            if result.output:
-                fragments.append(
-                    f"$ {stage}\n{_truncate(result.output, self.settings.max_file_chars)}"
-                )
-        if not fragments:
-            return ""
-        return "\n" + CHAIN_EVIDENCE_HEADER + "\n" + "\n\n".join(fragments) + "\n"
-
-    def _run_git_command(
-        self,
-        snapshot_dir: Path,
-        listing: list[str],
-        cmd: str,
-        overlay: Overlay,
+        working: Overlay,
+        stage: Stage,
+        cwd: str | None,
+        fmt: str,
         meta: GitMeta,
-    ):
-        result = run_git_chain(
-            cmd,
-            overlay,
-            lambda rel: self._read_snapshot_file(snapshot_dir, rel),
-            listing,
-            meta,
-            file_text=lambda working, rel: self._file_text(snapshot_dir, rel, working),
-            file_size=lambda working, rel: self._file_size(snapshot_dir, rel, working),
+        root: str,
+        alone: bool,
+    ) -> tuple[str, int] | None:
+        """The exact output, as the terminal shows it, and exit status of one stage run in `cwd`
+        against `working`; None when this cannot tell. `alone`: the stage is the whole command."""
+        command = unwrapped(stage.command)
+        if command.name == "cd" and len(stage.pipeline) == 1:
+            return cd_outcome(working, command, cwd)
+        canned = _canned(stage)
+        if canned is not None:
+            return canned
+        if command.name == "git":
+            plan = parse_git(stage.text)
+            if cwd != "" or isinstance(plan, ParseFailure):
+                return None
+            result = run_git(plan, working, working.read_base, working.listing(), meta)
+            if not isinstance(result, GitResult) or not result.exact:
+                return None
+            return (result.output + "\n" if result.output else ""), result.returncode
+        quiet = quiet_outcome(working, stage, cwd) or self._redirected_read(
+            snapshot_dir, working, stage, cwd, root
         )
-        if isinstance(result, ParseFailure) or not result.exact:
+        if quiet is not None:
+            # the openhands scaffold writes a heredoc with its editor, which reports back
+            heredoc = any(c.heredoc is not None for c in stage.pipeline)
+            # a heredoc write that is the whole command was the editor's own in the datasets
+            # converted from it, which reports the file it created
+            return None if heredoc and (fmt == OPENHANDS or (working.editor and alone)) else quiet
+        if cwd != "" and not _absolute_search(stage.text):
             return None
-        return result
+        result = self._run_command(snapshot_dir, stage.text, working, root)
+        if result is None or result.returncode is None:
+            return None
+        return result.raw, result.returncode
 
-    def _computed_git_block(
+    def _redirected_read(
+        self, snapshot_dir: Path, working: Overlay, stage: Stage, cwd: str | None, root: str
+    ) -> tuple[str, int] | None:
+        """A search whose output goes to a file (`grep x f > out`): it prints nothing, and its
+        status is the search's, when the search reports no missing file."""
+        last = stage.pipeline[-1]
+        target = next((r for r in last.redirects if r.fd == 1 and r.writes_file), None)
+        rest = [r for r in last.redirects if r is not target]
+        if target is None or cwd != "" or rest or not writable(working, target.target, cwd):
+            return None
+        words = " | ".join(shlex.join(command.argv) for command in stage.pipeline)
+        result = self._run_command(snapshot_dir, words, working, root, terminal=False)
+        if result is None or result.missing or result.returncode is None:
+            return None
+        return "", result.returncode
+
+    def _execute(
         self,
         snapshot_dir: Path,
-        listing: list[str],
         cmd: str,
         overlay: Overlay,
         fmt: str,
         meta: GitMeta,
-    ) -> tuple[str, str | None, int | None] | None:
-        result = self._run_git_command(snapshot_dir, listing, cmd, overlay, meta)
-        if result is None:
-            return None
-        if result.empty:
-            block, exact = COMPUTED_GIT_EMPTY, ""
-        else:
-            exact = _scaffold_truncate(result.output, fmt)
-            block = COMPUTED_GIT_HEADER + "\n" + exact + "\n"
-        return _truncate(block, self.settings.max_context_chars), exact, result.returncode
+        root: str,
+    ) -> tuple[list[_Ran], Overlay] | None:
+        """Run a command's stages in order against a copy of the session's checkout, each after
+        the changes of the stages before it, `&&` and `||` gating a stage on the exit status of
+        the one before; the stages that run or may run, and the checkout they leave.
 
-    def _computed_search_block(
+        A stage gated on one this could not answer may or may not run: its answer is what it
+        would print, and its changes are applied as ones that may have happened. None when the
+        shell parser refuses the command."""
+        parsed = parse_command(cmd)
+        if isinstance(parsed, Unsupported) or not parsed.stages:
+            return None
+        working = overlay.copy()
+        cwd, last, errexit = working.cwd, 0, False
+        alone = len(parsed.stages) == 1
+        out: list[_Ran] = []
+        for index, stage in enumerate(parsed.stages):
+            separator, name = stage.separator, stage.command.name
+            following = parsed.stages[index + 1].separator if index + 1 < len(parsed.stages) else ""
+            if last is not None and ((separator == AND and last) or (separator == OR and not last)):
+                continue
+            surely = last is not None or separator not in (AND, OR)
+            before = working.copy()
+            answer = self._stage_answer(snapshot_dir, working, stage, cwd, fmt, meta, root, alone)
+            code = answer[1] if answer is not None and surely else None
+            apply_stage(working, stage, cwd, surely, code)
+            out.append(_Ran(stage, answer, surely, index, before))
+            if name == "cd" and len(stage.pipeline) == 1:
+                cwd = cd_target(stage.command, cwd) if code == 0 else (cwd if code else None)
+            elif name in ("pushd", "popd"):
+                cwd = None
+            errexit = errexit_after(stage.command, errexit)
+            last = code
+            if name == "exit" or (errexit and last and following not in (AND, OR)):
+                break
+            if errexit and last is None and following not in (AND, OR):
+                for position, rest in enumerate(parsed.stages[index + 1 :], index + 1):
+                    out.append(_Ran(rest, None, False, position, working.copy()))
+                    apply_stage(working, rest, cwd, certain=False)
+                break
+        return out, working
+
+    def _parts(
         self,
         snapshot_dir: Path,
-        listing: list[str],
         cmd: str,
         overlay: Overlay,
-        fmt: str = "",
-        attested: set[str] | None = None,
-        root: str = "",
-    ) -> tuple[str, str | None, int | None] | None:
-        result = self._run_command(snapshot_dir, listing, cmd, overlay, attested, root)
-        if result is None:
+        fmt: str,
+        meta: GitMeta,
+        root: str,
+        attested: set[str],
+    ) -> list[dict] | None:
+        """Every stage the command may run, in order, as the parts the repository answers and the
+        gaps left to simulate, each with the `&&`, `||` or `;` that joins it to the one before:
+        which of them run is the simulator's to settle, from the gaps' exit statuses (see
+        `stitch_parts`). An exact part holds the text the terminal shows for its stage (final
+        line break included) and its exit status; a stage after a gap is answered only when its
+        answer holds whether or not the stages before it ran. A gap holds the command text of
+        consecutive stages this cannot answer and the context to simulate them with (the
+        checkout as the stages before them may have left it). None when splitting would not
+        help: nothing answered prints, there are more than `_MAX_GAP_GROUPS` gaps, or what runs
+        after a gap is not decided by exit statuses alone (`set -e`, an `exit` that may run)."""
+        result = self._execute(snapshot_dir, cmd, overlay, fmt, meta, root)
+        parsed = parse_command(cmd)
+        if not result or isinstance(parsed, Unsupported):
             return None
-        if result.empty and result.incomplete:
-            # nothing matched only because nothing could be read: claiming a verified
-            # empty here would assert the opposite of what the files actually hold
+        executed, _ = result
+        groups = _gap_groups(executed)
+        answered = any(ran.answer and ran.answer[0] for ran in executed)
+        errexit = any(errexit_after(stage.command, False) for stage in parsed.stages)
+        # `exit` ends the command where it runs; one that may run leaves the stages after it out
+        exits = any(ran.stage.command.name == "exit" and not ran.surely for ran in executed)
+        if not groups or len(groups) > _MAX_GAP_GROUPS or not answered or errexit or exits:
             return None
-
-        if result.empty:
-            block, exact = COMPUTED_EMPTY, ""
-        else:
-            exact = _scaffold_truncate(result.output, fmt)
-            block = COMPUTED_HEADER + "\n" + exact + "\n"
-        returncode = result.returncode
-        if result.incomplete:
-            block += (
-                "\n"
-                + COMPUTED_PARTIAL
-                + "\n".join(f"- {p}" for p in result.incomplete[:_MAX_MISSING_PATHS])
-                + "\n"
+        parts: list[dict] = []
+        for position, ran in enumerate(executed):
+            separator = ran.stage.separator if parts else ""
+            if ran.answer is not None:
+                output, returncode = ran.answer
+                parts.append(
+                    {
+                        "kind": "exact",
+                        "separator": separator,
+                        "output": output,
+                        "returncode": returncode,
+                    }
+                )
+                continue
+            group = next((g for g in groups if g[0] is ran), None)
+            if group is None:
+                continue
+            text = _joined_text([member.stage for member in group])
+            context = self._build_repo_block(
+                snapshot_dir, ran.before.listing(), text, ran.before, fmt, meta, root, attested
+            )[0]
+            earlier = [
+                f"$ {p.stage.text}\n" + p.answer[0].removesuffix("\n")
+                for p in executed[:position]
+                if p.answer
+            ]
+            if earlier:
+                context = PRIOR_STAGES_HEADER + "\n" + "\n\n".join(earlier) + "\n\n" + context
+            parts.append(
+                {"kind": "gap", "separator": separator, "command": text, "context": context}
             )
-            exact, returncode = None, None
-        return _truncate(block, self.settings.max_context_chars), exact, returncode
+        return parts
 
-    def _computed_chain_block(
-        self,
-        snapshot_dir: Path,
-        listing: list[str],
-        cmd: str,
-        overlay: Overlay,
-        fmt: str = "",
-        attested: set[str] | None = None,
-        root: str = "",
-    ) -> tuple[str, str | None, int | None] | None:
-        """One computed answer for an `&&` chain whose every stage is a repository query.
-
-        `parse_search` reads a whole command, and strips a leading `cd` prefix to do it, so a
-        chain of one query already computes; two or more of them do not, and until now the stages
-        were run only to be quoted back as evidence. Running the same stages and joining their
-        output answers the turn instead.
-
-        `&&` stops at the first stage that fails and that stage's status is the command's, so the
-        join stops there too. Three shapes are declined rather than composed, because each would
-        put a stage's answer in the wrong world: a stage that writes or redirects, which a later
-        stage could read back; a `cd` anywhere but the head of the chain, which moves where the
-        later stages resolve their paths; and a stage that reports a path missing, which after a
-        `cd` this does not follow could be a file that is present where the command was actually
-        run.
-        """
-        stages = split_chain(cmd)
-        if stages is None:
+    def _leading_output(
+        self, snapshot_dir: Path, cmd: str, overlay: Overlay, meta: GitMeta, root: str
+    ) -> str | None:
+        """The joined output of every stage before the last of an `&&` chain whose last stage has
+        its own head/tail cap, or None when any of them cannot be run exactly or fails: a failing
+        stage stops the chain, and an unrun one leaves the length of what precedes the last stage
+        unknown."""
+        parsed = parse_command(cmd)
+        if isinstance(parsed, Unsupported) or len(parsed.stages) < 2:
             return None
-        # only the head may be a `cd`: that one is the prefix parse_search itself strips, and
-        # every stage is then resolved from the repository root. A later one would move where
-        # the stages after it resolve their paths, and dropping it here would answer them from
-        # a directory the shell had already left
-        if any(_CD_ONLY.match(stage.strip()) for stage in stages[1:]):
+        if any(stage.separator != AND for stage in parsed.stages[1:]):
             return None
-        payload = [stage for stage in stages if not _CD_ONLY.match(stage.strip())]
-        if len(payload) < 2 or any(
-            _CHAIN_MUTATES.match(stage.strip()) or _CHAIN_REDIRECTS.search(_mask_quoted(stage))
-            for stage in payload
+        if not command_contract(parsed.stages[-1].text):
+            return None
+        executed = (self._execute(snapshot_dir, cmd, overlay, "", meta, root) or ([], None))[0]
+        earlier = executed[: len(parsed.stages) - 1]
+        if len(earlier) < len(parsed.stages) - 1 or any(
+            ran.answer is None or ran.answer[1] != 0 for ran in earlier
         ):
             return None
-        parts: list[str] = []
-        returncode = 0
-        for stage in payload:
-            result = self._run_command(snapshot_dir, listing, stage, overlay, attested, root)
-            if result is None or result.incomplete or result.missing:
-                return None
-            if result.returncode is None:
-                return None
-            if not result.empty:
-                parts.append(result.output)
-            returncode = result.returncode
-            if returncode:
-                break
-        output = "\n".join(parts)
-        if not output:
-            block, exact = COMPUTED_EMPTY, ""
-        else:
-            exact = _scaffold_truncate(output, fmt)
-            block = COMPUTED_HEADER + "\n" + exact + "\n"
-        return _truncate(block, self.settings.max_context_chars), exact, returncode
+        return "".join(ran.answer[0] for ran in earlier).removesuffix("\n")
+
+    def _run_chain(
+        self,
+        snapshot_dir: Path,
+        cmd: str,
+        overlay: Overlay,
+        fmt: str,
+        meta: GitMeta,
+        root: str = "",
+    ) -> tuple[tuple[str, str | None, int | None] | None, str, Overlay]:
+        """The command's exact answer when every stage computed; otherwise, as evidence for the
+        simulator, the stages in order: each computed one with its output, each gap marked (at
+        most `_MAX_GAP_GROUPS` runs of gaps, beyond which the evidence would not help). Last, the
+        checkout as the stages leave it, which the simulator's facts describe."""
+        result = self._execute(snapshot_dir, cmd, overlay, fmt, meta, root)
+        if not result:
+            return None, "", overlay
+        executed, working = result
+        if all(ran.answer is not None and ran.surely for ran in executed):
+            raw = "".join(ran.answer[0] for ran in executed)
+            text = raw.removesuffix("\n")
+            exact = _scaffold_truncate(raw, fmt) if text else ""
+            block = COMPUTED_HEADER + "\n" + exact + "\n" if text else COMPUTED_EMPTY
+            returncode = executed[-1].answer[1]
+            computed = (_truncate(block, self.settings.max_context_chars), exact, returncode)
+            return computed, "", working
+        if len(_gap_groups(executed)) > _MAX_GAP_GROUPS or not any(
+            ran.answer and ran.answer[0] for ran in executed
+        ):
+            return None, "", working
+        shown = []
+        for ran in executed:
+            stage, answer, surely = ran.stage, ran.answer, ran.surely
+            joined = f"{stage.separator} " if stage.separator in (AND, OR) else ""
+            if answer is None:
+                note = CHAIN_GAP if surely else CHAIN_MAYBE_GAP
+                shown.append(f"{joined}$ {stage.text}\n{note}")
+            else:
+                body = _truncate(answer[0].removesuffix("\n"), self.settings.max_file_chars)
+                note = "" if surely else f"\n{CHAIN_MAYBE_RUN}"
+                shown.append(f"{joined}$ {stage.text}\n{body or CHAIN_NO_OUTPUT}{note}")
+        evidence = "\n" + CHAIN_EVIDENCE_HEADER + "\n" + "\n\n".join(shown) + "\n"
+        return None, evidence, working
 
     def _build_repo_block(
         self,
@@ -1256,28 +1602,34 @@ class RepoContextService:
         root: str = "",
         attested: set[str] | None = None,
     ) -> tuple[str, str | None, int | None]:
-        computed = self._computed_search_block(
-            snapshot_dir, listing, cmd, overlay, fmt, attested, root
-        )
-        if computed is not None:
-            return computed
         meta = meta or GitMeta()
-        computed_git = self._computed_git_block(snapshot_dir, listing, cmd, overlay, fmt, meta)
-        if computed_git is not None:
-            return computed_git
-        computed_chain = self._computed_chain_block(
-            snapshot_dir, listing, cmd, overlay, fmt, attested, root
-        )
-        if computed_chain is not None:
-            return computed_chain
-        evidence = self._chain_evidence(
-            snapshot_dir, listing, cmd, overlay, attested, root
-        ) + self._git_hints(snapshot_dir, listing, cmd, overlay, meta)
+        viewed = _EDITOR_READ.fullmatch(cmd.strip()) if overlay.editor else None
+        evidence = ""
+        if viewed is not None:
+            # the editor's view, or none at all: bash's answer is not what the scaffold shows
+            view = _editor_answer(overlay, viewed)
+            if view is not None:
+                return "", view, 0
+        else:
+            computed_chain, evidence, overlay = self._run_chain(
+                snapshot_dir, cmd, overlay, fmt, meta, root
+            )
+            if computed_chain is not None:
+                return computed_chain
+        listing = overlay.listing()
+        evidence += self._git_hints(snapshot_dir, listing, cmd, overlay, meta)
         listing_paths, _ = _filter_listing(listing, cmd)
-        present, missing = _referenced_paths(cmd, listing)
+        present, missing = _referenced_paths(cmd, listing, overlay.text)
         missing, vouched = _split_attested(missing, attested)
-        listing_header = LISTING_HEADER_ROOTED.format(root=root) if root else LISTING_HEADER
+        # a path the session may have made, or made a directory of, is not reported absent
+        missing = [path for path in missing if overlay.kind(repo_path(path) or path) is None]
         show = lambda path: f"{root}/{path}" if root else f"./{path}"  # noqa: E731
+        listing_header = LISTING_HEADER_ROOTED.format(root=root) if root else LISTING_HEADER
+        # the checkout's own doubts; outside it only the session's files are ever shown
+        doubtful = [p for p in sorted(overlay.unsure) + sorted(overlay.maybe) if p[:1] != "/"]
+        if doubtful:
+            shown = [f"- {show(p) if p else '(the whole repository)'}" for p in doubtful[:10]]
+            listing_header += UNCERTAIN_LISTING_NOTE + "\n".join(shown) + "\n"
         missing_text = (
             "\n"
             + NOT_PRESENT_HEADER
@@ -1311,7 +1663,7 @@ class RepoContextService:
         contents_parts: list[str] = []
         contents_used = len(contents_header) + 2
         for path in present[: self.settings.max_files]:
-            text = self._file_text(snapshot_dir, path, overlay)
+            text = overlay.text(path)
             stale = False
             if text is None and overlay.is_dirty(path):
                 # edited by something we cannot model: the pre-edit text still beats nothing
@@ -1320,7 +1672,7 @@ class RepoContextService:
                 continue
             body = _truncate(text, self.settings.max_file_chars)
             if wants_numbers:
-                body = _number_lines(body, grep_style)
+                body = number_lines(body, grep_style)
             label = f"{show(path)}{PRE_EDIT_SUFFIX if stale else ''}"
             part = f"--- {label} ---\n{body}\n"
             if contents_used + len(part) > contents_budget:
@@ -1387,17 +1739,13 @@ class RepoContextService:
         ledger = ledger_block(overlay.git) if is_git_command(cmd) else ""
         return hint + evidence + ledger
 
-    def _file_text(self, snapshot_dir: Path, rel_path: str, overlay: Overlay) -> str | None:
-        if overlay.is_dirty(rel_path):
-            return None
-        return overlay.read(rel_path) or self._read_snapshot_file(snapshot_dir, rel_path)
-
     def _file_size(self, snapshot_dir: Path, rel_path: str, overlay: Overlay) -> int | None:
-        if overlay.is_dirty(rel_path):
+        if overlay.kind(rel_path) != FILE or overlay.is_dirty(rel_path):
             return None
-        held = overlay.read(rel_path)
-        if held is not None:
+        if (held := overlay.read(rel_path)) is not None:
             return len(held.encode("utf-8", "replace"))
+        if rel_path.startswith("/"):
+            return None
         root = snapshot_dir.resolve()
         try:
             target = (snapshot_dir / rel_path).resolve()
@@ -1424,7 +1772,7 @@ class RepoContextService:
         if not self.settings.dataset_root:
             return None
         try:
-            row = _read_parquet_row(Path(self.settings.dataset_root) / shard_name, row_idx)
+            row = read_parquet_row(Path(self.settings.dataset_root) / shard_name, row_idx)
         except Exception as exc:
             logger.info(
                 "repo_context_trajectory_unavailable shard={} row={} error={}",
@@ -1433,19 +1781,19 @@ class RepoContextService:
                 f"{type(exc).__name__}: {exc}",
             )
             return None
-        normalized = {key: _unwrap_column(value) for key, value in row.items()}
-        turns = _extract_turns(normalized)
-        assistant_positions = [i for i, turn in enumerate(turns) if _role(turn) == "assistant"]
+        normalized = {key: unwrap_column(value) for key, value in row.items()}
+        turns = extract_turns(normalized)
+        assistant_positions = [i for i, turn in enumerate(turns) if turn_role(turn) == "assistant"]
         pairs: list[tuple[str, str]] = []
         for assistant_index, position in enumerate(assistant_positions):
             if assistant_index < turn_idx:
                 continue
-            command = _first_command(_content(turns[position]))
+            command = first_bash_block(turn_content(turns[position]))
             if not command or position + 1 >= len(turns):
                 continue
-            if _role(turns[position + 1]) == "assistant":
+            if turn_role(turns[position + 1]) == "assistant":
                 continue
-            observation = _content(turns[position + 1]).strip()
+            observation = turn_content(turns[position + 1]).strip()
             if not observation:
                 continue
             if ANY_MARKER_RE.search(command) or ANY_MARKER_RE.search(observation):

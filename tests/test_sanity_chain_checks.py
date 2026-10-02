@@ -568,19 +568,11 @@ def test_four_wrong_submits_in_a_row_are_a_submission_loop():
         assert looped.startswith(f"submission loop: {SUBMISSION_LOOP_RUN} submit attempts in a row")
 
 
-def test_a_fourth_wrong_submit_in_the_trajectory_fails_it():
-    from sanity_service.chain import WRONG_SUBMIT_LIMIT, submission_loop_issue
-
-    replies = (WRONG, "ls", WRONG, CLAUSE, WRONG, "cat a.py")
-    assert submission_loop_issue(_replies(*replies, accepted=(3,))) == ""
-    failed = submission_loop_issue(_replies(*replies, WRONG, accepted=(3,)))
-    assert failed.startswith(f"wrong submission: {WRONG_SUBMIT_LIMIT} submit attempts")
-
-
-def test_a_submission_loop_is_reported_before_the_wrong_submission_total():
+def test_wrong_submits_broken_up_by_other_work_never_fail():
     from sanity_service.chain import submission_loop_issue
 
-    assert submission_loop_issue(_replies(WRONG, "ls", *[WRONG] * 4)).startswith("submission loop:")
+    replies = (WRONG, "ls", WRONG, CLAUSE, WRONG, "cat a.py", WRONG, "ls", WRONG)
+    assert submission_loop_issue(_replies(*replies, accepted=(3,))) == ""
 
 
 def test_the_dispatcher_accepts_a_correct_submit_before_counting_it():
@@ -597,4 +589,4 @@ def test_the_dispatcher_accepts_a_correct_submit_before_counting_it():
 
     assert [reply(command) for command in ("ls", wrong, wrong, wrong, CLAUSE)] == [""] * 5
     assert state.turns[-1]["submit_accepted"] and not state.turns[1]["submit_accepted"]
-    assert reply(wrong).startswith("wrong submission: 4 submit attempts")
+    assert reply(wrong) == ""

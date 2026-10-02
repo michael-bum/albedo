@@ -412,7 +412,8 @@ _BARE_LINE_NUMBER = re.compile(r"^\s*\d+\s*$")
 
 
 _PRINTS_NOTHING = re.compile(
-    r"^(?:cd|rm|mkdir|mv|cp|touch|export|chmod|true|git add|sed\s+(?:-i|--in-place))\b"
+    r"^(?:cd|rm|mkdir|mv|cp|touch|export|chmod|true|test|go build|python3? -m py_compile|git add"
+    r"|sed\s+(?:-i|--in-place))\b"
 )
 
 

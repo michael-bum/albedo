@@ -118,6 +118,10 @@ _BACKTICK_RE = re.compile(r"`([^`\n]*)`")
 _BASH_FENCE_RE = re.compile(r"```(?:bash|sh|shell)[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 _ECHO_RE = re.compile(r"(?<![\w./-])echo[ \t]+")
 _LINE_CONTINUATION_RE = re.compile(r"\\\r?\n")
+_QUIET_SCRIPT_RE = re.compile(
+    r"python3?[ \t]+-?[ \t]*<<-?[ \t]*(['\"]?)(\w+)\1[^\n]*\n(.*?)\n[ \t]*\2[ \t]*$", re.M | re.S
+)
+_SCRIPT_PRINTS_RE = re.compile(r"\bprint\b|sys\.std(?:out|err)|subprocess|os\.system")
 _VERBOSE_FLAG_RE = re.compile(r"(?<!\S)(?:-[A-Za-z]*v[A-Za-z]*|--verbose)(?!\S)")
 
 
@@ -341,6 +345,9 @@ def bench_submitted(command: str, marker: str) -> bool:
     if not marker:
         return False
     command = strip_leading_comments(command or "")
+    command = _QUIET_SCRIPT_RE.sub(
+        lambda m: m[0] if _SCRIPT_PRINTS_RE.search(m[3]) else "true", command
+    )
     for body in heredoc_bodies(command):
         command = command.replace(body, "", 1)
     command = _LINE_CONTINUATION_RE.sub(" ", command)

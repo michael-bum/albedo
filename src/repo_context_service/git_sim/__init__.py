@@ -10,7 +10,7 @@ from .execute import run_git
 from .models import GitMeta, GitResult, GitState
 from .notes import explain_git, ledger_block
 from .parse import is_git_command, parse_git
-from .patches import apply_hunks, unified_diff
+from .patches import apply_hunks, root_commit_header, unified_diff
 from .session import apply_git_stage, learn_git
 from .templates import DEFAULT_ABBREV, DEFAULT_BRANCH
 
@@ -29,6 +29,7 @@ __all__ = [
     "learn_git",
     "ledger_block",
     "parse_git",
+    "root_commit_header",
     "run_git",
     "unified_diff",
 ]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from .models import GitMeta, GitPlan, GitState
 from .parse import GIT_HEAD, SHORT_STATUS, STASH_RESTORE, git_stages, parse_git, subcommand_of
 from .render import head_line, status_sets
@@ -66,13 +68,30 @@ _NOTES = {
     "log": (
         'git log --oneline prints "<short sha> <subject>" per commit, newest first, starting at '
         "the checked-out commit {short}.",
-        "Never invent commit hashes or subjects: reuse only shas already visible in this prompt, "
-        "and keep the count the command asks for.",
+        "Never invent commit hashes or subjects: list only commits visible in this prompt, and "
+        "when fewer are visible than the command asks for, print only those.",
+    ),
+    "log_root": (
+        "This repository's history is exactly ONE commit, {short} ({subject}): a root commit "
+        "that added every tracked file. Every git log lists that commit and no other.",
+        "With -p it is shown as one patch that adds each file whole; a -S/-G search matches it "
+        "when the text is in the file as committed. Its header is:\n{root_header}",
     ),
     "show": (
         "git show prints the commit header (commit/Author/Date, blank line, indented subject) "
         "followed by its patch, for commit {short} unless another rev is named.",
         "Never invent a commit message or patch for a sha that is not visible in this prompt.",
+    ),
+    "show_root": (
+        "This repository's history is exactly ONE commit, {short}: a root commit, so git show "
+        "prints its header and then a patch that adds every tracked file as a new file.",
+        "The header, exactly as git prints it:\n{root_header}",
+    ),
+    "show_blob": (
+        "git show <rev>:<path> prints the text of that file as committed at <rev> — no commit "
+        "header and no patch. At HEAD ({short}) every tracked file is committed exactly as the "
+        "session found it in the checkout, before any edit this session made.",
+        "It fails only for a path git does not track at that commit.",
     ),
     "stash": (
         'git stash prints exactly one line — "Saved working directory and index state WIP on '
@@ -107,6 +126,9 @@ _NOTES = {
 }
 
 
+_SHOW_BLOB = re.compile(r"\bshow\s+(?:-\S+\s+)*[^\s:|;&<>-][^\s:|;&<>]*:\S")
+
+
 def _state_line(views: Views, state: GitState) -> str:
     staged, unstaged, untracked, uncertain = status_sets(views)
     if state.unknown or uncertain:
@@ -138,6 +160,10 @@ def explain_git(
             sub = "status_short"
         elif sub == "stash" and STASH_RESTORE.search(stage):
             sub = "stash_pop"
+        elif sub == "show" and _SHOW_BLOB.search(stage):
+            sub = "show_blob"
+        elif sub in ("show", "log") and meta is not None and meta.root_header:
+            sub += "_root"
         if sub in _NOTES and sub not in subs:
             subs.append(sub)
     if not subs:
@@ -153,6 +179,8 @@ def explain_git(
             else "Do not invent remote branches: this checkout has no remote-tracking refs."
         ),
         "short": state.head_short or meta.short or "the checked-out commit",
+        "subject": meta.root_header[4].strip() if len(meta.root_header) > 4 else "",
+        "root_header": "\n".join(meta.root_header),
         "state_line": _state_line(views, state),
         "stash_depth": str(len(state.stash)),
         "wip_ref": (

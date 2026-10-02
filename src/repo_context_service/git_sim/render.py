@@ -296,7 +296,46 @@ def _run_remote(plan: GitPlan, views: Views, meta: GitMeta) -> GitResult | Parse
     return GitResult(output="\n".join(lines), empty=False)
 
 
+def _names_head(rev: str, views: Views, meta: GitMeta) -> bool:
+    """Whether a rev is the checked-out commit: HEAD, or a prefix of its sha when known."""
+    if rev in ("HEAD", "@"):
+        return True
+    if len(rev) < 4 or not re.fullmatch(r"[0-9a-f]+", rev):
+        return False
+    shas = [views.state.head_short or ""]
+    if meta.sha and (meta.detached or views.state.detached or meta.root_header):
+        shas.append(meta.sha)
+    return any(sha and (sha.startswith(rev) or rev.startswith(sha)) for sha in shas)
+
+
+def _show_blob(plan: GitPlan, views: Views, meta: GitMeta) -> GitResult | ParseFailure:
+    """`git show <rev>:<path>`: the file's text as committed at the checked-out commit, which is
+    the checkout as the session found it."""
+    if plan.flags - {"--no-color"} or len(plan.paths) != 1:
+        return ParseFailure("unsupported_form", "show <rev>:<path> with flags")
+    rev, _, raw = plan.paths[0].partition(":")
+    path = repo_path(raw)
+    if not path or not _names_head(rev, views, meta):
+        return ParseFailure("unsupported_form", "show <rev>:<path> of another commit")
+    if not views.overlay.in_base(path):
+        if views.holds_tracked(path) or plan.pipeline:
+            return ParseFailure("unsupported_form", "show <rev>:<dir> or a failing pipe")
+        where = "exists on disk, but not in" if views.present(path) else "does not exist in"
+        error = "" if plan.dropped_stderr else f"fatal: path '{raw}' {where} '{rev}'"
+        return GitResult(output=error, returncode=128, empty=not error)
+    text = views.head(path)
+    if text is None or "\x00" in text:
+        return ParseFailure("unsupported_form", "show <rev>:<path> unreadable")
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    lines = apply_pipeline(lines, plan.pipeline)
+    return GitResult(output="\n".join(lines), empty=not lines)
+
+
 def _run_show(plan: GitPlan, views: Views, meta: GitMeta) -> GitResult | ParseFailure:
+    if len(plan.paths) == 1 and ":" in plan.paths[0]:
+        return _show_blob(plan, views, meta)
     if plan.flags - {"--stat", "--", "--no-color"}:
         return ParseFailure("unsupported_form", "show flag")
     wanted: list[str] = []
@@ -387,7 +426,7 @@ def _run_log(plan: GitPlan, views: Views, meta: GitMeta) -> GitResult | ParseFai
     scoped = None
     if paths:
         scoped = repo_path(paths[0])
-        if not scoped or scoped not in views.listing_set:
+        if not scoped or not (scoped in views.listing_set or views.holds_tracked(scoped)):
             return ParseFailure("unsupported_form", "log pathspec not tracked")
     if not callable(meta.history):
         return ParseFailure("unsupported_form", "no history source")

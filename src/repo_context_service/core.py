@@ -64,6 +64,7 @@ from .git_sim import (
     is_git_command,
     ledger_block,
     parse_git,
+    root_commit_header,
     run_git,
 )
 from .overlay import (
@@ -1107,11 +1108,12 @@ class RepoContextService:
         # still has it and its subject does not name the mirrored PR
         mirrored = owner == _SMITH_MIRROR_OWNER
         shown_owner, shown_repo = _smith_upstream(repo) if mirrored else (owner, repo)
-        head, subject = sha, _SMITH_SQUASHED_SUBJECT
+        head, subject, root = sha, _SMITH_SQUASHED_SUBJECT, ()
         if mirrored:
             point = self._upstream_point(shown_owner, shown_repo, repo.rpartition(".")[2])
-            if point is not None and not _names_mirrored_pr(point[1], instance_id):
-                head, subject = point
+            if point is not None and not _names_mirrored_pr(point["subject"], instance_id):
+                head, subject = point["sha"], point["subject"]
+                root = root_commit_header(point)
         return GitMeta(
             sha=head,
             owner=shown_owner,
@@ -1125,6 +1127,7 @@ class RepoContextService:
             decorate=scaffold.decorate,
             squashed=scaffold.squashed,
             tracking=scaffold.tracking,
+            root_header=root,
             history=(
                 (lambda path: _squashed_history(head, subject))
                 if mirrored
@@ -1151,12 +1154,14 @@ class RepoContextService:
             return None
         return self._commit_patch(snapshot, owner, repo, rev)
 
-    def _upstream_point(self, owner: str, repo: str, short: str) -> tuple[str, str] | None:
+    def _upstream_point(self, owner: str, repo: str, short: str) -> dict | None:
+        """The upstream commit a swesmith mirror was built from: sha, subject and the header
+        `git show` prints for it (author, author date in UTC, message body)."""
         cache_path = self._upstream_dir / f"{_safe_name(owner)}__{_safe_name(repo)}__{short}.json"
         cached = _read_json(cache_path)
         if isinstance(cached, dict):
-            if cached.get("sha"):
-                return cached["sha"], cached["subject"]
+            if cached.get("sha") and "author" in cached:
+                return cached
             absent = cached.get("kind") == "absent"
             ttl = _UPSTREAM_ABSENT_TTL_SECONDS if absent else _TRANSIENT_TTL_SECONDS
             if time.time() - float(cached.get("failed_at", 0)) < ttl:
@@ -1164,9 +1169,12 @@ class RepoContextService:
         try:
             data = self._github_json(f"/repos/{owner}/{repo}/commits/{short}")
             full = str(data.get("sha") or "")
-            subject = str((data.get("commit") or {}).get("message") or "").split("\n")[0].strip()
+            commit = data.get("commit") or {}
+            subject, _, body = str(commit.get("message") or "").partition("\n")
+            subject = subject.strip()
             if not (short and full.startswith(short) and subject):
                 raise _NotFound(f"{owner}/{repo}@{short}")
+            author = commit.get("author") or {}
         except Exception as exc:
             kind = "absent" if _is_permanent_github_error(exc) else "transient"
             logger.info(
@@ -1179,8 +1187,15 @@ class RepoContextService:
             )
             _write_json_atomic(cache_path, {"sha": None, "failed_at": time.time(), "kind": kind})
             return None
-        _write_json_atomic(cache_path, {"sha": full, "subject": subject})
-        return full, subject
+        point = {
+            "sha": full,
+            "subject": subject,
+            "author": f"{author.get('name') or ''} <{author.get('email') or ''}>",
+            "date": str(author.get("date") or ""),
+            "body": body.strip("\n"),
+        }
+        _write_json_atomic(cache_path, point)
+        return point
 
     def _commit_patch(self, snapshot: Path, owner: str, repo: str, rev: str) -> str | None:
         cache_path = snapshot / _PATCH_NAME.format(key=_hashed(rev))

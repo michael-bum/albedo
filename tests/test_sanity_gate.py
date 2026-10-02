@@ -890,3 +890,33 @@ def test_fail_suffix_blocking_verdicts_promise_no_strikes():
     assert fail_suffix("not viable: never edits", 3, 3).startswith(
         " — hotkey has 0 validation strikes left"
     )
+
+
+def test_a_slot_whose_microtask_fails_is_redrawn_before_the_run(monkeypatch):
+    from sanity_service.dataset import SanitySample
+
+    def _messages(task):
+        return [{"role": "system", "content": "reply with bash"}, {"role": "user", "content": task}]
+
+    async def _inject(states):
+        for state in states:
+            if state.sample_id == "ungrounded":
+                state.error = "microtask_generation_failed: no grounded function"
+
+    drawn = [SanitySample("p", _messages(t), t) for t in ("kept", "ungrounded", "fresh")]
+    monkeypatch.setattr(D, "_inject_microtasks", _inject)
+    monkeypatch.setattr(D, "sample_prompts", lambda **_: drawn)
+    request = SanityRunRequest(
+        run_id="run",
+        model_uri="model",
+        digest="digest",
+        prompts=["p", "p"],
+        sample_ids=["kept", "ungrounded"],
+        prompt_messages=[_messages("kept"), _messages("ungrounded")],
+    )
+    states = D._trajectory_states(request)
+    asyncio.run(_inject(states))
+    asyncio.run(D._redraw_failed_microtasks(SanitySettings(), request, states))
+
+    assert [s.sample_id for s in states] == ["kept", "fresh"]
+    assert not any(s.error for s in states)

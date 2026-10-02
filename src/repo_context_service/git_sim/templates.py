@@ -33,16 +33,15 @@ NO_NEWLINE_MARKER = "\\ No newline at end of file"
 FUNCNAME_MAX_CHARS = 80
 EVIDENCE_LOG_LIMIT = 40
 
-_MUTATING = {"add", "checkout", "restore", "reset", "stash", "rm", "mv", "apply", "commit"}
-_GLOBAL_VALUE_FLAGS = {"-C", "-c", "--git-dir", "--work-tree", "--exec-path", "--namespace"}
-_GLOBAL_BOOL_FLAGS = {
+GLOBAL_VALUE_FLAGS = {"-C", "-c", "--git-dir", "--work-tree", "--exec-path", "--namespace"}
+GLOBAL_BOOL_FLAGS = {
     "--no-pager",
     "--paginate",
     "--no-replace-objects",
     "--bare",
     "--literal-pathspecs",
 }
-_FUNCNAME = re.compile(r"^[A-Za-z$_]")
+FUNCNAME = re.compile(r"^[A-Za-z$_]")
 
 
 COMMIT_LINE = "commit {sha}"
@@ -70,12 +69,10 @@ UNCERTAIN_STATE_LINE = (
     "files from the transcript above, and never call a file unchanged on a guess."
 )
 
-_OPAQUE = {
+OPAQUE = {
     "commit",
     "apply",
     "am",
-    "rm",
-    "mv",
     "merge",
     "rebase",
     "revert",
@@ -83,9 +80,9 @@ _OPAQUE = {
     "clean",
     "pull",
 }
-_HISTORY_CHANGING = {"commit", "am", "merge", "rebase", "revert", "cherry-pick", "pull"}
-_HISTORY_ONLY = {"log", "show", "rev-parse", "remote"}
-_READ_ONLY = {
+HISTORY_CHANGING = {"commit", "am", "merge", "rebase", "revert", "cherry-pick", "pull"}
+HISTORY_ONLY = {"log", "show", "rev-parse", "remote"}
+READ_ONLY = {
     "log",
     "show",
     "status",

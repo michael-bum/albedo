@@ -12,6 +12,13 @@ import pyarrow.parquet as pq
 import pytest
 
 from albedo_config import RepoContextSettings
+from albedo_eval_service.shared.observation_format import (
+    OPENHANDS,
+    PYTEST_MISSING,
+    first_bash_block,
+    grounded_observation,
+)
+from repo_context_service import core
 from repo_context_service.command_search import ParseFailure, parse_search, run_search
 from repo_context_service.core import (
     _NEGATIVE_TTL_SECONDS,
@@ -19,13 +26,13 @@ from repo_context_service.core import (
     _TRANSIENT_TTL_SECONDS,
     GroundingContext,
     RepoContextService,
+    _data_words,
+    _editor_view,
     _filter_listing,
-    _first_command,
     _is_permanent_github_error,
     _NotFound,
     _referenced_paths,
     _safe_name,
-    _sed_scripts,
     _smith_mirror,
     _SnapshotTooLarge,
     parse_instance,
@@ -87,10 +94,28 @@ def test_parse_instance_formats():
     assert parse_instance("mini-coder", "owner__repo.ZZZZZZ") is None
 
 
-def test_first_command_takes_first_block_only():
-    text = "THOUGHT: x\n\n```bash\nls -la\n```\n```bash\nrm -rf /\n```"
-    assert _first_command(text) == "ls -la"
-    assert _first_command("no block") == ""
+def test_grounding_and_the_replay_read_the_command_the_judge_reads(tmp_path, monkeypatch):
+    """The judge runs the first `bash` fence or `<..._bash_...>` tag; grounding must answer that
+    command and the replay must apply it. A code snippet in an untagged or another language's
+    fence is not a command: replaying `rm` out of it would change a checkout nothing changed."""
+    service = make_service(tmp_path)
+    make_snapshot(service, {"a.py": "alpha\n", "b.py": "beta\n"})
+    monkeypatch.setattr(service, "_resolve_sha", lambda ref: ("o", "r", FULL_SHA))
+    done = {"role": "user", "content": "<returncode>0</returncode>\n<output>\n</output>"}
+    tagged = "<mswea_bash_command>cat a.py</mswea_bash_command>"
+    assert first_bash_block(tagged) == "cat a.py"
+    result = service.repo_context_for_instance("swe-zero", "o__r-12", tagged, fmt="returncode")
+    assert result.exact_output == "alpha"
+    removed = [{"role": "assistant", "content": "<mswea_bash_command>rm a.py</mswea_bash_command>"}]
+    after = service.repo_context_for_instance(
+        "swe-zero", "o__r-12", "```bash\ncat a.py\n```", removed + [done], fmt="returncode"
+    )
+    assert after.exact_output == "cat: a.py: No such file or directory"
+    snippet = [{"role": "assistant", "content": "Next:\n```\nrm b.py\n```"}, done]
+    kept = service.repo_context_for_instance(
+        "swe-zero", "o__r-12", "```bash\ncat b.py\n```", snippet, fmt="returncode"
+    )
+    assert kept.exact_output == "beta"
 
 
 def test_iid_lookup_from_manifest(tmp_path):
@@ -280,7 +305,8 @@ def test_extract_tarball_sanitizes_members(tmp_path):
     dest = tmp_path / "out"
     dest.mkdir()
     listing, extracted_bytes = service._extract_tarball(tar_path, dest)
-    assert listing == ["huge.bin", "src/app.py"]
+    # a link and an oversized file are listed, with text not kept
+    assert listing == ["huge.bin", "link.py", "src/app.py"]
     assert extracted_bytes == len(b"print('hi')\n")
     assert (dest / "src/app.py").read_text() == "print('hi')\n"
     assert not (tmp_path / "evil.txt").exists()
@@ -309,8 +335,8 @@ def test_repo_block_contents_and_containment(tmp_path, monkeypatch):
     assert "./src/app.py" in block
     not_present = block.split("FILES NOT PRESENT")[1]
     assert "- .env" in not_present
-    assert "- /etc/passwd" in not_present
-    assert "- ../../secret" in not_present
+    # outside the checkout: not the repo's to deny
+    assert "- /etc/passwd" not in not_present and "- ../../secret" not in not_present
     assert "- missing/file.py" in not_present
     assert "s/a/b" not in not_present
     assert "- src" not in not_present
@@ -384,8 +410,9 @@ def test_a_long_listing_is_derived_from_the_snapshot():
     read = {"a.py": "L1\nL2\n", "pkg/b.py": "X\n"}.get
     rows = run_search(parse_search("ls -l"), read, listing).output.split("\n")
     assert rows[0] == "total 8"
-    assert re.fullmatch(r"-rw-r--r-- 1 root root\s+6 \w{3} +\d+ [\d:]+ a\.py", rows[1]), rows[1]
-    assert re.fullmatch(r"drwxrwxrwx 2 root root\s+4096 \w{3} +\d+ [\d:]+ pkg", rows[2]), rows[2]
+    # each column as wide as its widest value, as GNU ls aligns them
+    assert re.fullmatch(r"-rw-r--r-- 1 root root    6 \w{3} +\d+ [\d:]+ a\.py", rows[1]), rows[1]
+    assert re.fullmatch(r"drwxr-xr-x 2 root root 4096 \w{3} +\d+ [\d:]+ pkg", rows[2]), rows[2]
     assert run_search(parse_search("ls -l a.py"), read, listing).output.endswith(" a.py")
     assert isinstance(parse_search("ls -lh"), ParseFailure)
 
@@ -406,6 +433,13 @@ def _find(cmd: str) -> list[str]:
     return run_search(plan, {p: "x\n" for p in _FIND_TREE}.get, _FIND_TREE).output.split("\n")
 
 
+def _declined(cmd: str) -> bool:
+    plan = parse_search(cmd)
+    return isinstance(plan, ParseFailure) or isinstance(
+        run_search(plan, {p: "x\n" for p in _FIND_TREE}.get, _FIND_TREE), ParseFailure
+    )
+
+
 def test_find_answers_without_needing_a_grep_downstream():
     assert _find("find . -name '*.py'") == [
         "./node_modules/x/y.py",
@@ -414,24 +448,20 @@ def test_find_answers_without_needing_a_grep_downstream():
         "./src/util/deep/c.py",
         "./tests/t_one.py",
     ]
-    assert _find("find . -name '*.py' | head -2") == ["./node_modules/x/y.py", "./src/a.py"]
+    # the order of a walk is the filesystem's, so what `head` keeps of it is not known
+    assert _declined("find . -name '*.py' | head -2")
+    assert _find("find . -name '*.py' | sort | head -2") == ["./node_modules/x/y.py", "./src/a.py"]
     assert _find("find . -name '*.py' | wc -l") == ["5"]
     assert _find("find . -name '*.py' | grep util") == ["./src/util/b.py", "./src/util/deep/c.py"]
 
 
 def test_find_depth_and_directory_predicates():
-    assert _find("find . -type d") == [
-        ".",
-        "./docs",
-        "./node_modules",
-        "./node_modules/x",
-        "./src",
-        "./src/util",
-        "./src/util/deep",
-        "./tests",
-    ]
+    assert _find("find src -type d") == ["src", "src/util", "src/util/deep"]
+    # the checkout's .git holds directories whose names are not known
+    assert _declined("find . -type d")
     assert _find("find . -maxdepth 1 -type d") == [
         ".",
+        "./.git",
         "./docs",
         "./node_modules",
         "./src",
@@ -456,16 +486,20 @@ def test_find_or_is_honoured_only_within_one_predicate():
         "./src/util/deep/c.py",
         "./tests/t_one.py",
     ]
-    assert isinstance(parse_search("find . -path '*util*' -o -name '*.py'"), ParseFailure)
+    assert _find("find src -path '*util*' -o -name 'a.py'") == [
+        "src/a.py", "src/util", "src/util/b.py", "src/util/deep", "src/util/deep/c.py"
+    ]  # fmt: skip
+    # `-o` next to another test binds tighter than it looks: not reproduced
+    assert _declined("find . -name '*.py' -o -name '*.md' -type f")
 
 
 def test_find_exec_ls_renders_one_long_row_per_hit():
     assert _find("find . -name '*.py' -exec ls -la {} \\;") == [
-        "-rw-r--r-- 1 root root        2 Jan  3 20:00 ./node_modules/x/y.py",
-        "-rw-r--r-- 1 root root        2 Jan  3 20:00 ./src/a.py",
-        "-rw-r--r-- 1 root root        2 Jan  3 20:00 ./src/util/b.py",
-        "-rw-r--r-- 1 root root        2 Jan  3 20:00 ./src/util/deep/c.py",
-        "-rw-r--r-- 1 root root        2 Jan  3 20:00 ./tests/t_one.py",
+        "-rw-r--r-- 1 root root 2 Jan  3 20:00 ./node_modules/x/y.py",
+        "-rw-r--r-- 1 root root 2 Jan  3 20:00 ./src/a.py",
+        "-rw-r--r-- 1 root root 2 Jan  3 20:00 ./src/util/b.py",
+        "-rw-r--r-- 1 root root 2 Jan  3 20:00 ./src/util/deep/c.py",
+        "-rw-r--r-- 1 root root 2 Jan  3 20:00 ./tests/t_one.py",
     ]
     assert _find("find src -type f -exec ls {} \\;") == [
         "src/a.py",
@@ -504,6 +538,89 @@ def test_a_missing_read_target_reports_the_shell_error_it_would_print():
     assert run_search(parse_search("cat a.py"), read, listing).output == "l1"
 
 
+def test_grep_reports_a_directory_operand_as_a_file_without_matches():
+    """GNU grep prints `Is a directory` and then counts or lists the directory as it would an
+    empty file: `-c` gives it 0, `-L` names it, `-l` and plain matching print nothing for it."""
+    listing = ["a.py", "b.cfg", "pkg/a.py"]
+    read = {"a.py": "S here\n", "b.cfg": "x\n", "pkg/a.py": "y\n"}.get
+
+    def out(cmd):
+        return run_search(parse_search(cmd), read, listing)
+
+    counted = out("grep -c S a.py pkg")
+    assert (counted.output, counted.returncode) == ("a.py:1\ngrep: pkg: Is a directory\npkg:0", 2)
+    assert out("grep -c S pkg").output == "grep: pkg: Is a directory\n0"
+    assert out("grep -s -c S b.cfg pkg").output == "b.cfg:0\npkg:0"
+    assert out("grep -L S b.cfg pkg a.py").output == "b.cfg\ngrep: pkg: Is a directory\npkg"
+    assert out("grep -l S b.cfg pkg a.py").output == "grep: pkg: Is a directory\na.py"
+    assert out("grep -n S a.py pkg").output == "a.py:1:S here\ngrep: pkg: Is a directory"
+    assert out("grep -c S nothere b.cfg").output == (
+        "grep: nothere: No such file or directory\nb.cfg:0"
+    )
+
+
+def test_ls_reports_missing_operands_in_argument_order_before_the_sorted_listing():
+    listing = ["a.py", "b.cfg", "adir/q", "zdir/w"]
+    read = {path: "x\n" for path in listing}.get
+    result = run_search(parse_search("ls zmiss b.cfg amiss zdir adir a.py"), read, listing)
+    assert result.output == (
+        "ls: cannot access 'zmiss': No such file or directory\n"
+        "ls: cannot access 'amiss': No such file or directory\n"
+        "a.py\nb.cfg\n\nadir:\nq\n\nzdir:\nw"
+    )
+    assert result.returncode == 2
+
+
+def test_head_prints_a_header_before_a_directory_error_among_several_operands():
+    """head opens a directory before the read fails, so its `==> name <==` header is printed;
+    a missing operand gets no header, and a blank line precedes every header but the first."""
+    listing = ["a.py", "adir/q", "tests/t.py"]
+    read = {"a.py": "S here\n", "adir/q": "q\n", "tests/t.py": "x\n"}.get
+
+    def out(cmd):
+        return run_search(parse_search(cmd), read, listing).output
+
+    assert out("head -1 nothere tests") == (
+        "head: cannot open 'nothere' for reading: No such file or directory\n"
+        "==> tests <==\nhead: error reading 'tests': Is a directory"
+    )
+    assert out("head -1 tests adir") == (
+        "==> tests <==\nhead: error reading 'tests': Is a directory\n\n"
+        "==> adir <==\nhead: error reading 'adir': Is a directory"
+    )
+    assert out("head -n 1 tests nothere a.py") == (
+        "==> tests <==\nhead: error reading 'tests': Is a directory\n"
+        "head: cannot open 'nothere' for reading: No such file or directory\n\n"
+        "==> a.py <==\nS here"
+    )
+    assert out("head -1 tests") == "head: error reading 'tests': Is a directory"
+
+
+def test_a_path_under_a_file_is_not_a_directory():
+    listing = ["a.py", "sub"]
+    read = {"a.py": "S here\n", "sub": "x\n"}.get
+    expected = {
+        "cat sub/conf.cfg": "cat: sub/conf.cfg: Not a directory",
+        "cat sub/a/b": "cat: sub/a/b: Not a directory",
+        "nl -ba sub/x": "nl: sub/x: Not a directory",
+        "head -1 sub/x": "head: cannot open 'sub/x' for reading: Not a directory",
+        "tail -n 1 sub/x": "tail: cannot open 'sub/x' for reading: Not a directory",
+        "sed -n 1p sub/x": "sed: can't read sub/x: Not a directory",
+        "wc -l sub/x": "wc: sub/x: Not a directory",
+        "grep S sub/x": "grep: sub/x: Not a directory",
+        "grep -c S sub/x a.py": "grep: sub/x: Not a directory\na.py:1",
+        "find sub/x -type f": "find: 'sub/x': Not a directory",
+        "ls sub/x": "ls: cannot access 'sub/x': Not a directory",
+        "head -1 sub/x a.py": (
+            "head: cannot open 'sub/x' for reading: Not a directory\n==> a.py <==\nS here"
+        ),
+    }
+    for cmd, message in expected.items():
+        result = run_search(parse_search(cmd), read, listing)
+        assert not isinstance(result, ParseFailure), cmd
+        assert result.output == message, cmd
+
+
 def test_grep_flags_that_change_nothing_on_text_are_accepted():
     listing = ["a.py"]
     read = {"a.py": "alpha\nbeta\n"}.get
@@ -525,9 +642,7 @@ def test_a_pattern_grep_itself_rejects_is_reported_not_refused():
     )
     quiet = run_search(parse_search('grep -rn "reverse\\|[::-1]" . 2>/dev/null'), read, listing)
     assert quiet.output == "" and quiet.empty is True
-    assert isinstance(
-        run_search(parse_search('rg -n "self.get\\(" a.py'), read, listing), ParseFailure
-    )
+    assert isinstance(parse_search('rg -n "self.get\\(" a.py'), ParseFailure)
 
 
 def test_paths_built_at_container_setup_are_not_claimed_absent():
@@ -567,7 +682,7 @@ def test_renderable_chain_stages_are_attached_as_evidence(tmp_path, monkeypatch)
     mixed = service.repo_context_for_instance(
         "swe-zero", "o__r-1", "```bash\nsed -n '1,2p' a.py && python run.py\n```"
     )
-    assert "CHAIN STAGES ALREADY EXECUTED" in mixed.context
+    assert "CHAIN STAGES —" in mixed.context
     assert "$ sed -n '1,2p' a.py\nL1\nL2" in mixed.context
     assert mixed.exact_output is None
     assert not mixed.context.lstrip().startswith("COMMAND OUTPUT —")
@@ -575,7 +690,7 @@ def test_renderable_chain_stages_are_attached_as_evidence(tmp_path, monkeypatch)
     nothing = service.repo_context_for_instance(
         "swe-zero", "o__r-1", "```bash\ncd /testbed && python run.py\n```"
     )
-    assert "CHAIN STAGES ALREADY EXECUTED" not in nothing.context
+    assert "CHAIN STAGES —" not in nothing.context
 
 
 def test_exact_output_is_offered_only_when_it_can_be_stood_behind(tmp_path, monkeypatch):
@@ -650,7 +765,7 @@ def test_trajectory_fallback_when_repo_unavailable(tmp_path, monkeypatch):
     monkeypatch.setattr(
         service,
         "repo_context_for_instance",
-        lambda *a: GroundingContext(context=None, kind="none", reason="snapshot_unavailable"),
+        lambda *a, **k: GroundingContext(context=None, kind="none", reason="snapshot_unavailable"),
     )
     result = service.context_for("swe-zero/data/train-00000.parquet:0:0", "```bash\npwd\n```")
     assert result.kind == "trajectory"
@@ -814,11 +929,11 @@ def test_a_chain_still_grounds_the_stages_after_one_it_cannot_render(tmp_path, m
     make_snapshot(service, {"a.py": "L1\nL2\nL3\n"})
     monkeypatch.setattr(service, "_resolve_sha", lambda ref: ("o", "r", FULL_SHA))
 
-    # git first: the whole chain used to be discarded because the loop stopped here
+    # a git stage first: the stages after it are still grounded
     after_git = service.repo_context_for_instance(
         "swe-zero", "o__r-1", "```bash\ngit show HEAD --stat && sed -n '1,2p' a.py\n```"
     )
-    assert "CHAIN STAGES ALREADY EXECUTED" in after_git.context
+    assert "CHAIN STAGES —" in after_git.context
     assert "$ sed -n '1,2p' a.py\nL1\nL2" in after_git.context
     assert after_git.exact_output is None
 
@@ -876,7 +991,7 @@ def test_posix_classes_and_stderr_redirects_do_not_silence_a_grep():
     hit = run_search(parse_search("grep -n '[[:space:]]*def' m.py"), read, listing)
     assert hit.output == "2:    def go(self):"
     assert not hit.empty
-    # 2>&1 is a redirect; the & in it used to be read as a control operator
+    # 2>&1 is a redirect, not a control operator
     assert not isinstance(parse_search("grep -rn target m.py 2>&1"), ParseFailure)
     assert not isinstance(parse_search("grep -rn target m.py 2>&1 | head -20"), ParseFailure)
     # sending stdout elsewhere is still not something we can claim was printed
@@ -907,11 +1022,16 @@ def test_no_exit_status_is_claimed_for_a_search_that_cannot_be_stood_behind(tmp_
     make_snapshot(service, {"src/app.py": "needle here\n"})
     monkeypatch.setattr(service, "_resolve_sha", lambda ref: ("o", "r", FULL_SHA))
 
-    # `grep -c` prints a "0" line while still failing, so neither answer is safe to assert
+    # verified against GNU grep: `-c` prints a "0" line and still fails, as nothing matched
     counted = service.repo_context_for_instance(
         "swe-zero", "o__r-1", "```bash\ngrep -rc absent-token src/\n```"
     )
-    assert counted.exact_returncode is None
+    assert (counted.exact_output, counted.exact_returncode) == ("src/app.py:0", 1)
+    # a status this cannot stand behind is never claimed: the search is left to the simulator
+    unknown = service.repo_context_for_instance(
+        "swe-zero", "o__r-1", "```bash\npython run.py | grep -c needle\n```"
+    )
+    assert unknown.exact_returncode is None
 
 
 def _search(cmd: str, files: dict[str, str]):
@@ -954,9 +1074,13 @@ def test_an_awk_line_window_reads_like_the_sed_range_it_is():
 def test_wc_l_counts_the_lines_and_names_the_operand():
     files = {"a.py": "".join(f"line {i}\n" for i in range(1, 21))}
     assert _search("wc -l a.py", files).output == "20 a.py"
-    # reading stdin, or several operands with their total, is not modelled
+    # verified against GNU wc: counts pad to the width of the files' total size
+    both = {**files, "b.py": "x\n"}
+    assert _search("wc -l a.py b.py", both).output == " 20 a.py\n  1 b.py\n 21 total"
+    assert _search("wc a.py", files).output == " 20  40 151 a.py"
+    assert _search("cat a.py | wc", files).output == "     20      40     151"
+    # reading the terminal is not modelled
     assert isinstance(parse_search("wc -l"), ParseFailure)
-    assert isinstance(parse_search("wc -c a.py"), ParseFailure)
 
 
 def test_a_read_of_a_missing_file_exits_the_way_its_own_tool_does():
@@ -973,9 +1097,14 @@ def test_cat_numbers_several_operands_as_one_stream():
     assert run_search(parse_search("cat a.py b.py"), read, listing).output == "one\ntwo\nthree"
     numbered = run_search(parse_search("cat -n a.py b.py"), read, listing).output
     assert numbered == "     1\tone\n     2\ttwo\n     3\tthree"
-    # head and tail banner each operand and wc -l adds a total, so they keep the one-file rule
-    assert isinstance(parse_search("head -3 a.py b.py"), ParseFailure)
-    assert isinstance(parse_search("wc -l a.py b.py"), ParseFailure)
+    # head and tail banner each operand
+    banners = run_search(parse_search("head -1 a.py b.py"), read, listing).output
+    assert banners == "==> a.py <==\none\n\n==> b.py <==\nthree"
+    # a file without its final line break runs into the next one, as cat writes it
+    joined = run_search(
+        parse_search("cat a.py b.py"), {"a.py": "one", "b.py": "two\n"}.get, listing
+    )
+    assert joined.output == "onetwo"
 
 
 def test_a_heredoc_body_is_never_reported_as_a_missing_file():
@@ -994,9 +1123,37 @@ def test_a_sed_script_is_never_reported_as_a_missing_file():
     listing = ["src/docx/text/run.py"]
     edit = "sed -i '112s/self.font.bold = True/self.font.bold = None/' src/docx/text/run.py"
     assert _referenced_paths(edit, listing)[1] == []
-    assert _sed_scripts("sed -i -e 's/a/b/' -e 's/c/d/' src/x.py") == ["s/a/b/", "s/c/d/"]
+    assert _data_words("sed -i -e 's/a/b/' -e 's/c/d/' src/x.py") == ["s/a/b/", "s/c/d/"]
     # the file the script runs against is still checked
     assert _referenced_paths("sed -i 's/a/b/' nope/gone.py", listing)[1] == ["nope/gone.py"]
+
+
+def test_inline_code_and_patterns_are_never_reported_as_missing_files():
+    """A module path in `python -c` code, or a dotted name grep searches for, is not a file: told
+    it is absent, the simulator answers `ModuleNotFoundError` for an import that works."""
+    listing = ["src/docx/text/run.py", "README.md"]
+    for command in (
+        "python3 -c 'from src.docx.text import run; print(run)'",
+        "grep -rn src.docx.text src",
+        "awk '/src.docx.x/' README.md",
+    ):
+        assert _referenced_paths(command, listing)[1] == [], command
+    # a file the code opens is still shown
+    assert _referenced_paths("python3 -c \"open('README.md')\"", listing)[0] == ["README.md"]
+
+
+def test_an_installed_package_is_never_reported_missing_but_a_checkout_file_is():
+    """A file outside the checkout (an installed package) is not the repo's to know: told it is
+    absent, the simulator answers `No such file` for a file that exists. The installed copy of
+    the project itself ends with a checkout path and must not be taken for it either."""
+    listing = ["src/docx/text/run.py", "README.md"]
+    for command in (
+        "cat /usr/lib/python3.11/site-packages/docx/text/run.py",
+        "ls /opt/conda/lib/python3.9/site-packages/docx",
+    ):
+        assert _referenced_paths(command, listing) == ([], []), command
+    for command in ("cat /testbed/src/docx/gone.py", "cat /workspace/o__r__1.0/src/docx/gone.py"):
+        assert _referenced_paths(command, listing)[1] == ["src/docx/gone.py"], command
 
 
 def _chain_result(service, command: str):
@@ -1026,59 +1183,97 @@ def test_a_chain_stops_at_the_stage_that_fails_and_reports_its_status(tmp_path, 
     assert "beta" not in (result.context or "")
 
 
-def test_a_chain_that_writes_before_it_reads_is_never_composed(tmp_path, monkeypatch):
-    """The read would be answered from the commit, which is the world the write just left.
-
-    Every stage is run against the same snapshot, so composing `sed -i` with the read that
-    follows it would assert the file's *old* content as the exact output of a command that ran
-    after the edit - a fabrication the assistant has no way to detect.
-    """
+def test_a_chain_applies_each_edit_before_the_stages_after_it(tmp_path, monkeypatch):
+    """A read after an edit in the same command sees the edit, as it would in a shell."""
     service = make_service(tmp_path)
     make_snapshot(service, {"a.py": "alpha\n"})
     monkeypatch.setattr(service, "_resolve_sha", lambda ref: ("o", "r", FULL_SHA))
 
-    for command in (
-        "sed -i 's/alpha/omega/' a.py && cat a.py",
-        "cp a.py b.py && cat a.py",
-        "cat a.py > copy.txt && cat a.py",
-        "rm a.py && ls .",
-    ):
-        result = _chain_result(service, command)
-        assert result.exact_output is None, command
-        assert "omega" not in (result.context or "")
+    edited = _chain_result(service, "sed -i 's/alpha/omega/' a.py && cat a.py")
+    assert (edited.exact_output, edited.exact_returncode) == ("omega", 0)
+    created = _chain_result(service, "cat > new.py <<'EOF'\nbody\nEOF\ncat new.py")
+    assert created.exact_output == "body"
+    lone = _chain_result(service, "sed -i 's/alpha/omega/' a.py")
+    assert (lone.exact_output, lone.exact_returncode) == ("", 0)
+    # the evidence for a stage that cannot run is taken after the edit, never before it
+    mixed = _chain_result(service, "sed -i 's/alpha/omega/' a.py && cat a.py && python run.py")
+    assert mixed.exact_output is None
+    assert "$ cat a.py\nomega" in mixed.context
+    # and the file contents the simulator gets are the edited ones
+    assert "--- ./a.py ---\nomega" in mixed.context
+    assert "\nalpha\n" not in mixed.context
 
 
-def test_a_chain_with_a_cd_past_its_head_is_never_composed(tmp_path, monkeypatch):
-    """Only a leading `cd` is a no-op for path resolution; a later one moves the stages after it.
+def test_a_chain_answers_its_reads_after_the_writes_before_them(tmp_path, monkeypatch):
+    service = make_service(tmp_path)
+    make_snapshot(service, {"a.py": "alpha\n"})
+    monkeypatch.setattr(service, "_resolve_sha", lambda ref: ("o", "r", FULL_SHA))
 
-    `parse_search` strips a `cd` prefix, so the stages are all resolved from the repository root.
-    A `cd` in the middle of the chain would make every following relative path mean something
-    else, and answering it from the root names the wrong file.
-    """
+    copied = _chain_result(service, "cp a.py b.py && cat b.py")
+    assert (copied.exact_output, copied.exact_returncode) == ("alpha", 0)
+    redirected = _chain_result(service, "cat a.py > copy.txt && cat copy.txt")
+    assert redirected.exact_output == "alpha"
+    # a listing after a removal must not show the removed file
+    removed = _chain_result(service, "rm a.py && ls .")
+    assert (removed.exact_output, removed.exact_returncode) == ("", 0)
+    moved = _chain_result(service, "mv a.py b.py && cat a.py")
+    assert moved.exact_output == "cat: a.py: No such file or directory"
+    assert moved.exact_returncode == 1
+    # a program's writes are not known: what it may have written is not answered
+    unknown = _chain_result(service, "python gen.py > a.py && cat a.py")
+    assert unknown.exact_output is None
+
+
+def test_a_canned_stage_answers_for_itself_inside_a_chain(tmp_path, monkeypatch):
+    service = make_service(tmp_path)
+    make_snapshot(service, {"a.py": "alpha\n", "b.py": "beta\n"})
+    monkeypatch.setattr(service, "_resolve_sha", lambda ref: ("o", "r", FULL_SHA))
+
+    after = _chain_result(service, "cat a.py && pytest -q; cat b.py")
+    assert (after.exact_output, after.exact_returncode) == (f"alpha\n{PYTEST_MISSING}\nbeta", 0)
+    stopped = _chain_result(service, "cat a.py && pytest -q && cat b.py")
+    assert (stopped.exact_output, stopped.exact_returncode) == (f"alpha\n{PYTEST_MISSING}", 1)
+
+
+def test_a_cd_moves_the_stages_after_it(tmp_path, monkeypatch):
     service = make_service(tmp_path)
     make_snapshot(service, {"a.py": "alpha\n", "pkg/a.py": "different\n"})
     monkeypatch.setattr(service, "_resolve_sha", lambda ref: ("o", "r", FULL_SHA))
 
-    result = _chain_result(service, "cat a.py && cd pkg && cat a.py")
-    assert result.exact_output is None
-    # the leading form stays composable
-    assert _chain_result(service, "cd /x && cat a.py && cat a.py").exact_output == "alpha\nalpha"
+    # a read after `cd pkg` names pkg/a.py, which a search from the root would miss
+    moved = _chain_result(service, "cat a.py && cd pkg && cat a.py")
+    assert moved.exact_output is None
+    assert "$ cat a.py\nalpha" in moved.context
+    assert _chain_result(service, "cd /testbed && cat a.py && cat a.py").exact_output == (
+        "alpha\nalpha"
+    )
+    # a cd that fails stops the `&&` chain, with bash's own message
+    failed = _chain_result(service, "cd missing && cat a.py")
+    assert failed.exact_output == "bash: cd: missing: No such file or directory"
+    assert failed.exact_returncode == 1
 
 
-def test_a_chain_whose_stage_reports_a_missing_path_is_never_composed(tmp_path, monkeypatch):
-    """A path absent from the tracked listing may still be present where the command ran.
-
-    The chain's stages are resolved from the repository root even when the command opened with a
-    `cd` this does not follow, so "No such file or directory" derived here could be a file that
-    exists in the directory the shell was actually in. The listing block says so in prose; an
-    exact output would say it as fact.
-    """
+def test_a_missing_path_is_reported_unless_an_observation_showed_it(tmp_path, monkeypatch):
     service = make_service(tmp_path)
     make_snapshot(service, {"a.py": "alpha\n"})
     monkeypatch.setattr(service, "_resolve_sha", lambda ref: ("o", "r", FULL_SHA))
 
-    result = _chain_result(service, "cat a.py && grep -rn x gone/")
-    assert result.exact_output is None
+    missing = _chain_result(service, "cat a.py && grep -rn x gone/")
+    assert missing.exact_output == "alpha\ngrep: gone/: No such file or directory"
+    assert missing.exact_returncode == 2
+    # a path an earlier observation listed exists on the machine, tracked or not
+    listing = (
+        "Here's the files and directories up to 2 levels deep in /testbed, excluding hidden"
+        " items:\n/testbed/\n/testbed/a.py\n/testbed/gone/\n/testbed/gone/x.txt\n"
+    )
+    shown = [
+        {"role": "assistant", "content": "```bash\nls /testbed\n```"},
+        {"role": "user", "content": listing},
+    ]
+    attested = service.repo_context_for_instance(
+        "swe-zero", "o__r-12", "```bash\ncat a.py && grep -rn x gone/\n```", shown
+    )
+    assert attested.exact_output is None
 
 
 def test_pwd_answers_from_the_session_root_and_declines_without_one():
@@ -1089,8 +1284,7 @@ def test_pwd_answers_from_the_session_root_and_declines_without_one():
     )
     # no root anywhere in the transcript means no directory to print
     assert isinstance(run_search(parse_search("pwd"), lambda rel: None, [], root=""), ParseFailure)
-    # a `cd` prefix is stripped before the parse, so its destination - which is exactly what pwd
-    # would print - is no longer visible: answering from the session root would name the old one
+    # after a `cd`, pwd prints where it went, not the session root: that is not answered here
     assert isinstance(parse_search("cd /elsewhere && pwd"), ParseFailure)
     assert isinstance(parse_search("pwd -P"), ParseFailure)
 
@@ -1199,3 +1393,332 @@ def test_resolve_sha_ignores_cache_entries_written_under_an_older_rule(tmp_path,
     assert json.loads(cache_file.read_text())["rule"] == _SHA_RULE
     assert service._resolve_sha(ref) == ("swesmith", "BurntSushi__ripgrep.3b7fd442", HEAD_SHA)
     assert len(calls) == 1
+
+
+def test_a_missing_path_prints_nothing_when_stderr_is_discarded():
+    files = {"a.py": "x\n"}
+    for command, code in (
+        ("cat gone.py 2>/dev/null", 1),
+        ("ls gone/ 2>/dev/null", 2),
+        ("grep -rn x gone/ 2>/dev/null", 2),
+    ):
+        loud = _search(command.replace(" 2>/dev/null", ""), files)
+        quiet = _search(command, files)
+        assert "No such file or directory" in loud.output, command
+        assert quiet.output == "" and quiet.missing, command
+        assert quiet.returncode == loud.returncode == code, command
+
+
+def test_a_gap_is_simulated_with_the_modules_its_program_imports(tmp_path, monkeypatch):
+    """`python3 run.py` prints what the modules it imports compute: the gap's context shows
+    them, as the earlier stages of the same command left them."""
+    service = make_service(tmp_path)
+    make_snapshot(
+        service,
+        {
+            "run.py": "from pkg import app\nprint(app.SIZE)\n",
+            "pkg/__init__.py": "",
+            "pkg/app.py": "SIZE = 1\n",
+        },
+    )
+    monkeypatch.setattr(service, "_resolve_sha", lambda ref: ("o", "r", FULL_SHA))
+
+    result = _chain_result(
+        service, "sed -i 's/SIZE = 1/SIZE = 5/' pkg/app.py && cat run.py && python3 run.py"
+    )
+    gap = next(part for part in result.parts if part["kind"] == "gap")
+    assert "--- ./pkg/app.py ---\nSIZE = 5" in gap["context"]
+    assert "--- ./pkg/app.py ---\nSIZE = 1" not in gap["context"]
+
+
+MB_FILE = ("x" * 99 + "\n") * 10486  # just over 1 MB
+
+
+def _session(service, commands: list[str], command: str):
+    messages = []
+    for earlier in commands:
+        messages += [
+            {"role": "assistant", "content": f"```bash\n{earlier}\n```"},
+            {"role": "user", "content": "<returncode>0</returncode>\n<output>\n</output>"},
+        ]
+    return service.repo_context_for_instance(
+        "swe-zero", "o__r-12", f"```bash\n{command}\n```", messages, fmt="returncode"
+    )
+
+
+def test_a_command_asking_for_more_text_than_is_answered_is_left_to_the_simulator(
+    tmp_path, monkeypatch
+):
+    """A few words can ask for gigabytes - a brace sequence, one file read many times, a file
+    doubled by each turn of a replayed session, a replacement repeated at every character.
+    None of it is built: the command is left to the simulator, and ordinary uses are answered."""
+    service = make_service(tmp_path)
+    make_snapshot(service, {"big.txt": MB_FILE, "f1": "1\n", "f2": "2\n", "a.txt": "aaaa\n"})
+    monkeypatch.setattr(service, "_resolve_sha", lambda ref: ("o", "r", FULL_SHA))
+
+    assert _session(service, [], "echo {1..3000000}").exact_output is None
+    assert (
+        _session(service, [], "cat f{1..2} && echo {a,b}{1,2}").exact_output == "1\n2\na1 a2 b1 b2"
+    )
+
+    assert _session(service, [], "cat " + " big.txt" * 20 + " | wc -l").exact_output is None
+    assert _session(service, [], "cat big.txt big.txt | wc -l").exact_output == "20972"
+
+    doubling = ["cp big.txt c.txt"] + ["cat c.txt c.txt > d.txt && mv d.txt c.txt"] * 8
+    assert _session(service, doubling, "wc -c c.txt").exact_output is None
+    assert _session(service, doubling[:3], "wc -l c.txt").exact_output == "41944 c.txt"
+
+    widened = f"sed -i 's/x/{'y' * 1000}/g' big.txt"
+    assert _session(service, [widened], "wc -c big.txt").exact_output is None
+    assert _session(service, ["sed -i 's/a/bb/g' a.txt"], "cat a.txt").exact_output == "bbbbbbbb"
+
+
+def test_an_editor_view_is_the_openhands_editor_s_rendering_of_the_file():
+    """In datasets whose `cat -n` and `sed -n 'A,Bp' f | cat -n` were converted from editor
+    views, the recorded observation is the editor's: tabs kept, every piece between line breaks
+    numbered (from A for a range), the text clipped at the editor's limit. A range the editor
+    refuses is an editor error, which is left to the simulator."""
+    text = "def f():\n\treturn 1\n\nx = 2\n"
+    assert (
+        _editor_view(text)
+        == "     1\tdef f():\n     2\t\treturn 1\n     3\t\n     4\tx = 2\n     5"
+    )
+    assert _editor_view(text, 2, 3) == "     2\t\treturn 1\n     3"
+    assert _editor_view(text, 4, 9) is None and _editor_view(text, 3, 2) is None
+    clipped = _editor_view("a" * 20000)
+    assert clipped.startswith("     1\t" + "a" * 100) and clipped.endswith("looking for.</NOTE>")
+    assert len(clipped) == len("     1\t") + 16000 + len(clipped.split("a" * 16000)[1])
+    served = grounded_observation(OPENHANDS, "     2\tx", 0, "sed -n '2,2p' /w/f.py | cat -n", [])
+    assert served == "Here's the result of running `cat -n` on /w/f.py:\n     2\tx"
+
+
+def test_an_editor_read_of_a_directory_leaves_no_bash_answer_for_the_simulator(
+    tmp_path, monkeypatch
+):
+    """The editor lists a directory in the filesystem's order, which is not known: the read is
+    simulated, and bash's `Is a directory` must not reach the simulator as a computed answer."""
+    service = make_service(tmp_path)
+    make_snapshot(service, {"pkg/a.py": "x = 1\n"})
+    monkeypatch.setattr(service, "_resolve_sha", lambda ref: ("o", "r", FULL_SHA))
+    monkeypatch.setattr(
+        core, "SCAFFOLDS", {("swe-zero", "openhands"): core.Scaffold(editor=core._EDITOR_CLIPPED)}
+    )
+    for command, exact in (
+        ("cat -n /testbed/pkg", None),
+        ("cat -n /testbed/pkg/a.py", "     1\tx = 1\n     2"),
+    ):
+        result = service.repo_context_for_instance(
+            "swe-zero", "o__r-12", f"```bash\n{command}\n```", fmt="openhands"
+        )
+        assert result.exact_output == exact, command
+        assert "Is a directory" not in (result.context or "") and not result.parts
+
+
+def _format_patch(sha: str, subject: str, diff: list[str]) -> str:
+    return "\n".join(
+        [
+            f"From {sha} Mon Sep 17 00:00:00 2001",
+            "From: swesmith <swesmith@swesmith.ai>",
+            "Date: Sat, 12 Jul 2025 17:08:47 +0000",
+            f"Subject: [PATCH] {subject}",
+            "",
+            "---",
+            " a.py | 2 +-",
+            " 1 file changed, 1 insertion(+), 1 deletion(-)",
+            "",
+            *diff,
+            "",
+        ]
+    )
+
+
+_BUG_DIFF = [
+    "diff --git a/a.py b/a.py",
+    "index 1111111..2222222 100644",
+    "--- a/a.py",
+    "+++ b/a.py",
+    "@@ -1,2 +1,2 @@",
+    " def add(a, b):",
+    "-    return a + b",
+    "+    return a - b",
+]
+_F2P_DIFF = [
+    "diff --git a/tests/test_a.py b/tests/test_a.py",
+    "deleted file mode 100644",
+    "index 3333333..0000000",
+    "--- a/tests/test_a.py",
+    "+++ /dev/null",
+    "@@ -1,2 +0,0 @@",
+    "-def test_add():",
+    "-    assert add(1, 2) == 3",
+]
+
+
+def _fake_github(
+    monkeypatch,
+    service,
+    history: list[tuple[str, str]],
+    patches: dict[str, str],
+    upstream: dict[str, dict] | None = None,
+):
+    calls = []
+
+    def fake_json(path):
+        calls.append(path)
+        if path in (upstream or {}):
+            return upstream[path]
+        if "/commits?" in path:
+            return [{"sha": sha, "commit": {"message": subject}} for sha, subject in history]
+        if "/commits/" in path:
+            raise _NotFound(path)
+        return {"default_branch": "main"}
+
+    def fake_text(path, accept):
+        calls.append(path)
+        rev = path.rsplit("/", 1)[-1]
+        return next((text for sha, text in patches.items() if sha.startswith(rev)), "")
+
+    monkeypatch.setattr(service, "_github_json", fake_json)
+    monkeypatch.setattr(service, "_github_text", fake_text)
+    return calls
+
+
+def test_smith_mirror_history_is_served_as_one_squashed_commit(tmp_path, monkeypatch):
+    service = make_service(tmp_path)
+    snapshot = make_snapshot(service, {"a.py": "def add(a, b):\n    return a - b\n"})
+    mirror = "BurntSushi__ripgrep.3b7fd442"
+    monkeypatch.setattr(service, "_resolve_sha", lambda ref: ("swesmith", mirror, HEAD_SHA))
+    monkeypatch.setattr(service, "_ensure_snapshot", lambda owner, repo, sha: snapshot)
+    calls = _fake_github(
+        monkeypatch,
+        service,
+        [(HEAD_SHA, "Remove F2P Tests"), (BUG_SHA, "Bug Patch"), (INITIAL_SHA, "Initial commit")],
+        {
+            HEAD_SHA: _format_patch(HEAD_SHA, "Remove F2P Tests", _F2P_DIFF),
+            BUG_SHA: _format_patch(BUG_SHA, "Bug Patch", _BUG_DIFF),
+        },
+    )
+
+    def ground(command):
+        return service.repo_context_for_instance("mini-coder", SMITH_ID, f"```bash\n{command}\n```")
+
+    squashed = f"{HEAD_SHA[:7]} Initial commit"
+    assert ground("git log --oneline -5").exact_output == squashed
+    assert ground("git log --oneline -- a.py").exact_output == squashed
+    upstream = "https://github.com/BurntSushi/ripgrep"
+    assert ground("git remote -v").exact_output == (
+        f"origin\t{upstream} (fetch)\norigin\t{upstream} (push)"
+    )
+    for command in (
+        f"git show {BUG_SHA[:7]}",
+        f"git show {HEAD_SHA[:7]}",
+        f"git show {BUG_SHA[:7]} --stat",
+        "git log --oneline --all",
+        "git log -p",
+    ):
+        result = ground(command)
+        assert result.exact_output is None, command
+        for leak in ("Bug Patch", "Remove F2P Tests", "return a + b", "test_add"):
+            assert leak not in (result.context or ""), (command, leak)
+    assert not any(path.startswith("/repos/swesmith/") and "/commits" in path for path in calls)
+    assert calls.count("/repos/BurntSushi/ripgrep/commits/3b7fd442") == 1
+
+
+def _smith_service(tmp_path, monkeypatch, mirror: str):
+    service = make_service(tmp_path)
+    snapshot = make_snapshot(service, {"a.py": "def add(a, b):\n    return a - b\n"})
+    monkeypatch.setattr(service, "_resolve_sha", lambda ref: ("swesmith", mirror, HEAD_SHA))
+    monkeypatch.setattr(service, "_ensure_snapshot", lambda owner, repo, sha: snapshot)
+    return service
+
+
+def test_smith_mirror_shows_the_upstream_commit_it_was_built_from(tmp_path, monkeypatch):
+    service = _smith_service(tmp_path, monkeypatch, "BurntSushi__ripgrep.3b7fd442")
+    upstream_sha = "3b7fd442" + "9" * 32
+    lookup = "/repos/BurntSushi/ripgrep/commits/3b7fd442"
+    calls = _fake_github(
+        monkeypatch,
+        service,
+        [(HEAD_SHA, "Remove F2P Tests"), (BUG_SHA, "Bug Patch"), (INITIAL_SHA, "Initial commit")],
+        {BUG_SHA: _format_patch(BUG_SHA, "Bug Patch", _BUG_DIFF)},
+        upstream={lookup: {"sha": upstream_sha, "commit": {"message": "Release 14.1.0\n\nnotes"}}},
+    )
+
+    def ground(command):
+        return service.repo_context_for_instance("mini-coder", SMITH_ID, f"```bash\n{command}\n```")
+
+    assert ground("git log --oneline -5").exact_output == f"{upstream_sha[:7]} Release 14.1.0"
+    assert ground("git log --oneline -- a.py").exact_output == f"{upstream_sha[:7]} Release 14.1.0"
+    assert ground("git rev-parse HEAD").exact_output == upstream_sha
+    for command in (f"git show {upstream_sha[:7]}", f"git show {BUG_SHA[:7]}", "git show HEAD"):
+        result = ground(command)
+        assert result.exact_output is None, command
+        for leak in ("Bug Patch", "Remove F2P Tests", "return a + b", "swesmith"):
+            assert leak not in (result.context or ""), (command, leak)
+    assert calls.count(lookup) == 1
+
+
+@pytest.mark.parametrize(("age_days", "looked_up"), [(2, False), (6.9, False), (7.1, True)])
+def test_a_missing_upstream_commit_is_remembered_for_seven_days(
+    tmp_path, monkeypatch, age_days, looked_up
+):
+    service = _smith_service(tmp_path, monkeypatch, "BurntSushi__ripgrep.3b7fd442")
+    marker = service.cache_dir / "upstream" / "BurntSushi__ripgrep__3b7fd442.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    failed_at = time.time() - age_days * 24 * 3600
+    marker.write_text(json.dumps({"sha": None, "failed_at": failed_at, "kind": "absent"}))
+    calls = _fake_github(monkeypatch, service, [], {})
+    service.repo_context_for_instance("mini-coder", SMITH_ID, "```bash\ngit log --oneline\n```")
+    assert ("/repos/BurntSushi/ripgrep/commits/3b7fd442" in calls) is looked_up
+
+
+@pytest.mark.parametrize(
+    ("message", "shows_upstream"),
+    [("Merge pull request #329 from x/fix", False), ("Merge pull request #3290 from x/y", True)],
+)
+def test_smith_pr_mirror_never_shows_an_upstream_commit_naming_its_pr(
+    tmp_path, monkeypatch, message, shows_upstream
+):
+    service = _smith_service(tmp_path, monkeypatch, "jawah__charset_normalizer.1fdd6463")
+    upstream_sha = "1fdd6463" + "8" * 32
+    lookup = "/repos/jawah/charset_normalizer/commits/1fdd6463"
+    _fake_github(
+        monkeypatch,
+        service,
+        [],
+        {},
+        upstream={lookup: {"sha": upstream_sha, "commit": {"message": message}}},
+    )
+    result = service.repo_context_for_instance(
+        "mini-coder", "jawah__charset_normalizer.1fdd6463.pr_329", "```bash\ngit log --oneline\n```"
+    )
+    squashed = f"{HEAD_SHA[:7]} Initial commit"
+    assert result.exact_output == (f"{upstream_sha[:7]} {message}" if shows_upstream else squashed)
+
+
+def test_git_show_renders_only_commits_from_the_served_history(tmp_path, monkeypatch):
+    service = make_service(tmp_path)
+    make_snapshot(service, {"a.py": "def add(a, b):\n    return a - b\n"})
+    monkeypatch.setattr(service, "_resolve_sha", lambda ref: ("o", "r", FULL_SHA))
+    older, fix = "6" * 40, "7" * 40
+    calls = _fake_github(
+        monkeypatch,
+        service,
+        [(FULL_SHA, "Base"), (older, "Older change")],
+        {
+            older: _format_patch(older, "Older change", _BUG_DIFF),
+            fix: _format_patch(fix, "Fix the reported bug", _BUG_DIFF),
+        },
+    )
+
+    def ground(command):
+        return service.repo_context_for_instance("swe-zero", "o__r-1", f"```bash\n{command}\n```")
+
+    served = ground(f"git show {older[:7]}")
+    assert served.exact_output is not None
+    assert "Older change" in served.exact_output
+
+    refused = ground(f"git show {fix[:7]}")
+    assert refused.exact_output is None
+    assert "Fix the reported bug" not in (refused.context or "")
+    assert not any(path.endswith(f"/commits/{fix[:7]}") for path in calls)

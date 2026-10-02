@@ -327,14 +327,16 @@ _CURSED_RAW_WITH_CODE = (
 )
 
 
-def test_heuristics_passes_cursed_think_output():
+def test_heuristics_fail_a_think_block_that_never_closes_without_a_command():
+    """The worker hands such a turn on as its notice, and the heuristics judge the turn as the
+    worker's `_strip_thinking` reads it, so the raw text fails the same way the notice does."""
     responses = [
         _CURSED_RAW_WITH_CODE,
         "<think>\nTHOUGHT: read the file first\nACTION: cat pkg/version/version.go\n",
         "<think>\nTHOUGHT: verify the change\nACTION: grep VERSION pkg/version/version.go\n",
     ]
     out = _heuristics(responses, _req())
-    assert all(v["passed"] for v in out), out
+    assert all(v["reason"] == "response contains an unclosed think block" for v in out), out
 
 
 def test_heuristics_empty_vllm_still_fails():
@@ -383,7 +385,7 @@ def test_run_prompts_does_not_leak_unclosed_think(monkeypatch):
     assert out == [unclosed_think_block_notice()]
 
 
-def test_run_prompts_strips_qwen_thinking_tail(monkeypatch):
+def test_run_prompts_keeps_the_reasoning_the_way_eval_stores_it(monkeypatch):
     raw = "Thinking Process: choose ls\n</think>\n\n```bash\nls -la\n```"
 
     class _Response:
@@ -422,7 +424,50 @@ def test_run_prompts_strips_qwen_thinking_tail(monkeypatch):
     )()
 
     out = asyncio.run(engine._run_prompts("model-name", ["prompt"], 77))
-    assert out == ["```bash\nls -la\n```"]
+    assert out == [raw]
+
+
+def test_simulator_transcript_shows_assistant_turns_as_their_command_like_eval():
+    transcript = sanity_dispatcher._simulation_transcript(
+        messages=[
+            {"role": "user", "content": "task"},
+            {
+                "role": "assistant",
+                "content": "weighing options\n</think>\nTHOUGHT: a\n```bash\nls\n```",
+            },
+            {"role": "user", "content": "a.py"},
+        ],
+        prompt="task",
+        assistant_output="more weighing\n</think>\n\nTHOUGHT: b\n```bash\ncat a.py\n```",
+    )
+    assert "weighing" not in transcript and "THOUGHT" not in transcript
+    assert "### assistant\n```bash\nls\n```" in transcript
+    assert transcript.endswith("### assistant\n```bash\ncat a.py\n```")
+
+
+def test_heuristics_judge_the_answer_without_its_reasoning():
+    answer = "THOUGHT: list the files\n```bash\nls -la\n```"
+    raw = "I should look around first, the task mentions files.\n</think>\n\n" + answer
+    assert _heuristics([raw] * 3, _req()) == _heuristics([answer] * 3, _req())
+
+
+def test_reasoning_absent_on_most_turns_is_logged_but_does_not_fail_pre_eval():
+    """Eval scores an amputated chain of thought with a multiplier; pre-eval must not be stricter.
+    The turns are stored raw, so the check sees the `</think>` eval sees."""
+    state = sanity_dispatcher._TrajectoryState(
+        sample_id="sanity-fallback:0",
+        prompt="initial prompt",
+        messages=[{"role": "user", "content": "Fix it."}],
+        turns=[],
+    )
+    bare = "</think>\n\nTHOUGHT: go\n```bash\nls\n```"
+    sanity_dispatcher._apply_turn_result(
+        [state], {"responses": [bare], "heuristics": [{"passed": True}]}
+    )
+    assert state.turns[-1]["content"] == bare
+    assert sanity_dispatcher.amputated_thinking(state)
+    sanity_dispatcher._run_chain_checks([state], 1)
+    assert "reasoning" not in state.heuristic_reason
 
 
 def test_run_prompts_uses_raw_completions(monkeypatch):

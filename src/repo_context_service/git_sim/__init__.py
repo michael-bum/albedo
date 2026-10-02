@@ -1,48 +1,34 @@
+"""A model of git in the sandbox checkout: its answers to git commands (`run_git`, `parse_git`)
+and what git commands a transcript ran do to the index and the working tree (`apply_git_stage`,
+`learn_git`)."""
+
 from __future__ import annotations
 
-from .chain import chain_stages, git_evidence, run_git_chain
+from .chain import git_evidence
 from .diffs import blob_hash
 from .execute import run_git
-from .models import GitMeta, GitPlan, GitResult, GitState, StashEntry
+from .models import GitMeta, GitResult, GitState
 from .notes import explain_git, ledger_block
-from .parse import _GIT_HEAD as _GIT_HEAD
-from .parse import is_git_command, mutation_stages, parse_git
-from .patches import learn_from_observed_diff
-from .session import apply_git, learn_git_facts
-from .templates import (
-    BRANCH_HEADER,
-    DEFAULT_ABBREV,
-    DEFAULT_BRANCH,
-    DETACHED_HEADER,
-    GIT_EVIDENCE_HEADER,
-    GIT_LEDGER_HEADER,
-    HARNESS_SUBJECT,
-)
+from .parse import is_git_command, parse_git
+from .patches import apply_hunks, unified_diff
+from .session import apply_git_stage, learn_git
+from .templates import DEFAULT_ABBREV, DEFAULT_BRANCH
 
 __all__ = [
-    "BRANCH_HEADER",
     "DEFAULT_ABBREV",
     "DEFAULT_BRANCH",
-    "DETACHED_HEADER",
-    "GIT_EVIDENCE_HEADER",
-    "GIT_LEDGER_HEADER",
-    "HARNESS_SUBJECT",
     "GitMeta",
-    "GitPlan",
     "GitResult",
     "GitState",
-    "StashEntry",
-    "apply_git",
+    "apply_git_stage",
+    "apply_hunks",
     "blob_hash",
-    "chain_stages",
     "explain_git",
     "git_evidence",
     "is_git_command",
-    "learn_from_observed_diff",
-    "learn_git_facts",
+    "learn_git",
     "ledger_block",
-    "mutation_stages",
     "parse_git",
     "run_git",
-    "run_git_chain",
+    "unified_diff",
 ]

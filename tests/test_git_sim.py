@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import functools
+import tempfile
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
+from albedo_config import RepoContextSettings
 from repo_context_service.command_search import ParseFailure
+from repo_context_service.core import RepoContextService
 from repo_context_service.git_sim import (
     GitMeta,
+    apply_hunks,
     blob_hash,
     is_git_command,
     ledger_block,
-    run_git_chain,
 )
-from repo_context_service.git_sim.patches import _apply_hunks, _observed_patches
+from repo_context_service.git_sim.patches import observed_patches
 from repo_context_service.overlay import build_overlay
 
 BASE = {
@@ -35,9 +43,21 @@ def _turn(command: str, body: str = "", returncode: int = 0) -> list[dict[str, s
     ]
 
 
+@functools.cache
+def _service() -> RepoContextService:
+    return RepoContextService(RepoContextSettings(_env_file=None, cache_dir=tempfile.mkdtemp()))
+
+
 def _run(command: str, messages: list[dict[str, str]] | None = None, meta: GitMeta = META):
-    overlay = build_overlay(messages or [], LISTING, {}, _read_base)
-    return run_git_chain(command, overlay, _read_base, LISTING, meta), overlay
+    """The command's exact answer through the service's stage runner, or a ParseFailure when it
+    is left to the simulator."""
+    overlay = build_overlay(messages or [], LISTING, _read_base)
+    run = _service()._run_chain
+    computed, _, _ = run(Path("/nonexistent"), command, overlay, "returncode", meta)
+    if computed is None:
+        return ParseFailure("declined"), overlay
+    _, exact, returncode = computed
+    return SimpleNamespace(output=exact, returncode=returncode, empty=exact == ""), overlay
 
 
 EDIT = _turn("cat > src/app.py <<'EOF'\ndef main():\n    return 2\nEOF")
@@ -151,10 +171,10 @@ def test_a_chain_stage_we_cannot_execute_refuses_the_whole_command():
     assert isinstance(result, ParseFailure)
 
 
-def test_a_command_without_a_git_stage_is_left_to_the_search_executor():
-    result, _ = _run("grep -rn TODO src", EDIT)
-    assert isinstance(result, ParseFailure)
-    assert result.reason == "not_git"
+def test_a_search_stage_after_a_git_stage_sees_the_git_change():
+    result, _ = _run("git checkout -- src/app.py && grep -rn 'return 1' src", EDIT)
+    assert result.output == "src/app.py:2:    return 1"
+    assert result.returncode == 0
 
 
 def test_the_ledger_is_rendered_for_git_commands_only():
@@ -194,9 +214,9 @@ OPENHANDS_TRAILER = (
     ],
 )
 def test_observed_diff_is_kept_whatever_follows_the_last_hunk(observation):
-    patches = _observed_patches(observation)
+    patches = observed_patches(observation)
     assert patches == {"src/app.py": APP_HUNKS}
-    assert _apply_hunks(BASE["src/app.py"], patches["src/app.py"]) == "def main():\n    return 2\n"
+    assert apply_hunks(BASE["src/app.py"], patches["src/app.py"]) == "def main():\n    return 2\n"
 
 
 def test_observed_diff_keeps_a_blank_context_line_inside_a_hunk():
@@ -204,7 +224,7 @@ def test_observed_diff_keeps_a_blank_context_line_inside_a_hunk():
         "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n"
         "@@ -1,3 +1,3 @@\n # demo\n\n-old\n+new\n" + OPENHANDS_TRAILER
     )
-    assert _observed_patches(diff) == {"README.md": [(1, [" # demo", " ", "-old", "+new"])]}
+    assert observed_patches(diff) == {"README.md": [(1, [" # demo", " ", "-old", "+new"])]}
 
 
 def test_observed_diff_keeps_every_file_when_a_trailer_follows():
@@ -212,7 +232,7 @@ def test_observed_diff_keeps_every_file_when_a_trailer_follows():
         "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n"
         "@@ -1 +1 @@\n-# demo\n+# Demo\n"
     )
-    patches = _observed_patches(APP_DIFF + readme + OPENHANDS_TRAILER)
+    patches = observed_patches(APP_DIFF + readme + OPENHANDS_TRAILER)
     assert patches == {"src/app.py": APP_HUNKS, "README.md": [(1, ["-# demo", "+# Demo"])]}
 
 
@@ -223,5 +243,134 @@ def test_transcript_git_diff_teaches_the_overlay_the_edit():
         {"role": "assistant", "content": "```bash\ngit diff\n```"},
         {"role": "user", "content": APP_DIFF + OPENHANDS_TRAILER},
     ]
-    overlay = build_overlay(messages, LISTING, {}, _read_base)
+    overlay = build_overlay(messages, LISTING, _read_base)
     assert overlay.read("src/app.py") == "def main():\n    return 2\n"
+
+
+HISTORY = {
+    "commits": [
+        {"sha": META.sha, "subject": "Fix the parser"},
+        {"sha": "b" * 40, "subject": "Start"},
+    ],
+    "complete": True,
+}
+
+
+def test_a_log_names_the_detached_head_only_when_it_writes_to_a_terminal():
+    """Git decorates refs on a terminal: `(HEAD)` beside the commit a detached HEAD is at; a
+    piped log is plain. Where the scaffold's terminal, or the refs of a branch, are not known,
+    the log is left to the simulator rather than printed without them."""
+    meta = replace(META, detached=True, decorate=True, history=lambda path: HISTORY)
+    assert (
+        _run("git log --oneline", meta=meta)[0].output
+        == "a1b2c3d (HEAD) Fix the parser\nbbbbbbb Start"
+    )
+    assert _run("git log --oneline | head -1", meta=meta)[0].output == "a1b2c3d Fix the parser"
+    for unknown in (replace(meta, decorate=None), replace(meta, detached=False)):
+        assert isinstance(_run("git log --oneline", meta=unknown)[0], ParseFailure)
+
+
+def test_a_short_hash_is_never_printed_before_its_length_is_known():
+    """A short hash grows with the repository; until an observation shows one, a oneline log
+    or a diff's `index` line is not answered, and a status (which has none) still is."""
+    meta = replace(META, abbrev=None, detached=True, history=lambda path: HISTORY)
+    edited = _turn("sed -i 's/return 1/return 2/' src/app.py")
+    for command in ("git log --oneline", "git diff"):
+        assert isinstance(_run(command, edited, meta)[0], ParseFailure), command
+    assert "modified:   src/app.py" in _run("git status", edited, meta)[0].output
+    shown = edited + _turn("git log --oneline -1", "a1b2c3d4 Fix the parser")
+    index_line = _run("git diff", shown, meta)[0].output.split("\n")[1]
+    assert index_line.startswith("index ")
+    assert len(index_line.split()[1].split("..")[0]) == 8
+
+
+def test_a_squashed_history_is_the_one_commit_an_observation_named():
+    """A history squashed into one local commit is not the one the upstream API knows: a log
+    is answered only once an observation has shown that commit."""
+    meta = replace(META, squashed=True, history=lambda path: HISTORY)
+    assert isinstance(_run("git log --oneline", meta=meta)[0], ParseFailure)
+    seen = _turn("git log --oneline", "f15fb67 Initial commit")
+    assert _run("git log --oneline -5", seen, meta)[0].output == "f15fb67 Initial commit"
+
+
+def test_git_branch_at_a_detached_head_is_no_branch_and_nothing_else_is_guessed():
+    """At a detached HEAD (the recorded openhands checkouts) git lists `* (no branch)`; a
+    checkout on a branch may hold others, and one the session made is not the only one."""
+    detached = replace(META, detached=True)
+    assert _run("git branch", meta=detached)[0].output == "* (no branch)"
+    assert _run("git branch -a", meta=detached)[0].output == "* (no branch)"
+    assert isinstance(_run("git branch", meta=META)[0], ParseFailure)
+    made = _turn("git checkout -b fix")
+    assert isinstance(_run("git branch", made, detached)[0], ParseFailure)
+
+
+def test_a_log_whose_hash_length_is_unknown_is_still_shown_to_the_simulator():
+    """Declining a oneline log whose short-hash length is not known must not leave the simulator
+    without the history: it would invent commits the repository does not have."""
+    from repo_context_service.git_sim import git_evidence
+
+    meta = replace(META, abbrev=None, detached=True, decorate=False, history=lambda path: HISTORY)
+    overlay = build_overlay([], LISTING, _read_base)
+    evidence = git_evidence("git log --oneline -2", overlay, _read_base, LISTING, meta)
+    assert "a1b2c3d Fix the parser" in evidence and "bbbbbbb Start" in evidence
+    assert "git prints more in a larger repository" in evidence
+
+
+def test_a_stash_under_an_unknown_index_still_restores_tracked_files_from_head():
+    """`cd src && git add .` may or may not have staged the edit, so the index is unknown; the
+    stash still resets every tracked file to HEAD, while a `checkout --` from that index cannot
+    say what text it restores."""
+    poisoned = EDIT + _turn("cd src && git add .")
+    result, overlay = _run("cat src/app.py", poisoned + _turn("git stash"))
+    assert overlay.git.unknown
+    assert result.output == BASE["src/app.py"].removesuffix("\n")
+    result, _ = _run("cat src/app.py", poisoned + _turn("git reset --hard"))
+    assert result.output == BASE["src/app.py"].removesuffix("\n")
+    result, _ = _run("cat src/app.py", poisoned + _turn("git checkout -- src/app.py"))
+    assert isinstance(result, ParseFailure)
+
+
+def test_a_failed_commit_does_not_keep_the_edit_through_a_hard_reset():
+    messages = EDIT + _turn("git commit -qm work", "no changes added to commit", 1)
+    result, _ = _run("cat src/app.py", messages + _turn("git reset --hard"))
+    assert result.output == BASE["src/app.py"].removesuffix("\n")
+    # after a commit that went through, HEAD moved and the restored text is not the snapshot's
+    result, _ = _run(
+        "cat src/app.py", EDIT + _turn("git commit -qam work") + _turn("git reset --hard")
+    )
+    assert isinstance(result, ParseFailure)
+
+
+def test_git_mv_into_a_missing_directory_moves_nothing():
+    messages = _turn("mkdir out\ngit mv README.md docs/b.cfg\nrm -rf out")
+    result, overlay = _run("cat README.md", messages)
+    assert result.output == "# demo"
+    assert not overlay.git.staged_deleted and "docs/b.cfg" not in overlay.git.index
+    result, _ = _run("cat docs/b.cfg", messages)
+    assert result.returncode == 1
+
+
+def test_git_rm_removes_the_directory_its_last_file_left():
+    result, _ = _run("ls", _turn("git rm -q src/app.py"))
+    assert result.output == "README.md"
+    result, _ = _run("ls src", _turn("git rm -q src/app.py"))
+    assert result.returncode == 2
+
+
+def test_a_reset_after_git_rm_unstages_the_deletion():
+    result, _ = _run("git status --short", _turn("git rm -q README.md") + _turn("git reset -q"))
+    assert result.output == " D README.md"
+    result, _ = _run(
+        "git status --short", _turn("git rm -q README.md") + _turn("git restore --staged README.md")
+    )
+    assert result.output == " D README.md"
+    result, _ = _run(
+        "git status --short", _turn("git rm -q README.md") + _turn("git reset -q --hard")
+    )
+    assert result.output == ""
+
+
+def test_a_renamed_file_edited_afterwards_is_one_rm_row_in_short_status():
+    messages = _turn("git mv README.md notes.md") + _turn("echo more >> notes.md")
+    result, _ = _run("git status --short", messages)
+    assert result.output == "RM README.md -> notes.md"

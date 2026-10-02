@@ -396,7 +396,6 @@ def _names(text: str, *, code: bool = False) -> set[str]:
 
 
 SUBMISSION_LOOP_RUN = 4
-WRONG_SUBMIT_LIMIT = 4
 
 
 def _submit_attempt(content: str) -> bool:
@@ -416,9 +415,6 @@ def submission_loop_issue(state: Any) -> str:
         run += 1
     if run >= SUBMISSION_LOOP_RUN:
         return f"submission loop: {run} submit attempts in a row were not accepted"
-    wrong = sum(_wrong_submit(turn) for turn in replies)
-    if wrong >= WRONG_SUBMIT_LIMIT:
-        return f"wrong submission: {wrong} submit attempts in this trajectory were not accepted"
     return ""
 
 

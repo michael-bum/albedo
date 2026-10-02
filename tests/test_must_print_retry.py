@@ -523,6 +523,28 @@ def test_a_range_piped_into_cat_n_numbers_from_one():
     assert renumbered_view("sed -n '315,330p' aiohttp/connector.py | cat -n", view) == view
 
 
+def test_two_views_in_one_command_keep_their_own_numbering():
+    from albedo_eval_service.shared.observation_format import renumbered_view
+
+    # each view restarts at its own first line: one run 61..96 would send the agent's next
+    # `sed -i '<n>s/...'` to lines the second view never showed
+    views = "    61\tdef a():\n    62\t    pass\n    61\tdef a():\n    62\t    pass"
+    command = "cat -n m.py | sed -n '61,62p'\ncat -n m.py | sed -n '61,62p'"
+    assert renumbered_view(command, views) == views
+    two_files = "     1\timport os\n     2\timport re\n     1\tx = 1"
+    assert renumbered_view("cat -n a.py && cat -n b.py", two_files) == two_files
+
+
+def test_a_blank_line_without_its_tab_still_counts_in_a_cat_n_view():
+    from albedo_eval_service.shared.observation_format import renumbered_view
+
+    view = "     1\tx = 1\n     2\n     3\ty = 2"
+    assert renumbered_view("cat -n a.py", view) == view
+    # without a numbering command a bare number is file content, never a view line
+    numbers = "   100\n   200"
+    assert renumbered_view("sed -n '5,6p' nums.txt", numbers) == numbers
+
+
 def test_sparse_and_truncated_views_keep_their_numbering():
     from albedo_eval_service.shared.observation_format import (
         OPENHANDS_TRUNCATION_NOTICE,

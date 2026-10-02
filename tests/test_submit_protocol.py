@@ -183,6 +183,18 @@ def test_is_exact_submission():
     assert first_bash_command("```\nnot bash\n```") == ""
 
 
+def test_bench_submitted_accepts_quiet_steps_before_the_echo():
+    edit = "python3 - <<'EOF'\np='a.py'\nopen(p,'w').write(open(p).read().replace('x','y'))\nEOF\n"
+    for head in (
+        edit,
+        "go build ./... && ",
+        "test -s patch.txt && ",
+        "python -m py_compile a.py && ",
+    ):
+        assert bench_submitted(f"{head}{NONCE_COMMAND}", NONCE)
+    assert not bench_submitted(f"python3 - <<'EOF'\nprint(1)\nEOF\n{NONCE_COMMAND}", NONCE)
+
+
 def test_bench_submitted_mirrors_mini_swe_agent():
     assert bench_submitted(NONCE_COMMAND, NONCE)
     assert bench_submitted(f"cd /testbed && {NONCE_COMMAND}", NONCE)

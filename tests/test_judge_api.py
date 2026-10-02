@@ -1102,6 +1102,25 @@ def test_simulation_transcript_strips_thought_from_assistant_turns():
     assert "sed -n '1,5p' a.py" in transcript
 
 
+def test_simulation_transcript_shows_the_command_not_prose_after_a_non_bash_snippet():
+    # the closing fence of a go snippet in the reasoning must not open the command block: the
+    # simulator would run the prose up to the real block and answer with a shell syntax error
+    turn = (
+        "The test calls:\n```go\nerr := CreateCertificates(mockSigner, KMSConfig{...})\n```\n\n"
+        "So the test file does not match. Let me run the tests.</think>```bash\n"
+        "cd /workspace/fulcio && go test ./pkg/certmaker/... 2>&1 | head -50\n```"
+    )
+    transcript = _simulation_transcript(
+        messages=[{"role": "user", "content": "task"}, {"role": "assistant", "content": turn}],
+        prompt="task",
+        assistant_output=turn,
+    )
+
+    command = "```bash\ncd /workspace/fulcio && go test ./pkg/certmaker/... 2>&1 | head -50\n```"
+    assert transcript.count(command) == 2
+    assert "Let me run the tests" not in transcript
+
+
 def test_simulation_transcript_keeps_text_without_command_block():
     from albedo_eval_service.judge_api import _simulation_transcript
 

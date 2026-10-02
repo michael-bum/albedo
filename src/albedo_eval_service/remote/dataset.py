@@ -57,8 +57,8 @@ def _load_sample(
     tokenizer_path: str | Path | None,
     enable_thinking: bool,
 ) -> EvalSample:
-    shard_name, row_idx, turn_idx = _parse_sample_id(sample_id)
-    row = _read_parquet_row(root / shard_name, row_idx)
+    shard_name, row_idx, turn_idx = parse_sample_id(sample_id)
+    row = read_parquet_row(root / shard_name, row_idx)
     prompt, target, messages = _prompt_from_row(
         row,
         turn_idx=turn_idx,
@@ -121,14 +121,14 @@ def dataset_sample_id(sample_id: str) -> str:
     return sample_id.split("#r", 1)[0]
 
 
-def _parse_sample_id(sample_id: str) -> tuple[str, int, int]:
+def parse_sample_id(sample_id: str) -> tuple[str, int, int]:
     shard_name, row_idx_raw, turn_idx_raw = dataset_sample_id(sample_id).rsplit(":", 2)
     if not _SHARD_RE.match(shard_name):
         raise ValueError(f"unsupported dataset shard in sample_id: {sample_id}")
     return shard_name, int(row_idx_raw), int(turn_idx_raw)
 
 
-def _read_parquet_row(path: Path, row_idx: int) -> dict[str, Any]:
+def read_parquet_row(path: Path, row_idx: int) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"dataset shard not found: {path}")
     if row_idx < 0:
@@ -152,10 +152,12 @@ def _prompt_from_row(
     tokenizer_path: str | Path | None,
     enable_thinking: bool,
 ) -> tuple[str, str | None, list[dict[str, str]] | None]:
-    normalized = {key: _unwrap_column(value) for key, value in row.items()}
-    turns = _extract_turns(normalized)
+    normalized = {key: unwrap_column(value) for key, value in row.items()}
+    turns = extract_turns(normalized)
     if turns:
-        assistant_turns = [index for index, turn in enumerate(turns) if _role(turn) == "assistant"]
+        assistant_turns = [
+            index for index, turn in enumerate(turns) if turn_role(turn) == "assistant"
+        ]
         source_index = (
             assistant_turns[turn_idx]
             if turn_idx < len(assistant_turns)
@@ -163,7 +165,9 @@ def _prompt_from_row(
         )
         prompt_turns = turns[:source_index]
         target = (
-            _content(turns[source_index]) if _role(turns[source_index]) == "assistant" else None
+            turn_content(turns[source_index])
+            if turn_role(turns[source_index]) == "assistant"
+            else None
         )
         messages = _messages_from_turns(prompt_turns)
         prompt = format_messages(
@@ -180,7 +184,7 @@ def _prompt_from_row(
     return prompt, None, [{"role": "user", "content": prompt}]
 
 
-def _extract_turns(row: dict[str, Any]) -> list[Any]:
+def extract_turns(row: dict[str, Any]) -> list[Any]:
     for key in ("messages", "turns", "conversation", "trajectory"):
         value = row.get(key)
         parsed = _maybe_json(value)
@@ -244,9 +248,9 @@ def _load_tokenizer(tokenizer_path: str):
 def _messages_from_turns(turns: list[Any]) -> list[dict[str, str]]:
     messages: list[dict[str, str]] = []
     for turn in turns:
-        content = _content(turn)
+        content = turn_content(turn)
         if content:
-            messages.append({"role": _chat_role(_role(turn)), "content": content})
+            messages.append({"role": _chat_role(turn_role(turn)), "content": content})
     return messages
 
 
@@ -260,7 +264,7 @@ def _chat_role(role: str | None) -> str:
     return "user"
 
 
-def _unwrap_column(value: Any) -> Any:
+def unwrap_column(value: Any) -> Any:
     if isinstance(value, list) and len(value) == 1:
         return value[0]
     return value
@@ -275,7 +279,7 @@ def _maybe_json(value: Any) -> Any:
     return value
 
 
-def _role(turn: Any) -> str | None:
+def turn_role(turn: Any) -> str | None:
     if isinstance(turn, dict):
         role = turn.get("role") or turn.get("speaker") or turn.get("from")
         return str(role).lower() if role is not None else None
@@ -320,7 +324,7 @@ def _render_tool_call(call: Any) -> str:
     return f"[{name}{(' ' + detail) if detail else ''}]"
 
 
-def _content(turn: Any) -> str:
+def turn_content(turn: Any) -> str:
     if not isinstance(turn, dict):
         return str(turn) if turn is not None else ""
     body = ""

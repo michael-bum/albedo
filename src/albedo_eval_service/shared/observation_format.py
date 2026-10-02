@@ -75,6 +75,8 @@ def valid_output(raw: str, fmt: str) -> bool:
 
 
 _NUMBERED_VIEW_LINE = re.compile(r"^(\s*)(\d+)(\t.*)$", re.DOTALL)
+# a blank line of a `cat -n` view is its number and a tab, and the tab is easily dropped
+_BLANK_VIEW_LINE = re.compile(r"^(\s+)(\d+)()$")
 _SED_READ_RANGE = re.compile(r"\bsed\s+-n\s+'?(\d+),(\d+)p'?(?!\S)")
 _CONTIGUOUS_VIEW = re.compile(r"\bcat\s+-n\b|\bnl\s+-ba\b")
 _SPARSE_VIEW = re.compile(r"\bgrep\b|\brg\b|p;|;\s*\d+,\d+p")
@@ -85,19 +87,26 @@ def renumbered_view(command: str, raw: str) -> str:
     window, numberer = _SED_READ_RANGE.search(text), _CONTIGUOUS_VIEW.search(text)
     if not (window or numberer) or _SPARSE_VIEW.search(text):
         return raw
+    # every view numbers its own lines, so views of two ranges or files are not one run
+    if len(_SED_READ_RANGE.findall(text)) > 1 or len(_CONTIGUOUS_VIEW.findall(text)) > 1:
+        return raw
     if OPENHANDS_TRUNCATION_NOTICE in (raw or ""):
         return raw
     if window and numberer and numberer.start() > window.start():
         window = None
     lines = (raw or "").splitlines()
-    numbered = [i for i, line in enumerate(lines) if _NUMBERED_VIEW_LINE.match(line)]
+
+    def view_line(line: str) -> re.Match | None:
+        return _NUMBERED_VIEW_LINE.match(line) or (numberer and _BLANK_VIEW_LINE.match(line))
+
+    numbered = [i for i, line in enumerate(lines) if view_line(line)]
     if not numbered:
         return raw
-    first = _NUMBERED_VIEW_LINE.match(lines[numbered[0]])
+    first = view_line(lines[numbered[0]])
     start = int(window.group(1)) if window else int(first.group(2))
     fixed = False
     for count, i in enumerate(numbered):
-        pad, number, rest = _NUMBERED_VIEW_LINE.match(lines[i]).groups()
+        pad, number, rest = view_line(lines[i]).groups()
         want = str(start + count)
         if want != number:
             lines[i] = f"{' ' * max(len(pad) + len(number) - len(want), 1)}{want}{rest}"
@@ -379,10 +388,12 @@ _VIEW_HEADER_RE = re.compile(r"^\s*Here's the (?:result of running|files and dir
 
 
 def observation_body(raw: str, fmt: str) -> str:
-    text = (raw or "").strip()
+    # only the lines around the body go: the first line's indentation is part of the output
+    text = (raw or "").rstrip().lstrip("\n")
     if fmt == RETURNCODE:
-        match = re.search(r"<output>\n(.*)\n?</output>", text, re.DOTALL)
-        return _strip_view_header(match.group(1).strip("\n") if match else "")
+        # the tags delimit the output exactly: a blank line it starts with is part of it
+        match = re.search(r"<output>\n(.*)</output>", text, re.DOTALL)
+        return _strip_view_header(match.group(1).removesuffix("\n") if match else "")
     if fmt == SWE_AGENT:
         if not text.startswith("OBSERVATION:"):
             return _strip_view_header(text)
@@ -412,7 +423,8 @@ _BARE_LINE_NUMBER = re.compile(r"^\s*\d+\s*$")
 
 
 _PRINTS_NOTHING = re.compile(
-    r"^(?:cd|rm|mkdir|mv|cp|touch|export|chmod|true|git add|sed\s+(?:-i|--in-place))\b"
+    r"^(?:cd|rm|mkdir|mv|cp|touch|export|chmod|true|test|go build|python3? -m py_compile|git add"
+    r"|sed\s+(?:-i|--in-place))\b"
 )
 
 
@@ -430,7 +442,10 @@ def heredoc_bodies(command: str) -> list[str]:
     text = command or ""
     bodies: list[str] = []
     for match in _HEREDOC_START.finditer(text):
-        start = cut = match.end()
+        # the body starts on the next line: the rest of the `<<WORD` line is still shell
+        start = cut = text.find("\n", match.end()) + 1
+        if not start:
+            continue
         for line in text[cut:].splitlines(keepends=True):
             if line.strip() == match.group(2):
                 break
@@ -440,16 +455,28 @@ def heredoc_bodies(command: str) -> list[str]:
 
 
 def command_stages(command: str) -> list[str]:
-    """The command's top-level stages, ignoring separators that are data rather than syntax.
+    return [stage for _, stage in command_chain(command)]
 
-    A `;` or newline inside a quoted argument or a heredoc body belongs to that argument, not to
-    the shell, so both are blanked before the split: `python -c "a; b"` is one stage, and a
-    heredoc that spans twenty lines is one stage rather than twenty.
+
+def command_chain(command: str) -> list[tuple[str, str]]:
+    """The command's top-level stages, each with the separator that joins it to the one before.
+
+    The first stage's separator is "". A stage that is empty only because of a line break
+    (`a &&\\n b`) is dropped and the `&&` / `||` before it is kept, so the pair still reads as
+    the shell does.
+
+    Separators that are data rather than syntax are ignored. A `;` or newline inside a quoted
+    argument or a heredoc body belongs to that argument, not to the shell, so both are blanked
+    before the split: `python -c "a; b"` is one stage, and a heredoc that spans twenty lines is
+    one stage rather than twenty.
     """
     text = command or ""
-    masked = list(_unquoted(text))
+    masked = list(_unquoted(_COMMENT_LINE.sub(lambda m: m.group(0).replace("'", " "), text)))
     for match in _HEREDOC_START.finditer(text):
-        cut = match.end()
+        # `cat <<'EOF' > a.py && python3 a.py` runs a second stage on the heredoc's own line
+        start = cut = text.find("\n", match.end()) + 1
+        if not start:
+            continue
         for line in text[cut:].splitlines(keepends=True):
             # the terminator's own newline ends the heredoc and separates it from whatever runs
             # next, so it must stay visible to the split: masking it joins `EOF` to the command
@@ -457,14 +484,43 @@ def command_stages(command: str) -> list[str]:
             cut += len(line.rstrip("\r\n")) if line.strip() == match.group(2) else len(line)
             if line.strip() == match.group(2):
                 break
-        masked[match.end() : cut] = "_" * (cut - match.end())
+        # the body belongs to the `<<WORD` stage, and a stage after it on the opener's line runs
+        # once the heredoc is written: moving that stage behind the terminator keeps both whole
+        if tail := _STAGE_SEP.search("".join(masked[match.end() : start - 1])):
+            split = match.end() + tail.start()
+            body = text[start - 1 : cut]
+            return command_chain(
+                f"{text[:split].rstrip()}{body}\n{text[split : start - 1]}{text[cut:]}"
+            )
+        # from the newline that opens the body, so the body stays part of the `<<WORD` stage
+        masked[start - 1 : cut] = "_" * (cut - start + 1)
     joined = "".join(masked)
-    stages, last = [], 0
+    chain, last, glue = [], 0, ""
     for separator in _STAGE_SEP.finditer(joined):
-        stages.append(text[last : separator.start()])
+        if stage := text[last : separator.start()].strip():
+            chain.append((glue, stage))
+            glue = ""
+        glue = glue if glue in ("&&", "||") else separator.group()
         last = separator.end()
-    stages.append(text[last:])
-    return [stage.strip() for stage in stages if stage.strip()]
+    if stage := text[last:].strip():
+        chain.append((glue, stage))
+    return chain
+
+
+# a compound command, subshell, substitution or line continuation spans stages, so splitting
+# the list would cut it in half
+_SPANS_STAGES = re.compile(
+    r"^(?:for|while|until|if|then|elif|else|fi|do|done|case|esac|function|select)\b|[(){}`]|\\$"
+)
+
+
+def flat_chain(command: str) -> list[tuple[str, str]] | None:
+    """The stages of a flat `&&` / `||` / `;` list, comments dropped, or None when a stage is a
+    compound command, subshell or substitution that the split would cut in half."""
+    chain = [(glue, stage) for glue, stage in command_chain(command) if not stage.startswith("#")]
+    # only a stage's first line is shell: the rest is a quoted argument or a heredoc body
+    heads = [_QUOTED_SPAN_RE.sub("", stage).split("\n")[0].strip() for _, stage in chain]
+    return None if any(_SPANS_STAGES.search(head) for head in heads) else chain
 
 
 # a redirect onto a file swallows the stage's output; a bare heredoc says nothing about who
@@ -577,6 +633,7 @@ def first_bash_block(assistant_output: str) -> str:
 
 
 _QUOTED_SPAN_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+_COMMENT_LINE = re.compile(r"(?m)^[ \t]*#[^\n]*")
 _CHAINED_RE = re.compile(r"&&|\|\||;|\n")
 _READ_HEAD_RE = re.compile(r"^\s*(?:cat|nl|head|tail|less|more|sed\s+-n)\b")
 _CD_PREFIX_RE = re.compile(r"^\s*cd\s+\S+\s*&&\s*")
@@ -591,7 +648,8 @@ _SEARCH_HEAD_RE = re.compile(
 _SILENT_RE = re.compile(
     r"^\s*(?:sed\s+-i|tee\b|touch\b|mkdir\b|rmdir\b|rm\b|mv\b|cp\b|ln\b|chmod\b|chown\b|"
     r"export\b|unset\b|cd\b|pushd\b|popd\b|true\b|:\s*$|"
-    r"git\s+(?:add|rm|mv|checkout|switch|restore|apply|stash|config|init|reset)\b|"
+    r"git\s+(?:add|rm|mv|checkout|switch|restore|apply|stash|config|init|reset|diff|ls-files|tag|"
+    r"clean|commit)\b|"
     r"apply_patch\b|patch\s+-p)"
 )
 _MAY_BE_EMPTY_TAIL_RE = re.compile(
@@ -699,6 +757,16 @@ _SHELL_DIAGNOSTIC_RE = re.compile(
     r"(?:command not found|No such file or directory|syntax error|No module named)\b"
 )
 _OBSERVED_RC_RE = re.compile(r"<returncode>(-?\d+)</returncode>")
+# the exit status a scaffold reports, in the returncode format or OpenHands' trailer
+_REPORTED_RC_RE = re.compile(
+    r"<returncode>\s*(-?\d+)\s*</returncode>|\[Command finished with exit code (-?\d+)\]"
+)
+
+
+def observed_returncode(raw: str | None) -> int | None:
+    """The exit status an observation reports, or None when its format shows none."""
+    match = _REPORTED_RC_RE.search(raw or "")
+    return int(match.group(1) or match.group(2)) if match else None
 
 
 _PIPE_TAIL_RE = re.compile(r"\|\s*(?:head|tail)\b[^|&;]*$")
@@ -827,30 +895,32 @@ def requires_output(command: str) -> bool:
 
 _SED_RANGE_RE = re.compile(r"^sed\s+-n\s+['\"][^'\"]*['\"]\s+\S+(?:\s*\|\s*(?:cat\s+-n|nl\b.*))?$")
 _SED_NUM_RANGE_RE = re.compile(r"(\d+)\s*,\s*(\d+)\s*p")
-_HEAD_TAIL_TAIL_RE = re.compile(r"\|\s*(?:head|tail)\s+-n?\s*(\d+)\s*$")
-_HEAD_TAIL_ONLY_RE = re.compile(r"^(?:head|tail)\s+-n?\s*(\d+)\s+\S+$")
+_HEAD_TAIL_TAIL_RE = re.compile(r"\|\s*(head|tail)\s+-n?\s*(\d+)\s*$")
+_HEAD_TAIL_ONLY_RE = re.compile(r"^(head|tail)\s+-n?\s*(\d+)\s+\S+$")
 
 
 @dataclass(frozen=True)
 class CommandContract:
     max_lines: int | None = None
+    # `tail` keeps the last lines, so a repair has to cut from the front
+    from_end: bool = False
 
     def __bool__(self) -> bool:
         return self.max_lines is not None
 
+    def keep(self, lines: list[str]) -> list[str]:
+        return lines[-self.max_lines :] if self.from_end else lines[: self.max_lines]
+
 
 def command_contract(command: str) -> CommandContract:
-    masked = _unquoted((command or "").strip())
-    if not masked:
+    # a leading `cd` prints nothing, so it does not change what the rest may print
+    masked = _unquoted(_CD_PREFIX_RE.sub("", (command or "").strip()))
+    # in `a && b | tail -5` the pipe caps only `b`: `a` prints on top of it, so a chain has no cap
+    if not masked or _CHAINED_RE.search(masked):
         return CommandContract()
-    capped = _HEAD_TAIL_TAIL_RE.search(masked)  # a trailing pipe caps whatever precedes it
+    capped = _HEAD_TAIL_TAIL_RE.search(masked) or _HEAD_TAIL_ONLY_RE.match(masked)
     if capped:
-        return CommandContract(max_lines=int(capped.group(1)))
-    if _CHAINED_RE.search(masked):
-        return CommandContract()
-    only = _HEAD_TAIL_ONLY_RE.match(masked)
-    if only:
-        return CommandContract(max_lines=int(only.group(1)))
+        return CommandContract(max_lines=int(capped.group(2)), from_end=capped.group(1) == "tail")
     if _SED_RANGE_RE.match(masked):
         ranges = _SED_NUM_RANGE_RE.findall(command)
         if ranges:
@@ -874,8 +944,34 @@ def repair_to_contract(raw: str, fmt: str, contract: CommandContract) -> str:
     if not contract or is_scaffold_truncated(raw) or not has_content(raw, fmt):
         return raw
     lines = observation_body(raw, fmt).splitlines()
-    kept = lines[: contract.max_lines]
+    kept = contract.keep(lines)
     return raw if kept == lines else _replace_body(raw, fmt, kept)
+
+
+def cap_last_stage(raw: str, fmt: str, command: str, leading_output: str | None) -> str:
+    """Hold the last stage of an `&&` chain to its own trailing `| head -N` / `| tail -N`.
+
+    The shell applies such a cap to the last stage alone, so the chain's observation is the output
+    of the stages before it followed by at most N lines of the last one. `leading_output` is the
+    exact output of those earlier stages, as the repo-context service ran them. The cap is applied
+    to the lines after it, and only when the observation opens with exactly those lines: otherwise
+    nothing marks where the last stage's output begins.
+    """
+    contract = command_contract(command.rsplit("&&", 1)[-1])
+    if (
+        leading_output is None
+        or not contract
+        or is_scaffold_truncated(raw)
+        or not has_content(raw, fmt)
+    ):
+        return raw
+    leading = [line.rstrip() for line in leading_output.splitlines()]
+    lines = observation_body(raw, fmt).splitlines()
+    if [line.rstrip() for line in lines[: len(leading)]] != leading:
+        return raw
+    rest = lines[len(leading) :]
+    kept = contract.keep(rest)
+    return raw if kept == rest else _replace_body(raw, fmt, lines[: len(leading)] + kept)
 
 
 _OH_TRAILER_OPEN = re.compile(
@@ -883,29 +979,28 @@ _OH_TRAILER_OPEN = re.compile(
 )
 _OH_TRAILER_CLOSE = re.compile(r"^\[Command finished with exit code -?\d+\]$")
 _OH_BRACKET_LINE = re.compile(r"^\[.*\]$")
-_OH_NUMBERED_READ = re.compile(r"^cat\s+-n\s+(\S+)$")
+# a read the openhands editor answers with its view: a whole file, or a range of its lines
+_OH_NUMBERED_READ = re.compile(
+    r"^(?:cat\s+-n\s+(?P<file>\S+)|sed\s+-n\s+'\d+,(?:\d+|\$)p'\s+(?P<range>\S+)\s+\|\s+cat\s+-n)$"
+)
 _OH_MOVES_CWD = re.compile(r"(?:^|[;&|]\s*)cd\b")
 _OH_CD_PREFIX = re.compile(r"^\s*cd\s+(\S+)\s*&&")
 _OH_CWD_LINE = "[Current working directory: "
 
 
-def _moves_cwd(command: str, middle: tuple[str, ...]) -> bool:
-    """Whether this command lands the session somewhere other than where it already is.
-
-    A leading `cd` into the absolute path the transcript is already reporting is a no-op, so
-    the session's own trailer still describes where the next observation runs. Anything else —
-    a relative hop, a `cd` mid-chain, or a move with no reported directory to compare against —
-    puts the session in a directory this cannot spell with confidence.
-    """
-    if not _OH_MOVES_CWD.search(command or ""):
-        return False
-    target = _OH_CD_PREFIX.match(command or "")
-    if target is None or not target.group(1).startswith("/"):
-        return True
-    current = next(
-        (line[len(_OH_CWD_LINE) : -1] for line in middle if line.startswith(_OH_CWD_LINE)), None
-    )
-    return current is None or target.group(1).rstrip("/") != current.rstrip("/")
+def _relocated(middle: tuple[str, ...], command: str) -> tuple[str, ...] | None:
+    """The trailer block once `command` has run: its working-directory line rewritten to the
+    absolute path a single leading `cd` entered, or None when a relative hop, or any `cd` after
+    the first, lands the session in a directory only it could resolve."""
+    command = (command or "").strip()
+    moves = _OH_MOVES_CWD.findall(command)
+    if not moves:
+        return middle
+    target = _OH_CD_PREFIX.match(command)
+    if target is None or not target.group(1).startswith("/") or len(moves) > 1:
+        return None
+    cwd = f"{_OH_CWD_LINE}{target.group(1).rstrip('/')}]"
+    return tuple(cwd if line.startswith(_OH_CWD_LINE) else line for line in middle)
 
 
 def openhands_trailer(messages: list[dict[str, str]] | None) -> tuple[str, ...] | None:
@@ -943,6 +1038,15 @@ def grounded_observation(
     be derived from this transcript falls through to the simulator rather than being handed an
     invented one.
     """
+    view = _OH_NUMBERED_READ.match((command or "").strip())
+    if view and fmt != RETURNCODE:
+        # the editor answers a successful numbered read with its view: openhands prints it with
+        # no trailer at all, swe-agent after the scaffold's own prefix
+        if returncode != 0 or not body:
+            return None
+        path = view.group("file") or view.group("range")
+        rendered = f"Here's the result of running `cat -n` on {path}:\n{body}"
+        return wrap(rendered, fmt) if fmt == SWE_AGENT else rendered
     if fmt == SWE_AGENT:
         return wrap(body, fmt)
     if fmt == RETURNCODE:
@@ -951,17 +1055,12 @@ def grounded_observation(
         # a non-empty computed output was already answered as a success before exit codes were
         # derived; an empty one says nothing without a status, so it still needs the simulator
         return wrap(body, fmt, returncode=0) if body else None
-    if view := _OH_NUMBERED_READ.match((command or "").strip()):
-        # the scaffold renders a successful numbered read as a view, with no trailer at all
-        return (
-            f"Here's the result of running `cat -n` on {view.group(1)}:\n{body}"
-            if (returncode == 0 and body)
-            else None
-        )
     if returncode is None:
         return None
     middle = openhands_trailer(messages)
-    if middle is None or _moves_cwd(command, middle):
+    if middle is not None:
+        middle = _relocated(middle, command)
+    if middle is None:
         return None
     return wrap(body, fmt, returncode=returncode, middle=middle)
 

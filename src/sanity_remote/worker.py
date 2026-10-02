@@ -22,6 +22,7 @@ from albedo_eval_service.shared.observation_format import (
     THINK_OPEN_RE,
     THINK_PAIR_RE,
     THINK_TAG_RE,
+    has_unclosed_think_block,
     mask_fenced_spans,
     strip_leaked_reasoning,
     truncation_notice,
@@ -487,7 +488,10 @@ class VllmEngine:
                         generated,
                     )
                     return truncation_notice(max_tokens)
-                return answer
+                # the turn is kept as eval keeps it, reasoning included, so the stored trajectory,
+                # the judges and the amputated-thinking check see what the model wrote; only a
+                # think block that never closes and carries no command is replaced by its notice
+                return answer if has_unclosed_think_block(answer) else raw
             except (KeyError, IndexError, ValueError):
                 logger.warning("[sanity-remote] malformed vLLM response body - model fault")
                 return ""
@@ -542,6 +546,8 @@ def _heuristics(responses: list[str], req: Any, skip: bool = False) -> list[dict
         logger.info("[sanity-remote] heuristics skipped for {} responses", len(responses))
         return [{"passed": True, "reason": "heuristics disabled"} for _ in responses]
 
+    # the heuristics judge the answer alone, as they did before the reasoning was kept
+    responses = [_strip_thinking(resp) for resp in responses]
     out: list[dict[str, Any]] = []
     for i, resp in enumerate(responses):
         r = check_one(

@@ -3,8 +3,8 @@ from __future__ import annotations
 import re
 
 from .models import GitState
-from .templates import _FUNCNAME, AUTHOR_LINE, COMMIT_LINE, DATE_LINE, FUNCNAME_MAX_CHARS
-from .views import _Views
+from .templates import AUTHOR_LINE, COMMIT_LINE, DATE_LINE, FUNCNAME, FUNCNAME_MAX_CHARS
+from .views import Views
 
 _PATCH_FROM = re.compile(r"^From ([0-9a-f]{40}) ", re.M)
 _PATCH_AUTHOR = re.compile(r"^From: (.+(?:\n[ \t].+)*)$", re.M)
@@ -24,7 +24,7 @@ def _git_date(raw: str) -> str | None:
     return f"{moment:%a %b} {moment.day} {moment:%H:%M:%S %Y} {moment:%z}"
 
 
-def _parse_patch(text: str) -> dict | None:
+def parse_patch(text: str) -> dict | None:
     from email.header import decode_header, make_header
 
     sha = _PATCH_FROM.search(text or "")
@@ -79,7 +79,7 @@ def _parse_patch(text: str) -> dict | None:
     }
 
 
-def _commit_header(patch: dict) -> list[str]:
+def commit_header(patch: dict) -> list[str]:
     lines = [
         COMMIT_LINE.format(sha=patch["sha"]),
         AUTHOR_LINE.format(author=patch["author"]),
@@ -88,13 +88,11 @@ def _commit_header(patch: dict) -> list[str]:
         "    " + patch["subject"],
     ]
     if patch["body"]:
-        lines.append("    ")
-    for line in patch["body"]:
-        lines.append(("    " + line) if line.strip() else "    ")
+        lines += ["    ", *(("    " + line) if line.strip() else "    " for line in patch["body"])]
     return lines
 
 
-def _reabbrev(diff: list[str], abbrev: int) -> list[str]:
+def reabbrev(diff: list[str], abbrev: int) -> list[str]:
     def shorten(match):
         old, new, tail = match.group(1), match.group(2), match.group(3)
         if len(old) < abbrev or len(new) < abbrev:
@@ -114,12 +112,12 @@ def _funcname_above(file_lines: list[str], anchor: str, near: int) -> str | None
         return None
     start = min(positions, key=lambda i: abs(i - near))
     for above in range(start - 1, -1, -1):
-        if _FUNCNAME.match(file_lines[above]):
+        if FUNCNAME.match(file_lines[above]):
             return " " + file_lines[above].rstrip()[:FUNCNAME_MAX_CHARS]
     return ""
 
 
-def _retarget_funcnames(diff: list[str], views: _Views) -> list[str]:
+def retarget_funcnames(diff: list[str], views: Views) -> list[str]:
     out = list(diff)
     file_lines: list[str] | None = None
     for position, line in enumerate(diff):
@@ -146,7 +144,7 @@ def _retarget_funcnames(diff: list[str], views: _Views) -> list[str]:
 _DIFF_HEADER = re.compile(r"^diff --git a/(.*) b/(.*)$")
 
 
-def _filter_diff(diff: list[str], wanted: list[str]) -> list[str]:
+def filter_diff(diff: list[str], wanted: list[str]) -> list[str]:
     keep = set(wanted)
     out: list[str] = []
     including = False
@@ -159,87 +157,90 @@ def _filter_diff(diff: list[str], wanted: list[str]) -> list[str]:
 
 
 _OUTPUT_BODY = re.compile(r"<output>\n?(.*?)\n?</output>", re.S)
-_DIFF_FILE = re.compile(r"^diff --git a/(\S+) b/(\S+)\s*$")
-_HUNK_START = re.compile(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@")
+_DIFF_OLD = re.compile(r"^--- (\S+)")
+_DIFF_NEW = re.compile(r"^\+\+\+ (\S+)")
+_HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
-def _observed_patches(observation: str) -> dict[str, list[tuple[int, list[str]]]]:
+def unified_diff(text: str) -> list[tuple[str, str, list[tuple[int, list[str]]], bool]] | None:
+    """The files of a unified diff, each as (old path, new path, hunks, whether a line is
+    marked as lacking its final newline), a hunk as (old start line, body); None when the text
+    is not a diff this reads."""
+    files = []
+    lines = text.split("\n")
+    index = 0
+    while index < len(lines):
+        old = _DIFF_OLD.match(lines[index])
+        new = _DIFF_NEW.match(lines[index + 1]) if old and index + 1 < len(lines) else None
+        if not new:
+            index += 1
+            continue
+        hunks, marked = [], False
+        index += 2
+        while index < len(lines) and (header := _HUNK.match(lines[index])):
+            old_left = int(header.group(2) or 1)
+            new_left = int(header.group(4) or 1)
+            body, index = [], index + 1
+            while (old_left > 0 or new_left > 0) and index < len(lines):
+                line = lines[index]
+                tag = line[:1] or " "
+                if tag == "\\":
+                    marked = True
+                elif tag in " -+":
+                    body.append(tag + line[1:])
+                    old_left -= tag in " -"
+                    new_left -= tag in " +"
+                else:
+                    return None
+                index += 1
+            if index < len(lines) and lines[index].startswith("\\"):
+                marked, index = True, index + 1
+            hunks.append((int(header.group(1)), body))
+        files.append((old.group(1), new.group(1), hunks, marked))
+    return files or None
+
+
+def observed_patches(observation: str) -> dict[str, list[tuple[int, list[str]]]]:
+    """The hunks of each file a diff shown in an observation changes in place: not a file it
+    adds or removes, nor one whose last line lacks its line break (the hunks do not carry it)."""
     body = observation or ""
     if match := _OUTPUT_BODY.search(body):
         body = match.group(1)
-    patches: dict[str, list[tuple[int, list[str]]]] = {}
-    path: str | None = None
-    hunks: list[tuple[int, list[str]]] = []
-    current: list[str] | None = None
-    blank_tail = 0
-
-    def flush() -> None:
-        if current is not None and blank_tail:
-            del current[len(current) - blank_tail :]
-        if path and hunks:
-            patches[path] = hunks
-
-    for line in body.split("\n"):
-        if header := _DIFF_FILE.match(line):
-            flush()
-            path, hunks, current, blank_tail = header.group(2), [], None, 0
-            continue
-        if path is None:
-            continue
-        if start := _HUNK_START.match(line):
-            if current is not None and blank_tail:
-                del current[len(current) - blank_tail :]
-            current, blank_tail = [], 0
-            hunks.append((int(start.group(1)), current))
-            continue
-        if current is None:
-            continue
-        if line == "":
-            current.append(" ")
-            blank_tail += 1
-        elif line[:1] in (" ", "+", "-", "\\"):
-            current.append(line)
-            blank_tail = 0
-        else:
-            flush()
-            path, hunks, current, blank_tail = None, [], None, 0
-    flush()
-    return patches
+    return {
+        new.removeprefix("b/"): hunks
+        for old, new, hunks, marked in unified_diff(body) or []
+        if "/dev/null" not in (old, new) and not marked and hunks
+    }
 
 
-def _apply_hunks(text: str, hunks: list[tuple[int, list[str]]]) -> str | None:
+def apply_hunks(text: str, hunks: list[tuple[int, list[str]]]) -> str | None:
+    """`text` with the hunks applied at the lines they name, or None when one does not match
+    there. A hunk that only adds lines starts after the line its start names."""
     lines = text.split("\n")
-    trailing = lines and lines[-1] == ""
+    trailing = bool(lines) and lines[-1] == ""
     if trailing:
         lines.pop()
     out: list[str] = []
     cursor = 0
     for start, body in hunks:
-        index = start - 1
+        index = start - 1 if any(entry[:1] in " -" for entry in body) else start
         if index < cursor or index > len(lines):
             return None
         out.extend(lines[cursor:index])
         position = index
         for entry in body:
             tag, content = entry[:1], entry[1:]
-            if tag == "\\":
-                continue
-            if tag == " ":
-                if position >= len(lines) or lines[position] != content:
-                    return None
-                out.append(content)
-                position += 1
-            elif tag == "-":
+            if tag in " -":
                 if position >= len(lines) or lines[position] != content:
                     return None
                 position += 1
-            elif tag == "+":
-                out.append(content)
+                if tag == " ":
+                    out.append(content)
             else:
-                return None
+                out.append(content)
         cursor = position
     out.extend(lines[cursor:])
-    return "\n".join(out) + ("\n" if trailing else "")
+    return "\n".join(out) + "\n" if out else ""
 
 
 def learn_from_observed_diff(overlay, state: GitState, command: str, observation: str, read_base):
@@ -249,11 +250,11 @@ def learn_from_observed_diff(overlay, state: GitState, command: str, observation
     staged = "--cached" in text or "--staged" in text
     if not staged and state.index:
         return
-    for path, hunks in _observed_patches(observation).items():
+    for path, hunks in observed_patches(observation).items():
         base = read_base(path)
         if base is None:
             continue
-        patched = _apply_hunks(base, hunks)
+        patched = apply_hunks(base, hunks)
         if patched is None:
             continue
         if staged:

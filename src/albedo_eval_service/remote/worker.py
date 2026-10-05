@@ -4,7 +4,7 @@ import glob
 import os
 import subprocess
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Protocol, TypeVar
@@ -15,10 +15,10 @@ from loguru import logger
 from albedo_config import RemoteSettings
 
 from ..evaluator.shared.questions import assign_horizons
-from ..judge_core import CHALLENGER_WIN_MARGIN, challenger_beats_king
+from ..judge_core import CHALLENGER_WIN_MARGIN, aggregate_scores, challenger_beats_king
 from ..modelstore.canonical_model_config import canonical_generation_config, canonical_max_model_len
 from ..modelstore.resolver import ModelArtifactResolver, ResolvedModel
-from ..scoring.scoring_client import Scorer, build_scorer
+from ..scoring.scoring_client import Scorer, ScoringResult, build_scorer
 from ..shared.dataset_manifest import load_manifest_file
 from ..shared.models import EvalRequest
 from ..shared.observation_format import (
@@ -158,12 +158,40 @@ class RemoteEvalWorker:
             "challenger", topology.challenger, challenger_model.local_path
         )
         _cleanup_stale_vllm_resources()
-        king_results, challenger_results = self._generate_trajectories(
-            request=request,
-            samples=samples,
-            king_generator=king_generator,
-            challenger_generator=challenger_generator,
-        )
+        # a pair is judged as soon as both its trajectories end, while the engines are still
+        # busy with the others; the batches are gathered again once generation is over
+        pending: list[tuple[EvalSample, GenerationResult, GenerationResult]] = []
+        pending_lock = threading.Lock()
+        batches: list[Future[ScoringResult]] = []
+        batch_size = max(1, int(request.dataset.scoring_batch_size))
+        with ThreadPoolExecutor(
+            max_workers=max(1, self.settings.scoring_batch_concurrency)
+        ) as scoring_pool:
+
+            def flush() -> None:
+                if pending:
+                    batch, pending[:] = list(pending), []
+                    batches.append(
+                        scoring_pool.submit(self._score_batch, request, batch, category_prep_id)
+                    )
+
+            def on_pair(
+                sample: EvalSample, king: GenerationResult, challenger: GenerationResult
+            ) -> None:
+                with pending_lock:
+                    pending.append((sample, king, challenger))
+                    if len(pending) >= batch_size:
+                        flush()
+
+            king_results, challenger_results = self._generate_trajectories(
+                request=request,
+                samples=samples,
+                king_generator=king_generator,
+                challenger_generator=challenger_generator,
+                on_pair=on_pair,
+            )
+            with pending_lock:
+                flush()
 
         self._emit_generation_batches(
             run, request, samples, king_results, challenger_results, topology
@@ -181,7 +209,7 @@ class RemoteEvalWorker:
             samples=samples,
             king_results=king_results,
             challenger_results=challenger_results,
-            category_prep_id=category_prep_id,
+            batches=batches,
         )
         scoring_records = scoring_result["records"]
         self._emit_scoring_batches(run, request, scoring_records)
@@ -347,10 +375,12 @@ class RemoteEvalWorker:
         samples: list[EvalSample],
         king_generator: Generator,
         challenger_generator: Generator,
+        on_pair: Callable[[EvalSample, GenerationResult, GenerationResult], None] | None = None,
     ) -> tuple[list[GenerationResult], list[GenerationResult]]:
         """Every trajectory runs on its own thread: generate a turn, fetch its observation, go
         again. No sample waits for another, so the engines stay busy while observations are
-        simulated, and extra rollouts only add threads."""
+        simulated, and extra rollouts only add threads. `on_pair` gets each sample's merged king
+        and challenger results the moment both of its trajectories have ended."""
         horizons = _rollout_horizons(samples)
         turn_count = max(
             horizons.values(), default=max(1, int(self.settings.trajectory_assistant_turns))
@@ -362,7 +392,29 @@ class RemoteEvalWorker:
             max(1, self.settings.scoring_batch_concurrency)
         )
 
+        finished: dict[str, set[str]] = {}
+        finished_lock = threading.Lock()
+
+        def merged(sample: EvalSample, side: str) -> GenerationResult:
+            return _merge_trajectory_results(
+                [sample],
+                results[side],
+                observations[side],
+                side=side,
+                token_limit=self.settings.max_new_tokens,
+                horizons=horizons,
+            )[0]
+
         def trajectory(side: str, sample: EvalSample) -> None:
+            walk(side, sample)
+            with finished_lock:
+                sides = finished.setdefault(sample.sample_id, set())
+                sides.add(side)
+                complete = len(sides) == len(generators)
+            if complete and on_pair is not None:
+                on_pair(sample, merged(sample, "previous_king"), merged(sample, "challenger"))
+
+        def walk(side: str, sample: EvalSample) -> None:
             for turn_index in range(horizons[sample.sample_id]):
                 result = _generate_retrying_bad_turns(generators[side], [sample])[0]
                 results[side][turn_index].append(result)
@@ -587,8 +639,10 @@ class RemoteEvalWorker:
         samples: list[EvalSample],
         king_results: list[GenerationResult],
         challenger_results: list[GenerationResult],
-        category_prep_id: str | None = None,
+        batches: list[Future[ScoringResult]] | None = None,
     ) -> dict[str, object]:
+        """The streamed batches as one scoring result, once the whole set of pairs is known to
+        be worth scoring; the records come back in sample order."""
         valid_pair_count = _valid_generated_pair_count(samples, king_results, challenger_results)
         total_sample_count = len(samples)
         min_valid_fraction = self.settings.scoring_min_valid_fraction
@@ -620,13 +674,7 @@ class RemoteEvalWorker:
                 },
             }
         try:
-            result = self._scorer.score(
-                request=request,
-                samples=samples,
-                king_results=king_results,
-                challenger_results=challenger_results,
-                category_prep_id=category_prep_id,
-            )
+            scored = [batch.result() for batch in batches or []]
         except Exception as exc:
             logger.exception(
                 f"[remote-worker] judge scoring failed eval_run={request.eval_run_id} "
@@ -649,7 +697,32 @@ class RemoteEvalWorker:
                     "retryable": True,
                 },
             }
-        return {"records": result.records, "summary": result.summary}
+        order = {sample.sample_id: index for index, sample in enumerate(samples)}
+        records = sorted(
+            (record for batch in scored for record in batch.records),
+            key=lambda record: order.get(str(record.get("sample_id")), len(order)),
+        )
+        summary = aggregate_scores(
+            records, min_valid_fraction=min_valid_fraction, total=len(samples)
+        )
+        summary["batch_summaries"] = [
+            inner for batch in scored for inner in batch.summary.get("batch_summaries", [])
+        ]
+        return {"records": records, "summary": summary}
+
+    def _score_batch(
+        self,
+        request: EvalRequest,
+        batch: list[tuple[EvalSample, GenerationResult, GenerationResult]],
+        category_prep_id: str | None,
+    ) -> ScoringResult:
+        return self._scorer.score(
+            request=request,
+            samples=[sample for sample, _, _ in batch],
+            king_results=[king for _, king, _ in batch],
+            challenger_results=[challenger for _, _, challenger in batch],
+            category_prep_id=category_prep_id,
+        )
 
     def _build_verdict(
         self,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import types
+from concurrent.futures import Future
 from uuid import uuid4
 
 import pyarrow as pa
@@ -264,6 +265,10 @@ def test_remote_worker_starts_category_prep_before_model_resolution(tmp_path, mo
 
     assert calls.index("category_prep") < calls.index("resolve:s3-or-hippius-uri/king")
     assert any(str(call).startswith("simulate:") for call in calls)
+    # a pair is scored while the other trajectories are still generating
+    generate_indexes = [i for i, c in enumerate(calls) if isinstance(c, dict) and "sample_ids" in c]
+    assert calls.count("score:prep-1") >= 2  # one batch per finished pair at batch size 1
+    assert calls.index("score:prep-1") < generate_indexes[-1]
 
 
 def test_submit_echo_stops_future_trajectory_turns(monkeypatch):
@@ -582,7 +587,16 @@ def test_score_pairs_counts_truncated_pairs_as_valid():
             self, *, request, samples, king_results, challenger_results, category_prep_id=None
         ):
             scored["samples"] = len(samples)
-            return ScoringResult(records=[], summary={"state": "succeeded"})
+            records = [
+                {
+                    "sample_id": s.sample_id,
+                    "scored": True,
+                    "king_score": 0.5,
+                    "challenger_score": 0.5,
+                }
+                for s in samples
+            ]
+            return ScoringResult(records=records, summary={"state": "succeeded"})
 
         def simulate_observation(self, **_kwargs):
             return ""
@@ -592,16 +606,22 @@ def test_score_pairs_counts_truncated_pairs_as_valid():
     challenger_results = [
         GenerationResult(sample.sample_id, "notice", truncated=True) for sample in samples
     ]
-
-    result = _pairs_worker(Recording())._score_pairs(
+    worker = _pairs_worker(Recording())
+    batch = worker._score_batch(
+        _request(), list(zip(samples, king_results, challenger_results)), None
+    )
+    done: Future = Future()
+    done.set_result(batch)
+    result = worker._score_pairs(
         request=_request(),
         samples=samples,
         king_results=king_results,
         challenger_results=challenger_results,
+        batches=[done],
     )
-
     assert scored["samples"] == 10
     assert result["summary"]["state"] == "succeeded"
+    assert [r["sample_id"] for r in result["records"]] == [s.sample_id for s in samples]
 
 
 def test_submit_echo_bypasses_observation_simulator(tmp_path):

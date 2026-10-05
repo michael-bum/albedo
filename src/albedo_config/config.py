@@ -85,6 +85,7 @@ class JudgeSettings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api"
     engy_api_key: str = Field("", validation_alias=AliasChoices("ALBEDO_JUDGE_ENGY_API_KEY"))
     engy_base_url: str = "https://api.engy.ai"
+    jev_api_key: str = ""
     engy_models: str = ENGY_MODELS
     engy_max_errors: int = 150
     request_timeout_seconds: float = 300.0

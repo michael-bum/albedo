@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import collections
-import contextlib
 import email.utils
 import json
 import random
@@ -35,8 +34,8 @@ class JudgeRawResponse:
     logprobs: list[dict[str, Any]] | None = None
 
 
-ENGY_PURPOSES = frozenset({"judge"})
-ENGY_FALLBACK_PURPOSES = frozenset({"reference", "questions"})
+ENGY_PURPOSES = frozenset({"judge", "reference"})
+ENGY_FALLBACK_PURPOSES = frozenset({"questions"})
 
 POOL_WAIT_SECONDS = 30.0
 
@@ -82,6 +81,9 @@ class JudgeLLMClient:
         self._engy_models = {m.strip() for m in settings.engy_models.split(",") if m.strip()}
         self._engy_errors: collections.Counter[tuple[str, str]] = collections.Counter()
         self._engy_gate = asyncio.Semaphore(max(1, settings.engy_max_concurrency))
+        self._engy_queue = asyncio.Semaphore(
+            max(1, settings.engy_max_concurrency) * max(1, settings.engy_queue_depth)
+        )
         logger.info(
             f"[judge-llm] engy routing for purposes={sorted(ENGY_PURPOSES)}: "
             + (
@@ -174,9 +176,11 @@ class JudgeLLMClient:
         )
 
     async def _call(self, **kwargs: Any) -> JudgeRawResponse:
-        """The routes a call may take, in order. References and questions try OpenRouter, then
-        engy. A judge call tries engy, then OpenRouter on the same model, then OpenRouter on the
-        model's fallback. The first usable answer wins; the last route's answer is returned as is.
+        """The routes a call may take, in order. Questions try OpenRouter, then engy. Judge and
+        reference calls try engy, then OpenRouter on the same model, then OpenRouter on the model's
+        fallback. Engy takes up to `engy_queue_depth` x gate calls at a time, in flight or waiting
+        for a slot; the rest skip it and go to OpenRouter at once. The first usable answer wins;
+        the last route's answer is returned as is.
         """
         model, purpose = kwargs["model"], kwargs.get("purpose", "other")
         engy = not kwargs.get("force_openrouter") and self._use_engy(
@@ -192,9 +196,16 @@ class JudgeLLMClient:
             routes += [{**kwargs, "model": fallback, "force_openrouter": True}] if fallback else []
         else:
             routes = [kwargs]
-        for route in routes[:-1]:
-            result = await self._call_once(**route)
-            if _usable(result, kwargs.get("accept"), kwargs.get("accept_response")):
+        result = None
+        for route in routes:
+            attempt = await (
+                self._on_engy(**route) if route.get("engy_only") else self._call_once(**route)
+            )
+            if attempt is None:
+                continue
+            result = attempt
+            usable = _usable(result, kwargs.get("accept"), kwargs.get("accept_response"))
+            if route is routes[-1] or usable:
                 return result
             via = "engy" if route.get("engy_only") else "openrouter"
             logger.warning(
@@ -202,7 +213,14 @@ class JudgeLLMClient:
                 f"eval_run_id={kwargs.get('eval_run_id', '')} purpose={purpose}, "
                 f"trying the next route: {result.error or 'unusable answer'}"
             )
-        return await self._call_once(**routes[-1])
+        return result
+
+    async def _on_engy(self, **kwargs: Any) -> JudgeRawResponse | None:
+        """The call on engy, once a gate slot frees; None when engy's queue is already full."""
+        if self._engy_queue.locked():
+            return None
+        async with self._engy_queue, self._engy_gate:
+            return await self._call_once(**kwargs)
 
     async def _call_once(
         self,
@@ -476,9 +494,7 @@ class JudgeLLMClient:
         want_logprobs: bool = False,
         engy_only: bool = False,
     ) -> JudgeRawResponse:
-        on_engy = engy_only or (
-            not force_openrouter and self._use_engy(purpose, model, eval_run_id)
-        )
+        on_engy = engy_only
         client = self._engy if on_engy else self._client
         pins = JUDGE_LOGPROB_PROVIDER_PINS if want_logprobs else JUDGE_PROVIDER_PINS
         provider_block = provider if provider is not None else pins.get(model, {})
@@ -505,24 +521,16 @@ class JudgeLLMClient:
             }
         started = time.monotonic()
         try:
-            async with self._engy_gate if on_engy else contextlib.nullcontext():
-                body = await self._exchange(client, payload)
+            body = await self._exchange(client, payload)
         except Exception as exc:
-            if not on_engy:
-                raise
-            self._engy_errors[(eval_run_id, model)] += 1
-            logger.warning(
-                f"[judge-llm] engy error {self._engy_errors[(eval_run_id, model)]}/"
-                f"{self.settings.engy_max_errors} eval_run_id={eval_run_id} "
-                f"model={model} purpose={purpose}, "
-                f"{'retrying on engy' if engy_only else 'retrying this call on openrouter'}: "
-                f"{type(exc).__name__}: {exc}"
-            )
-            if engy_only:
-                raise
-            on_engy = False
-            payload["model"] = model
-            body = await self._exchange(self._client, payload)
+            if on_engy:
+                self._engy_errors[(eval_run_id, model)] += 1
+                logger.warning(
+                    f"[judge-llm] engy error {self._engy_errors[(eval_run_id, model)]}/"
+                    f"{self.settings.engy_max_errors} eval_run_id={eval_run_id} "
+                    f"model={model} purpose={purpose}: {type(exc).__name__}: {exc}"
+                )
+            raise
         usage = body.get("usage") or {}
         cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
         reasoning = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0)

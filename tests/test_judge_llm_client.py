@@ -295,6 +295,36 @@ def test_judge_without_engy_pins_the_logprob_aligned_providers():
     assert SENT_ORDERS == [["parasail", "reka", "digitalocean"]]
 
 
+def test_engy_is_skipped_once_its_queue_is_full():
+    hits = asyncio.run(
+        _route(
+            "judge",
+            want_logprobs=True,
+            engy_max_concurrency=1,
+            engy_queue_depth=1,
+            hold_gate=True,
+        )
+    )
+    assert hits == [("openrouter", "z-ai/glm-5.3-flash")]
+
+
+def test_a_call_in_the_queue_waits_for_an_engy_slot():
+    hits = asyncio.run(
+        _route(
+            "judge",
+            want_logprobs=True,
+            engy_max_concurrency=1,
+            engy_queue_depth=2,
+            hold_gate=0.1,
+        )
+    )
+    assert hits == [("engy", "glm-5.3-flash")]
+
+
+def test_reference_goes_to_engy_first():
+    assert asyncio.run(_route("reference")) == [("engy", "glm-5.3-flash")]
+
+
 def test_questions_fall_back_to_engy_when_openrouter_fails():
     hits = asyncio.run(_route("questions", openrouter_should_fail=True))
     assert hits == [("openrouter", "z-ai/glm-5.3-flash"), ("engy", "glm-5.3-flash")]
@@ -350,11 +380,18 @@ async def _route(
     want_logprobs=False,
     engy_should_fail=False,
     openrouter_should_fail=False,
+    hold_gate=False,
     **overrides,
 ):
     hits: list[tuple[str, str]] = []
     SENT_ORDERS.clear()
     settings, client = _engy_client(None, **overrides)
+    if hold_gate:
+        await client._engy_gate.acquire()
+        if hold_gate is True:
+            await client._engy_queue.acquire()
+        else:
+            asyncio.get_running_loop().call_later(hold_gate, client._engy_gate.release)
     client._engy_should_fail, client._openrouter_should_fail = (
         engy_should_fail,
         openrouter_should_fail,

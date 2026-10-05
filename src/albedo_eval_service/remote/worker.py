@@ -172,7 +172,9 @@ class RemoteEvalWorker:
                 if pending:
                     batch, pending[:] = list(pending), []
                     batches.append(
-                        scoring_pool.submit(self._score_batch, request, batch, category_prep_id)
+                        scoring_pool.submit(
+                            self._score_batch, request, batch, category_prep_id, len(batches) + 1
+                        )
                     )
 
             def on_pair(
@@ -715,6 +717,7 @@ class RemoteEvalWorker:
         request: EvalRequest,
         batch: list[tuple[EvalSample, GenerationResult, GenerationResult]],
         category_prep_id: str | None,
+        index: int = 1,
     ) -> ScoringResult:
         return self._scorer.score(
             request=request,
@@ -722,6 +725,7 @@ class RemoteEvalWorker:
             king_results=[king for _, king, _ in batch],
             challenger_results=[challenger for _, _, challenger in batch],
             category_prep_id=category_prep_id,
+            batch_index=index,
         )
 
     def _build_verdict(

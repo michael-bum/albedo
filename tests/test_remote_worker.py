@@ -205,8 +205,17 @@ class RecordingScorer:
         self.calls.append(f"simulate:{sample.sample_id}")
         return f"Observation: saw {assistant_output[-20:]}"
 
-    def score(self, *, request, samples, king_results, challenger_results, category_prep_id=None):
-        self.calls.append(f"score:{category_prep_id}")
+    def score(
+        self,
+        *,
+        request,
+        samples,
+        king_results,
+        challenger_results,
+        category_prep_id=None,
+        batch_index=1,
+    ):
+        self.calls.append(f"score:{category_prep_id}:{batch_index}")
         records = [
             {
                 "sample_id": sample.sample_id,
@@ -267,8 +276,9 @@ def test_remote_worker_starts_category_prep_before_model_resolution(tmp_path, mo
     assert any(str(call).startswith("simulate:") for call in calls)
     # a pair is scored while the other trajectories are still generating
     generate_indexes = [i for i, c in enumerate(calls) if isinstance(c, dict) and "sample_ids" in c]
-    assert calls.count("score:prep-1") >= 2  # one batch per finished pair at batch size 1
-    assert calls.index("score:prep-1") < generate_indexes[-1]
+    scores = [c for c in calls if isinstance(c, str) and c.startswith("score:prep-1:")]
+    assert len(scores) >= 2 and scores[:2] == ["score:prep-1:1", "score:prep-1:2"]
+    assert calls.index("score:prep-1:1") < generate_indexes[-1]
 
 
 def test_submit_echo_stops_future_trajectory_turns(monkeypatch):
@@ -584,7 +594,14 @@ def test_score_pairs_counts_truncated_pairs_as_valid():
 
     class Recording:
         def score(
-            self, *, request, samples, king_results, challenger_results, category_prep_id=None
+            self,
+            *,
+            request,
+            samples,
+            king_results,
+            challenger_results,
+            category_prep_id=None,
+            batch_index=1,
         ):
             scored["samples"] = len(samples)
             records = [

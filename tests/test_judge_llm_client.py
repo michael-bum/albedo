@@ -278,6 +278,11 @@ def test_judge_leaves_engy_for_the_same_model_on_openrouter():
     assert hits == [("engy", "glm-5.3-flash"), ("openrouter", "z-ai/glm-5.3-flash")]
 
 
+def test_an_engy_transport_error_is_not_re_asked_across_parse_attempts():
+    hits = asyncio.run(_route("judge", engy_should_fail=True, parse_retries=3))
+    assert hits == [("engy", "glm-5.3-flash"), ("openrouter", "z-ai/glm-5.3-flash")]
+
+
 def test_judge_drops_to_glm_5_2_only_when_openrouter_fails_too():
     hits = asyncio.run(
         _route("judge", want_logprobs=True, engy_should_fail=True, openrouter_should_fail=True)

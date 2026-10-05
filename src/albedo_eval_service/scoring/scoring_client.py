@@ -45,6 +45,7 @@ class Scorer(Protocol):
         king_results: list[GenerationResult],
         challenger_results: list[GenerationResult],
         category_prep_id: str | None = None,
+        batch_index: int = 1,
     ) -> ScoringResult: ...
 
 
@@ -104,9 +105,15 @@ class HttpScoringClient:
         king_results: list[GenerationResult],
         challenger_results: list[GenerationResult],
         category_prep_id: str | None = None,
+        batch_index: int = 1,
     ) -> ScoringResult:
         payloads = _score_batch_payloads(
-            request, samples, king_results, challenger_results, category_prep_id=category_prep_id
+            request,
+            samples,
+            king_results,
+            challenger_results,
+            category_prep_id=category_prep_id,
+            first_index=batch_index,
         )
         with httpx.Client(
             base_url=self.settings.scoring_base_url.rstrip("/"),
@@ -171,9 +178,15 @@ class WebSocketScoringClient:
         king_results: list[GenerationResult],
         challenger_results: list[GenerationResult],
         category_prep_id: str | None = None,
+        batch_index: int = 1,
     ) -> ScoringResult:
         payloads = _score_batch_payloads(
-            request, samples, king_results, challenger_results, category_prep_id=category_prep_id
+            request,
+            samples,
+            king_results,
+            challenger_results,
+            category_prep_id=category_prep_id,
+            first_index=batch_index,
         )
 
         def send(payload: dict[str, Any]) -> dict[str, Any]:
@@ -215,6 +228,7 @@ class MockScoringClient:
         king_results: list[GenerationResult],
         challenger_results: list[GenerationResult],
         category_prep_id: str | None = None,
+        batch_index: int = 1,
     ) -> ScoringResult:
         king_by_id = {result.sample_id: result for result in king_results}
         challenger_by_id = {result.sample_id: result for result in challenger_results}
@@ -320,6 +334,7 @@ def _score_batch_payloads(
     challenger_results: list[GenerationResult],
     *,
     category_prep_id: str | None = None,
+    first_index: int = 1,
 ) -> list[dict[str, Any]]:
     king_by_id = {result.sample_id: result for result in king_results}
     challenger_by_id = {result.sample_id: result for result in challenger_results}
@@ -333,7 +348,7 @@ def _score_batch_payloads(
     ]
     payloads = []
     for batch_idx, batch in enumerate(
-        _chunks(valid_samples, request.dataset.scoring_batch_size), start=1
+        _chunks(valid_samples, request.dataset.scoring_batch_size), start=first_index
     ):
         payloads.append(
             {

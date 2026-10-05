@@ -357,7 +357,10 @@ class JudgeLLMClient:
             f"attempts={transport_budget + 1}, returning error: {last_error}"
         )
         return JudgeRawResponse(
-            model=model, provider=_provider_name(model), raw="", error=last_error
+            model=model,
+            provider="engy" if engy_only else _provider_name(model),
+            raw="",
+            error=last_error,
         )
 
     async def _score_once_hedged(self, hedge_after: float, **kwargs: Any) -> JudgeRawResponse:

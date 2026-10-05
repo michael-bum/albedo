@@ -162,7 +162,7 @@ question one run earned is kept whatever the others say. With Jev down entirely 
 GLM with the whole checklist, as before.
 If no run returns a readable verdict the unpruned checklist is kept rather than deleted blind.
 
-A sample is rejected outright if fewer than `QUESTION_FLOOR` (6) milestone questions survive
+A sample is rejected outright if fewer than `QUESTION_FLOOR` (5) milestone questions survive
 
 ## Before the judge: degenerate sides are scored 0 outright
 
@@ -267,11 +267,14 @@ The reading is validated before it is trusted: the sampled token must be the let
 did), the token spans must cover the whole content, and the written letter must be in the list. A
 response that fails any of these is rejected like a parse failure and re-asked on the next pinned
 provider; there is no fallback to letter-only scoring. Because of this, judge calls run on their own
-provider pin (`JUDGE_LOGPROB_PROVIDER_PINS`: alibaba, then digitalocean — glm-5.2 endpoints whose
-top-20 logprobs line up with the sampled token; StreamLake, Cloudflare, Parasail and Wafer accept the
-parameter but return misaligned arrays; the pin keeps the fp8 filter, so OpenRouter skips DigitalOcean
-while it reports no quantization and alibaba serves), not the general `JUDGE_PROVIDER_PINS` the sanity
-checks use.
+provider pin, not the general `JUDGE_PROVIDER_PINS` the sanity checks use. Both pins come from one
+roster per model (`PROVIDERS` in `models.py`): every provider in the order to try it, flagged by
+whether its top-20 logprobs line up with the sampled token. Questions, references and the simulator
+fallback walk the whole roster; a judge call only the aligned providers (glm-5.3-flash: Parasail, Reka,
+DigitalOcean; glm-5.2: Alibaba, DigitalOcean). The judge model (`JUDGE_MODELS`,
+glm-5.3-flash) is asked on engy first, then on OpenRouter, then its `JUDGE_FALLBACK_MODELS` entry
+glm-5.2 is asked on OpenRouter. glm-5.3-flash cannot run without reasoning, so `MODEL_REASONING`
+sends `effort: low`.
 
 With `ALBEDO_JUDGE_JUDGE_REPEATS` > 1, a question's score is the **mean** of the repeats'
 expectations (not a majority vote); `answers` shows the majority letter and `disputed` counts the
@@ -365,8 +368,8 @@ Judge-side settings are `JudgeSettings` in `src/albedo_config/config.py`, prefix
 
 | setting | code default | meaning |
 |---|---|---|
-| `evaluator_model` | `z-ai/glm-5.2` | reads the vector and writes the ladder |
-| `sota_models` | `z-ai/glm-5.2` | pool the reference runs are drawn from |
+| `evaluator_model` | `z-ai/glm-5.3-flash` | reads the vector and writes the ladder; engy answers when OpenRouter cannot |
+| `sota_models` | `z-ai/glm-5.3-flash` | pool the reference runs are drawn from; engy answers when OpenRouter cannot |
 | `reference_runs` | 3 | how many reference trajectories are generated per sample |
 | `reference_prune` | `true` | judge every run against the checklist and drop what none of them earns |
 | `milestone_readings` | 4 | independent extractor readings, merged by union |
@@ -380,7 +383,8 @@ Judge-side settings are `JudgeSettings` in `src/albedo_config/config.py`, prefix
 | `repo_context_url` | `""` | grounding service; empty disables grounding (see [DATASETS.md](DATASETS.md)) |
 
 The model roster lives in `src/albedo_config/models.py`. `JUDGE_MODELS` is now a **single** judge —
-`("z-ai/glm-5.2",)` — matching `judge_count = 1`; `EVALUATOR_MODEL` and `SOTA_MODELS` are the same model.
+`("z-ai/glm-5.3-flash",)` on engy, with glm-5.2 on OpenRouter as its fallback — matching `judge_count = 1`;
+`EVALUATOR_MODEL` and `SOTA_MODELS` are the same model.
 Read the run's `judge-results` in `scoring-results.jsonl` to confirm who actually voted for a given eval.
 
 `ScoringConfig.allowed_scores` is `[0, 1]`: the range a question score lies in. The verdict and

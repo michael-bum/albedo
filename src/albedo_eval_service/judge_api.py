@@ -348,9 +348,6 @@ class ReferenceTrajectoryService:
                 temperature=0.0,
                 eval_run_id=eval_run_id,
                 max_tokens=self.settings.sota_max_tokens,
-                provider=_evaluator_provider(self.settings)
-                if model == self.settings.evaluator_model
-                else None,
                 accept=lambda raw: bool(raw.strip()),
             )
             if response.error or not response.raw.strip():
@@ -396,7 +393,7 @@ class ReferenceTrajectoryService:
 
 
 # Fewest questions a WHOLE checklist can have
-QUESTION_FLOOR = 6
+QUESTION_FLOOR = 5
 
 
 def _reference_document(prefix: list[dict[str, str]] | None, turns: list[dict[str, Any]]) -> str:
@@ -457,14 +454,15 @@ class QuestionService:
         runs = await self.reference_service.generate_many(
             sample, self.settings.reference_runs, eval_run_id=eval_run_id
         )
-        return await self._prepare_once(sample, runs)
+        return await self._prepare_once(sample, runs, eval_run_id=eval_run_id)
 
     async def _extract_vector(
-        self, task: str, references: list[str], candidate_turns: int
+        self, task: str, references: list[str], candidate_turns: int, eval_run_id: str = ""
     ) -> tuple[list[dict[str, Any]], str]:
         """The runs, read against each other, become an ordered vector of milestones."""
         response = await self.client.complete(
             purpose="questions",
+            eval_run_id=eval_run_id,
             model=self.settings.evaluator_model,
             messages=build_extractor_messages(
                 task=task, references=references, candidate_turns=candidate_turns
@@ -489,6 +487,7 @@ class QuestionService:
         candidate_turns: int,
         trajectories: list[dict[str, Any]],
         problem: str = "",
+        eval_run_id: str = "",
     ) -> tuple[list[dict[str, Any]], list[dict[str, str]], str, int, int]:
         """`milestone_readings` independent readings of the same runs, merged by fact.
 
@@ -501,7 +500,9 @@ class QuestionService:
         async def read() -> tuple[
             list[dict[str, Any]], list[dict[str, Any]], list[dict[str, str]], str
         ]:
-            raw, provider = await self._extract_vector(task, references, candidate_turns)
+            raw, provider = await self._extract_vector(
+                task, references, candidate_turns, eval_run_id
+            )
             milestones, dropped = validate_vector(raw, trajectories, task)
             return raw, milestones, dropped, provider
 
@@ -539,6 +540,7 @@ class QuestionService:
                     clusters,
                     4000,
                     "milestone",
+                    eval_run_id,
                 )
         merged = merge_vectors(vectors, clusters)
         logger.info(
@@ -558,10 +560,12 @@ class QuestionService:
         exact: list[list[tuple[int, int]]],
         max_tokens: int,
         what: str,
+        eval_run_id: str,
     ) -> tuple[list[list[tuple[int, int]]], str]:
         """The GLM aligner, kept for when Jev is unavailable; the exact groups if it fails too."""
         response = await self.client.complete(
             purpose="questions",
+            eval_run_id=eval_run_id,
             model=self.settings.evaluator_model,
             messages=messages,
             temperature=self.settings.temperature,
@@ -582,7 +586,11 @@ class QuestionService:
         return parsed, "glm"
 
     async def _write_ladders(
-        self, milestones: list[dict[str, Any]], approach: dict[int, list[str]], problem: str
+        self,
+        milestones: list[dict[str, Any]],
+        approach: dict[int, list[str]],
+        problem: str,
+        eval_run_id: str,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         """`question_readings` calls for the whole vector, merged by what each question tests.
 
@@ -600,6 +608,7 @@ class QuestionService:
         async def ask(messages: list[dict[str, str]]) -> list[dict[str, Any]]:
             response = await self.client.complete(
                 purpose="questions",
+                eval_run_id=eval_run_id,
                 model=self.settings.evaluator_model,
                 messages=messages,
                 temperature=self.settings.temperature,
@@ -631,7 +640,12 @@ class QuestionService:
                     "question_alignment_jev_failed readings={} error={}", len(lists), exc
                 )
                 clusters, aligned = await self._glm_clusters(
-                    build_question_merge_messages(lists), lists, clusters, 6000, "question"
+                    build_question_merge_messages(lists),
+                    lists,
+                    clusters,
+                    6000,
+                    "question",
+                    eval_run_id,
                 )
         by_id = select_questions(lists, clusters, LADDER_MIN)
         thin = [i for i in order if len(by_id.get(i, [])) < LADDER_MIN]
@@ -693,6 +707,7 @@ class QuestionService:
         runs: list[tuple[str, str, bool, list[dict[str, Any]]]],
         prefix: list[dict[str, str]] | None,
         discarded: list[dict[str, str]],
+        eval_run_id: str = "",
     ) -> tuple[list[dict[str, Any]], set[int]]:
         """Drop questions that no reference run can answer, stamping `scored_by` on every one.
 
@@ -749,6 +764,7 @@ class QuestionService:
                     response_text=documents[run - 1],
                     questions=open_questions,
                     judge_models=[self.settings.evaluator_model],
+                    eval_run_id=eval_run_id,
                 )
                 for run in fallback
             ]
@@ -782,6 +798,7 @@ class QuestionService:
         self,
         sample: QuestionPrepSample | JudgeSample,
         runs: list[tuple[str, str, bool, list[dict[str, Any]]]],
+        eval_run_id: str = "",
     ) -> QuestionPrepResult:
         prefix = getattr(sample, "messages", None)
         phase = sample_phase(prefix)
@@ -813,6 +830,7 @@ class QuestionService:
             int(getattr(sample, "assistant_turns", 0) or self.settings.sota_trajectory_turns),
             trajectories,
             problem=problem,
+            eval_run_id=eval_run_id,
         )
         discarded.extend(dropped)
         if not milestones:
@@ -827,6 +845,7 @@ class QuestionService:
                 for t in trajectories
             },
             problem,
+            eval_run_id,
         )
         # build_judge_messages shows the judge id/tag/text/example_bad and nothing else, so the
         # near-miss has to arrive under the name it reads
@@ -841,7 +860,9 @@ class QuestionService:
         pruned_from = len(questions)
         readable: set[int] = set()
         if self.settings.reference_prune:
-            questions, readable = await self._prune_unreachable(questions, runs, prefix, discarded)
+            questions, readable = await self._prune_unreachable(
+                questions, runs, prefix, discarded, eval_run_id
+            )
         pruned_out = pruned_from - len(questions)
         if len(questions) < QUESTION_FLOOR:
             raise QuestionScoringUnavailable(
@@ -1132,7 +1153,7 @@ class ObservationSimulationService:
                 (primary, self.settings.simulation_loop_reruns + 1, rung, index > 0)
                 for index, rung in enumerate(rungs)
             ]
-            attempts.append((fallback_model, 1, _evaluator_provider(self.settings), True))
+            attempts.append((fallback_model, 1, None, False))
         else:
             attempts = [
                 (
@@ -1808,6 +1829,7 @@ async def _judge_side(
     questions: list[dict[str, str]],
     judge_models: list[str],
     repeats: int = 1,
+    eval_run_id: str = "",
 ) -> tuple[dict[str, dict[str, float | None]], list[dict[str, Any]]]:
     """Each judge model answers `repeats` times; a question's score is the mean expectation."""
     question_ids = [q["id"] for q in questions]
@@ -1824,6 +1846,7 @@ async def _judge_side(
                 max_tokens=settings.answer_max_tokens,
                 accept_response=lambda result: _reading_error(result, question_ids) is None,
                 want_logprobs=True,
+                eval_run_id=eval_run_id,
             )
             for model in judge_models
             for _ in range(repeats)
@@ -1860,6 +1883,7 @@ async def _judge_side(
             {
                 "side": side,
                 "judge_model": model,
+                "answered_by": first.model,
                 "provider": first.provider,
                 "answers": answers,
                 "scores": scores,
@@ -1990,6 +2014,7 @@ async def _score_samples(
                 questions=questions,
                 judge_models=request.judge_models,
                 repeats=int(getattr(settings, "judge_repeats", 1) or 1),
+                eval_run_id=request.eval_run_id,
             )
 
         (king_scores, king_recs), (chal_scores, chal_recs) = await asyncio.gather(

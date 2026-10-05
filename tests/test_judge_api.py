@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from test_verdict_levels import logprob_entries
 
 from albedo_config import JudgeSettings
-from albedo_config.models import JUDGE_MODELS
+from albedo_config.models import JUDGE_MODELS, SOTA_MODELS
 from albedo_eval_service.judge_api import (
     Grounding,
     JudgeSample,
@@ -156,6 +156,7 @@ class FakeClient:
         purpose="",
         accept_response=None,
         want_logprobs=False,
+        eval_run_id="",
     ):
         ids = response_schema["properties"]["answers"]["items"]["properties"]["asked"]["enum"]
         content = messages[1]["content"]
@@ -265,9 +266,12 @@ def test_observation_simulation_primary_capped_then_fallback():
     service = ObservationSimulationService(settings, client)
     observation = asyncio.run(service.simulate(request))
     assert observation == _RC_OBSERVATION
-    assert [c["model"] for c in client.calls] == ["openai/gpt-5.6-luna", "z-ai/glm-5.2"]
+    assert [c["model"] for c in client.calls] == [
+        "openai/gpt-5.6-luna",
+        settings.evaluator_model,
+    ]
     fallback_call = client.calls[1]
-    assert fallback_call["provider"]["quantizations"] == ["fp8"]
+    assert fallback_call["provider"] is None
     assert "parse_retries" not in fallback_call
     assert "retry_count" not in fallback_call
 
@@ -515,6 +519,7 @@ class OneJudgeBrokenClient:
         purpose="",
         accept_response=None,
         want_logprobs=False,
+        eval_run_id="",
     ):
         ids = response_schema["properties"]["answers"]["items"]["properties"]["asked"]["enum"]
         if model == JUDGE_MODELS[0]:
@@ -879,6 +884,7 @@ class _AnchorFakeClient:
         purpose="",
         accept_response=None,
         want_logprobs=False,
+        eval_run_id="",
     ):
         # every reference answers every question, so pruning removes nothing here
         ids = response_schema["properties"]["answers"]["items"]["properties"]["asked"]["enum"]
@@ -913,7 +919,7 @@ def test_prepare_anchors_on_reference_and_filters_leaks():
     assert fake.saw_reference_prompt
     assert result.source["question_mode"] == "milestone_ladder"
     assert result.source["reference_runs"] == 3
-    assert result.source["reference_models"] == ["z-ai/glm-5.2"] * 3
+    assert result.source["reference_models"] == [SOTA_MODELS] * 3
     first_run = result.source["reference_steps"][0]
     assert first_run["run"] == 1 and first_run["steps"][0]["assistant"]
     assert result.source["milestones_kept"] == 2
@@ -1114,7 +1120,7 @@ def test_milestone_alignment_falls_back_to_the_glm_aligner_without_jev(monkeypat
 
     statements = iter(["Read x.py", "Open x.py"])
 
-    async def extract(task, references, candidate_turns):
+    async def extract(task, references, candidate_turns, eval_run_id=""):
         return [{"id": "m1", "category": "explore", "statement": next(statements)}], "fake"
 
     class MergingClient:

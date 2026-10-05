@@ -47,11 +47,11 @@ def test_simulation_ladder_tries_each_provider_before_expensive_fallback():
     assert models[:3] == [
         "deepseek/deepseek-v4-flash-0731",  # rung 1: deepseek provider first
         "deepseek/deepseek-v4-flash-0731",  # rung 2: cloudflare provider first
-        settings.evaluator_model,  # rung 3: expensive judge model last
+        settings.evaluator_model,  # rung 3: expensive fallback model last
     ]
     assert orders[0][0] == "deepseek"
     assert orders[1][0] == "cloudflare"
-    assert orders[2][0] == settings.evaluator_providers.split(",")[0]
+    assert orders[2] is None
     # `cat` must print, so a silent ladder earns one last directed ask before we give up
     assert len(client.calls) == 4
     assert models[3] == "deepseek/deepseek-v4-flash-0731"

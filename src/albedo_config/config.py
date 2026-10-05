@@ -88,6 +88,7 @@ class JudgeSettings(BaseSettings):
     jev_api_key: str = ""
     engy_models: str = ENGY_MODELS
     engy_max_errors: int = 150
+    engy_max_concurrency: int = 48
     request_timeout_seconds: float = 300.0
     stream_enabled: bool = True
     stream_stall_seconds: float = 90.0

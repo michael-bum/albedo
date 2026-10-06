@@ -5,7 +5,7 @@ import { el, mount } from "../dom.js";
 import { toRoman } from "../format.js";
 import { kingTitleName, hubRepoUrl, modelRepo, dendriteRepo, dendriteRepoUrl } from "../model.js";
 import { renderReign } from "../render/reign.js";
-import { renderBenchmarks, liveScoreCandidates } from "../render/benchmarks.js";
+import { renderBenchmarks, liveScoreCandidates, pulledRunId } from "../render/benchmarks.js";
 import { renderPipeline } from "../render/pipeline.js";
 import { renderHistory, renderFails, collapsePasses } from "../render/history.js";
 import { renderDatasets } from "../render/datasets.js";
@@ -62,14 +62,12 @@ function render(d) {
   renderTables(d);
 }
 
-let lastSig = null;
-let benchmarkSig = null;
+let lastRaw = null;
+let benchmarkInputs = [];
 async function tick() {
   const raw = await fetchDashboard();
-  if (!raw) return;
-  const sig = JSON.stringify(raw);
-  if (sig === lastSig) return;
-  lastSig = sig;
+  if (!raw || raw === lastRaw) return;
+  lastRaw = raw;
   state = normalize(raw);
   render(state);
 }
@@ -87,9 +85,9 @@ function paintBenchmarks() {
 async function tickBenchmarks() {
   const [data, scores, distributed] = await Promise.all([fetchBenchmarks(), fetchPulledScores(), fetchResultsManifest()]);
   if (!data) return;
-  const sig = JSON.stringify([data, [...scores], distributed]);
-  if (sig === benchmarkSig) return;
-  benchmarkSig = sig;
+  const inputs = [data, distributed, ...scores.values()];
+  if (inputs.every((x, i) => x === benchmarkInputs[i])) return;
+  benchmarkInputs = inputs;
   benchmarkData = data;
   benchmarkScores = scores;
   resultsManifest = distributed;
@@ -103,7 +101,8 @@ function reigningCandidate(pulled) {
   if (!Number.isFinite(reign) || reign < pulled.fromKing) return [];
   const runId = `king-${toRoman(reign)}`;
   const scored = (benchmarkScores?.get(pulled.suite) || [])
-    .some(row => String(row?.run_id).toLowerCase() === runId.toLowerCase());
+    .some(row => String(row?.run_id).toLowerCase() === runId.toLowerCase())
+    || benchmarkData?.models?.some(model => pulledRunId(model) === runId); // listed: liveScoreCandidates decides
   return scored ? [] : [runId];
 }
 
@@ -114,7 +113,7 @@ function hasDistributedProgress(suite) {
 }
 
 async function tickPreds() {
-  const candidates = benchmarkData ? liveScoreCandidates(benchmarkData, benchmarkScores) : new Map();
+  const candidates = benchmarkData ? liveScoreCandidates(benchmarkData, benchmarkScores, resultsManifest) : new Map();
   const next = new Map();
   for (const pulled of PULLED_SUITES) {
     if (hasDistributedProgress(pulled.suite)) continue;
@@ -128,23 +127,17 @@ async function tickPreds() {
   paintBenchmarks();
 }
 
-let manifestSig = null;
+let lastManifest = null;
 async function tickDatasets() {
   const manifest = await fetchManifest();
-  if (!manifest) return;
-  const sig = JSON.stringify(manifest);
-  if (sig === manifestSig) return;
-  manifestSig = sig;
+  if (!manifest || manifest === lastManifest) return;
+  lastManifest = manifest;
   renderDatasets($("datasets-wrap"), $("datasets-meta"), manifest);
 }
 
-let registrationSig = null;
 async function tickRegistrations() {
   const next = await fetchRegistrationHistory();
-  if (!next) return;
-  const sig = JSON.stringify(next);
-  if (sig === registrationSig) return;
-  registrationSig = sig;
+  if (!next || next === registrations) return;
   registrations = next;
   renderRegistrationChart($("registration-chart"), registrations);
 }

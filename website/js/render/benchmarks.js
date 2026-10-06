@@ -286,10 +286,10 @@ function panelModels(data, liveRunIds = new Set()) {
   return { models, sorted, selected: sorted.find(model => !isGenesis(model)) || sorted[0] || null };
 }
 
-// Reigns whose pulled score has not landed yet: their preds file is what the tile
-// shows progress from, one candidate list per suite.
-export function liveScoreCandidates(data, scoresBySuite) {
-  const sorted = sortModels(mergePulledScores(data, scoresBySuite)?.models || []);
+// Reigns whose score has not landed yet (pulled or distributed): their preds file is what
+// the tile shows progress from, one candidate list per suite.
+export function liveScoreCandidates(data, scoresBySuite, resultsManifest) {
+  const sorted = sortModels(mergeDistributedResults(mergePulledScores(data, scoresBySuite), resultsManifest)?.models || []);
   return new Map(PULLED_SUITES.map(pulled => [
     pulled.suite,
     sorted
@@ -570,8 +570,7 @@ function renderTile(model, suite, sorted, baseline, activity, preds, backfills =
     { label: "genesis", score: baseline?.score ?? null },
     ...referenceScores.map(r => ({ label: r.label, score: r.entry?.score ?? null })),
   ];
-  const chartSvgElement = el("div", { class: "bench-tile-chart" },
-    renderSpark(sorted, suite, baseline?.score, 360, comparisons));
+  const chartSvgElement = el("div", { class: "bench-tile-chart" });
   let chartWidth = 0;
   const chartObserver = new ResizeObserver(entries => {
     const w = Math.round(entries[0].contentRect.width);

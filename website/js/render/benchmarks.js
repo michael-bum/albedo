@@ -286,20 +286,19 @@ function panelModels(data, liveRunIds = new Set()) {
   return { models, sorted, selected: sorted.find(model => !isGenesis(model)) || sorted[0] || null };
 }
 
-// Reigns whose score has not landed yet (pulled or distributed): their preds file is what
-// the tile shows progress from, one candidate list per suite.
+// Reigns newer than the newest one with a score (pulled or distributed): their preds file is
+// what the tile shows progress from, one candidate list per suite.
 export function liveScoreCandidates(data, scoresBySuite, resultsManifest) {
   const sorted = sortModels(mergeDistributedResults(mergePulledScores(data, scoresBySuite), resultsManifest)?.models || []);
-  return new Map(PULLED_SUITES.map(pulled => [
-    pulled.suite,
-    sorted
-      .filter(model => !isGenesis(model)
-        && pulledApplies(pulled, reignNumber(model))
-        && suiteScores(model)[pulled.suite]?.score == null)
+  return new Map(PULLED_SUITES.map(pulled => {
+    const newestScored = sorted.findIndex(model => suiteScores(model)[pulled.suite]?.score != null);
+    return [pulled.suite, sorted
+      .slice(0, newestScored < 0 ? undefined : newestScored)
+      .filter(model => !isGenesis(model) && pulledApplies(pulled, reignNumber(model)))
       .map(pulledRunId)
       .filter(Boolean)
-      .slice(0, 6),
-  ]));
+      .slice(0, 6)];
+  }));
 }
 
 function scoreTotal(rows, fallback) {

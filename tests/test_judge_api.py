@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from test_verdict_levels import logprob_entries
 
 from albedo_config import JudgeSettings
-from albedo_config.models import JUDGE_MODELS
+from albedo_config.models import JUDGE_MODELS, SOTA_MODELS
 from albedo_eval_service.judge_api import (
     Grounding,
     JudgeSample,
@@ -156,6 +156,7 @@ class FakeClient:
         purpose="",
         accept_response=None,
         want_logprobs=False,
+        eval_run_id="",
     ):
         ids = response_schema["properties"]["answers"]["items"]["properties"]["asked"]["enum"]
         content = messages[1]["content"]
@@ -265,9 +266,12 @@ def test_observation_simulation_primary_capped_then_fallback():
     service = ObservationSimulationService(settings, client)
     observation = asyncio.run(service.simulate(request))
     assert observation == _RC_OBSERVATION
-    assert [c["model"] for c in client.calls] == ["openai/gpt-5.6-luna", "z-ai/glm-5.2"]
+    assert [c["model"] for c in client.calls] == [
+        "openai/gpt-5.6-luna",
+        settings.evaluator_model,
+    ]
     fallback_call = client.calls[1]
-    assert fallback_call["provider"]["quantizations"] == ["fp8"]
+    assert fallback_call["provider"] is None
     assert "parse_retries" not in fallback_call
     assert "retry_count" not in fallback_call
 
@@ -515,6 +519,7 @@ class OneJudgeBrokenClient:
         purpose="",
         accept_response=None,
         want_logprobs=False,
+        eval_run_id="",
     ):
         ids = response_schema["properties"]["answers"]["items"]["properties"]["asked"]["enum"]
         if model == JUDGE_MODELS[0]:
@@ -879,6 +884,7 @@ class _AnchorFakeClient:
         purpose="",
         accept_response=None,
         want_logprobs=False,
+        eval_run_id="",
     ):
         # every reference answers every question, so pruning removes nothing here
         ids = response_schema["properties"]["answers"]["items"]["properties"]["asked"]["enum"]
@@ -913,7 +919,7 @@ def test_prepare_anchors_on_reference_and_filters_leaks():
     assert fake.saw_reference_prompt
     assert result.source["question_mode"] == "milestone_ladder"
     assert result.source["reference_runs"] == 3
-    assert result.source["reference_models"] == ["z-ai/glm-5.2"] * 3
+    assert result.source["reference_models"] == [SOTA_MODELS] * 3
     first_run = result.source["reference_steps"][0]
     assert first_run["run"] == 1 and first_run["steps"][0]["assistant"]
     assert result.source["milestones_kept"] == 2
@@ -1044,6 +1050,99 @@ def test_reference_scoring_joins_on_the_ids_the_checklist_ships_with():
         round((kept - 1) / kept, 6),
         round((kept - 1) / kept, 6),
     ]
+
+
+def test_prune_sends_only_unearned_questions_of_runs_jev_cannot_take_to_glm(monkeypatch):
+    """J2 with its partial fallback, and J1.a dropping a cross-milestone duplicate before it.
+
+    Run 1 earns every question but the first two, run 2 is over Jev's request limit and run 3
+    earns nothing. GLM judges run 2 alone, on the two open questions only, and earns the first.
+    """
+    from albedo_eval_service import judge_api
+    from albedo_eval_service.judge_api import QuestionPrepSample, ReferenceTrajectoryService
+
+    async def jev_scores(documents, questions, **_):
+        ids = [q["id"] for q in questions]
+        return [{i: 0.1 if i in ids[:2] else 0.9 for i in ids}, None, {i: 0.1 for i in ids}]
+
+    async def duplicates(problem, milestones, questions, **_):
+        return {questions[-1]["id"]}
+
+    monkeypatch.setattr(judge_api, "reference_scores", jev_scores)
+    monkeypatch.setattr(judge_api, "cross_milestone_duplicates", duplicates)
+
+    class GlmFallback(_AnchorFakeClient):
+        def __init__(self):
+            super().__init__()
+            self.asked: list[list[str]] = []
+
+        async def score(self, **kwargs):
+            ids = kwargs["response_schema"]["properties"]["answers"]["items"]["properties"][
+                "asked"
+            ]["enum"]
+            self.asked.append(list(ids))
+            raw = json.dumps(
+                {
+                    "answers": [
+                        {"asked": qid, "reason": "e", "verdict": "T" if qid == ids[0] else "A"}
+                        for qid in ids
+                    ]
+                }
+            )
+            return JudgeRawResponse(
+                model=kwargs["model"], provider="fake", raw=raw, logprobs=logprob_entries(raw)
+            )
+
+    fake = GlmFallback()
+    settings = JudgeSettings(openrouter_api_key="k", num_questions=50, jev_api_key="k")
+    simulator = ObservationSimulationService(settings, fake)
+    service = QuestionService(settings, fake, ReferenceTrajectoryService(settings, fake, simulator))
+    sample = QuestionPrepSample(
+        sample_id="s:1:1",
+        prompt="TASK",
+        messages=[{"role": "user", "content": "fix the bug"}],
+        assistant_turns=2,
+    )
+    result = asyncio.run(service.prepare(sample, eval_run_id="run-1"))
+
+    stages = [d["stage"] for d in result.source["discarded_questions"]]
+    assert stages.count("cross_milestone_duplicate") == 1
+    assert stages.count("reference_prune") == 1, "the open question GLM did not earn either"
+    assert len(fake.asked) == 1 and len(fake.asked[0]) == 2, "run 2 only, open questions only"
+    earners = sorted(result.source["reference_scoring"].values())
+    assert earners == [[1]] * (len(result.questions) - 1) + [[2]]
+
+
+def test_milestone_alignment_falls_back_to_the_glm_aligner_without_jev(monkeypatch):
+    """No Jev key: two readings wording one fact differently are joined by the GLM aligner rather
+    than left as two milestones by exact matching."""
+    from albedo_eval_service import judge_api
+
+    statements = iter(["Read x.py", "Open x.py"])
+
+    async def extract(task, references, candidate_turns, eval_run_id=""):
+        return [{"id": "m1", "category": "explore", "statement": next(statements)}], "fake"
+
+    class MergingClient:
+        def __init__(self):
+            self.merge_calls = 0
+
+        async def complete(self, *, model, response_schema=None, **_):
+            assert "clusters" in response_schema["properties"]
+            self.merge_calls += 1
+            raw = json.dumps({"clusters": [{"label": "x.py", "members": ["A1", "B1"]}]})
+            return JudgeRawResponse(model=model, provider="fake", raw=raw)
+
+    fake = MergingClient()
+    settings = JudgeSettings(openrouter_api_key="k", milestone_readings=2)
+    service = QuestionService(settings, fake, None)
+    monkeypatch.setattr(service, "_extract_vector", extract)
+    monkeypatch.setattr(judge_api, "validate_vector", lambda raw, trajectories, task: (raw, []))
+
+    merged, *_ = asyncio.run(service._extract_validated_vector("task", [], 2, []))
+
+    assert fake.merge_calls == 1
+    assert [m["merged_from"] for m in merged] == [2]
 
 
 def test_prepare_raises_when_every_reference_run_fails():

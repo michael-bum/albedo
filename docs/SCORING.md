@@ -84,8 +84,13 @@ itself on something that no longer exists.
 
 The extractor is run `milestone_readings` (4) times over the same runs, each reading validated as
 above. One reading of the same runs comes back with a different subset of the facts, so the readings
-are merged rather than the best one picked: exact duplicates are grouped, one aligner call matches the
-rest by fact (`vector_merge.py`), and the result is the **union** — a fact any reading found is kept
+are merged rather than the best one picked: exact duplicates are grouped, and if anything is left
+unmatched Jev (TypeSafe System One, key `ALBEDO_JUDGE_JEV_API_KEY`) is asked of every pair of those groups whether
+both establish the same fact, averaged over several orders of the milestones, and the groups are
+joined by average linkage at 0.55 (`jev_align.py`). Jev can join exact groups but never split one.
+If Jev is unreachable, or leaves any pair unanswered, the GLM aligner (`MERGE_SKELETON`) does
+it instead, and the exact groups stand if that fails too. The result
+is the **union** — a fact any reading found is kept
 once, under its best-evidenced wording, with the evidence pooled and `depends_on` remapped. Nothing
 is re-asked.
 
@@ -116,6 +121,19 @@ The ladder is written `question_readings` (3) times over the whole vector. Quest
 what they test and kept by **majority** — asked by at least two readings, earliest wording — and a
 milestone left under `LADDER_MIN` (2) is topped up from the spare questions rather than re-asked.
 
+The alignment is Jev (J1, `jev_questions.question_clusters`): every pair of questions under the
+same milestone is asked "Do `A3` and `B5` test the same thing about a candidate?", with the task,
+the milestone statements and each question's near-miss in the state, averaged over two orders of
+the state, and each milestone's questions are joined by average linkage at 0.55. Word-for-word
+repeats under one milestone are one group from the start. If Jev is unreachable, or leaves any pair
+unanswered, the GLM question aligner does it instead.
+
+Questions under different milestones are never grouped by J1, so after enforcement (below) J1.a
+(`jev_questions.cross_milestone_duplicates`) asks the same question of every cross-milestone pair of
+finished questions (orders 1-2, orders 3-6 for pairs in [0.2, 0.85]). A pair at 0.55 or above asks
+one thing twice, and the question of the later milestone is dropped (`cross_milestone_duplicate` in
+`discarded_questions`). Without Jev the checklist is kept as it is.
+
 ### Enforcement at parse time
 
 Prose rules in a prompt get ignored, so the parsed output is re-checked in code and the drops are
@@ -134,9 +152,17 @@ Every reference run is judged against the finished checklist, and a question tha
 earns is dropped (`_prune_unreachable`, gated by `ALBEDO_JUDGE_REFERENCE_PRUNE`). A run earns a
 question when its graded score for it is at least `PRUNE_EARNED_MIN` (0.5), i.e. the judge leaned
 toward satisfied.
+
+The judge is Jev (J2, `jev_questions.reference_scores`): one request per run, the rendered run
+document as the state and one Noul per question with the same earned / not-earned criteria for
+every question. A run Jev does not answer — a document over Jev's 32k-token limit on the state, Jev
+unreachable, or any question left unanswered — falls back to the GLM judge, asked only the
+questions no Jev-judged run earned: a
+question one run earned is kept whatever the others say. With Jev down entirely every run goes to
+GLM with the whole checklist, as before.
 If no run returns a readable verdict the unpruned checklist is kept rather than deleted blind.
 
-A sample is rejected outright if fewer than `QUESTION_FLOOR` (6) milestone questions survive
+A sample is rejected outright if fewer than `QUESTION_FLOOR` (5) milestone questions survive
 
 ## Before the judge: degenerate sides are scored 0 outright
 
@@ -241,11 +267,14 @@ The reading is validated before it is trusted: the sampled token must be the let
 did), the token spans must cover the whole content, and the written letter must be in the list. A
 response that fails any of these is rejected like a parse failure and re-asked on the next pinned
 provider; there is no fallback to letter-only scoring. Because of this, judge calls run on their own
-provider pin (`JUDGE_LOGPROB_PROVIDER_PINS`: alibaba, then digitalocean — glm-5.2 endpoints whose
-top-20 logprobs line up with the sampled token; StreamLake, Cloudflare, Parasail and Wafer accept the
-parameter but return misaligned arrays; the pin keeps the fp8 filter, so OpenRouter skips DigitalOcean
-while it reports no quantization and alibaba serves), not the general `JUDGE_PROVIDER_PINS` the sanity
-checks use.
+provider pin, not the general `JUDGE_PROVIDER_PINS` the sanity checks use. Both pins come from one
+roster per model (`PROVIDERS` in `models.py`): every provider in the order to try it, flagged by
+whether its top-20 logprobs line up with the sampled token. Questions, references and the simulator
+fallback walk the whole roster; a judge call only the aligned providers (glm-5.3-flash: Parasail, Reka,
+DigitalOcean; glm-5.2: Alibaba, DigitalOcean). The judge model (`JUDGE_MODELS`,
+glm-5.3-flash) is asked on engy first, then on OpenRouter, then its `JUDGE_FALLBACK_MODELS` entry
+glm-5.2 is asked on OpenRouter. glm-5.3-flash cannot run without reasoning, so `MODEL_REASONING`
+sends `effort: low`.
 
 With `ALBEDO_JUDGE_JUDGE_REPEATS` > 1, a question's score is the **mean** of the repeats'
 expectations (not a majority vote); `answers` shows the majority letter and `disputed` counts the
@@ -339,8 +368,8 @@ Judge-side settings are `JudgeSettings` in `src/albedo_config/config.py`, prefix
 
 | setting | code default | meaning |
 |---|---|---|
-| `evaluator_model` | `z-ai/glm-5.2` | reads the vector and writes the ladder |
-| `sota_models` | `z-ai/glm-5.2` | pool the reference runs are drawn from |
+| `evaluator_model` | `z-ai/glm-5.3-flash` | reads the vector and writes the ladder; engy answers when OpenRouter cannot |
+| `sota_models` | `z-ai/glm-5.3-flash` | pool the reference runs are drawn from; engy answers when OpenRouter cannot |
 | `reference_runs` | 3 | how many reference trajectories are generated per sample |
 | `reference_prune` | `true` | judge every run against the checklist and drop what none of them earns |
 | `milestone_readings` | 4 | independent extractor readings, merged by union |
@@ -354,7 +383,8 @@ Judge-side settings are `JudgeSettings` in `src/albedo_config/config.py`, prefix
 | `repo_context_url` | `""` | grounding service; empty disables grounding (see [DATASETS.md](DATASETS.md)) |
 
 The model roster lives in `src/albedo_config/models.py`. `JUDGE_MODELS` is now a **single** judge —
-`("z-ai/glm-5.2",)` — matching `judge_count = 1`; `EVALUATOR_MODEL` and `SOTA_MODELS` are the same model.
+`("z-ai/glm-5.3-flash",)` on engy, with glm-5.2 on OpenRouter as its fallback — matching `judge_count = 1`;
+`EVALUATOR_MODEL` and `SOTA_MODELS` are the same model.
 Read the run's `judge-results` in `scoring-results.jsonl` to confirm who actually voted for a given eval.
 
 `ScoringConfig.allowed_scores` is `[0, 1]`: the range a question score lies in. The verdict and

@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import json
 
-from albedo_config.models import JUDGE_LOGPROB_PROVIDER_PINS, JUDGE_MODELS, JUDGE_PROVIDER_PINS
+from albedo_config.models import (
+    JUDGE_LOGPROB_PROVIDER_PINS,
+    JUDGE_MODELS,
+    JUDGE_PROVIDER_PINS,
+    PROVIDERS,
+)
 from albedo_eval_service.judge_core import (
     CHALLENGER_WIN_MARGIN,
     aggregate_scores,
@@ -17,19 +22,24 @@ from albedo_eval_service.judge_core import (
 from albedo_eval_service.shared.verdict_levels import LETTERS
 
 
-def test_judge_panel_pins_fast_fp8_providers_no_open_fallback():
-    assert JUDGE_MODELS == ("z-ai/glm-5.2",)
-    for model in JUDGE_MODELS:
+def test_judge_pins_derive_from_the_provider_roster():
+    assert JUDGE_MODELS == ("z-ai/glm-5.3-flash",)
+    for model, roster in PROVIDERS.items():
         assert JUDGE_PROVIDER_PINS[model] == {
             "allow_fallbacks": False,
             "quantizations": ["fp8"],
-            "order": ["streamlake", "baidu", "alibaba", "phala"],
+            "order": list(roster),
         }
         assert JUDGE_LOGPROB_PROVIDER_PINS[model] == {
             "allow_fallbacks": False,
-            "quantizations": ["fp8"],
-            "order": ["alibaba", "digitalocean"],
+            "order": [p for p, aligned in roster.items() if aligned],
         }
+    assert JUDGE_LOGPROB_PROVIDER_PINS["z-ai/glm-5.3-flash"]["order"] == [
+        "parasail",
+        "reka",
+        "digitalocean",
+    ]
+    assert JUDGE_LOGPROB_PROVIDER_PINS["z-ai/glm-5.2"]["order"] == ["alibaba", "digitalocean"]
 
 
 def test_judge_prompt_describes_the_five_anchors_of_the_ladder():

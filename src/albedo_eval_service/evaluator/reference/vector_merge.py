@@ -82,15 +82,17 @@ def build_merge_messages(
     ]
 
 
+def exact_key(item: dict[str, Any]) -> str:
+    """What a milestone or question shares with another that says it word for word."""
+    return normalise_span(str(item.get("statement") or item.get("text") or "")).lower()
+
+
 def exact_groups(readings: list[list[dict[str, Any]]]) -> list[list[tuple[int, int]]]:
     """Clusters by normalised statement text - the alignment no model is needed for."""
     groups: dict[str, list[tuple[int, int]]] = {}
     for reading, milestones in enumerate(readings):
         for index, milestone in enumerate(milestones):
-            key = normalise_span(
-                str(milestone.get("statement") or milestone.get("text") or "")
-            ).lower()
-            groups.setdefault(key, []).append((reading, index))
+            groups.setdefault(exact_key(milestone), []).append((reading, index))
     return list(groups.values())
 
 

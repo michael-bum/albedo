@@ -14,7 +14,13 @@ def test_openrouter_payload_respects_provider_structured_output_support():
 
     plain_payload = payloads[0]
     assert plain_payload["model"] == "z-ai/glm-5.2"
-    assert plain_payload["provider"]["order"] == ["streamlake", "baidu", "alibaba", "phala"]
+    assert plain_payload["provider"]["order"] == [
+        "streamlake",
+        "baidu",
+        "alibaba",
+        "phala",
+        "digitalocean",
+    ]
     assert plain_payload["provider"]["quantizations"] == ["fp8"]
     assert plain_payload["provider"]["allow_fallbacks"] is False
     assert plain_payload["provider"]["require_parameters"] is True
@@ -22,7 +28,7 @@ def test_openrouter_payload_respects_provider_structured_output_support():
 
     schema_payload = payloads[1]
     assert schema_payload["model"] == "z-ai/glm-5.2"
-    assert schema_payload["provider"]["order"] == ["streamlake", "baidu", "alibaba", "phala"]
+    assert schema_payload["provider"]["order"] == plain_payload["provider"]["order"]
     assert schema_payload["provider"]["quantizations"] == ["fp8"]
     assert schema_payload["provider"]["allow_fallbacks"] is False
     assert schema_payload["provider"]["require_parameters"] is True
@@ -33,7 +39,7 @@ def test_openrouter_payload_respects_provider_structured_output_support():
     assert logprob_payload["logprobs"] is True
     assert logprob_payload["top_logprobs"] == 20
     assert logprob_payload["provider"]["order"] == ["alibaba", "digitalocean"]
-    assert logprob_payload["provider"]["quantizations"] == ["fp8"]
+    assert "quantizations" not in logprob_payload["provider"]
     assert logprob_payload["provider"]["allow_fallbacks"] is False
     assert logprob_payload["provider"]["require_parameters"] is True
 
@@ -222,16 +228,19 @@ async def _capture_orders_under_failures():
 
 def _engy_client(handler, **overrides):
     """A client whose OpenRouter and engy legs both hit MockTransport handlers."""
-    settings = JudgeSettings(
+    defaults = dict(
         openrouter_api_key="test-key",
         engy_api_key="engy-key",
         retry_count=0,
         retry_backoff_seconds=0,
         parse_retries=1,
-        **overrides,
     )
+    settings = JudgeSettings(**{**defaults, **overrides})
     client = JudgeLLMClient(settings)
     return settings, client
+
+
+SENT_ORDERS: list[list[str] | None] = []
 
 
 async def _swap_transports(client, settings, hits):
@@ -239,7 +248,8 @@ async def _swap_transports(client, settings, hits):
         def handler(request: httpx.Request) -> httpx.Response:
             body = json.loads(request.content.decode())
             hits.append((tag, body["model"]))
-            if tag == "engy" and getattr(client, "_engy_should_fail", False):
+            SENT_ORDERS.append((body.get("provider") or {}).get("order"))
+            if getattr(client, f"_{tag}_should_fail", False):
                 return httpx.Response(500, json={"error": "boom"})
             return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
 
@@ -250,28 +260,90 @@ async def _swap_transports(client, settings, hits):
         base_url=settings.openrouter_base_url.rstrip("/"),
         transport=httpx.MockTransport(make("openrouter")),
     )
-    await client._engy.aclose()
-    client._engy = httpx.AsyncClient(
-        base_url=settings.engy_base_url.rstrip("/"),
-        transport=httpx.MockTransport(make("engy")),
+    if client._engy is not None:
+        await client._engy.aclose()
+        client._engy = httpx.AsyncClient(
+            base_url=settings.engy_base_url.rstrip("/"),
+            transport=httpx.MockTransport(make("engy")),
+        )
+
+
+def test_judge_goes_to_engy_with_bare_model_name():
+    hits = asyncio.run(_route("judge"))
+    assert hits == [("engy", "glm-5.3-flash")]
+
+
+def test_judge_leaves_engy_for_the_same_model_on_openrouter():
+    hits = asyncio.run(_route("judge", want_logprobs=True, engy_should_fail=True))
+    assert hits == [("engy", "glm-5.3-flash"), ("openrouter", "z-ai/glm-5.3-flash")]
+
+
+def test_an_engy_transport_error_is_not_re_asked_across_parse_attempts():
+    hits = asyncio.run(_route("judge", engy_should_fail=True, parse_retries=3))
+    assert hits == [("engy", "glm-5.3-flash"), ("openrouter", "z-ai/glm-5.3-flash")]
+
+
+def test_judge_drops_to_glm_5_2_only_when_openrouter_fails_too():
+    hits = asyncio.run(
+        _route("judge", want_logprobs=True, engy_should_fail=True, openrouter_should_fail=True)
     )
+    assert hits == [
+        ("engy", "glm-5.3-flash"),
+        ("openrouter", "z-ai/glm-5.3-flash"),
+        ("openrouter", "z-ai/glm-5.2"),
+    ]
 
 
-def test_reference_goes_to_engy_with_bare_model_name():
-    hits = asyncio.run(_route("reference"))
-    assert hits == [("engy", "glm-5.2")]
+def test_judge_without_engy_pins_the_logprob_aligned_providers():
+    hits = asyncio.run(_route("judge", want_logprobs=True, engy_api_key=""))
+    assert hits == [("openrouter", "z-ai/glm-5.3-flash")]
+    assert SENT_ORDERS == [["parasail", "reka", "digitalocean"]]
+
+
+def test_engy_is_skipped_once_its_queue_is_full():
+    hits = asyncio.run(
+        _route(
+            "judge",
+            want_logprobs=True,
+            engy_max_concurrency=1,
+            engy_queue_depth=1,
+            hold_gate=True,
+        )
+    )
+    assert hits == [("openrouter", "z-ai/glm-5.3-flash")]
+
+
+def test_a_call_in_the_queue_waits_for_an_engy_slot():
+    hits = asyncio.run(
+        _route(
+            "judge",
+            want_logprobs=True,
+            engy_max_concurrency=1,
+            engy_queue_depth=2,
+            hold_gate=0.1,
+        )
+    )
+    assert hits == [("engy", "glm-5.3-flash")]
+
+
+def test_reference_goes_to_engy_first():
+    assert asyncio.run(_route("reference")) == [("engy", "glm-5.3-flash")]
+
+
+def test_questions_fall_back_to_engy_when_openrouter_fails():
+    hits = asyncio.run(_route("questions", openrouter_should_fail=True))
+    assert hits == [("openrouter", "z-ai/glm-5.3-flash"), ("engy", "glm-5.3-flash")]
 
 
 def test_decode_bound_purposes_stay_on_openrouter():
-    assert asyncio.run(_route("judge")) == [("openrouter", "z-ai/glm-5.2")]
-    assert asyncio.run(_route("questions")) == [("openrouter", "z-ai/glm-5.2")]
+    assert asyncio.run(_route("questions")) == [("openrouter", "z-ai/glm-5.3-flash")]
 
 
 def test_simulate_stays_on_openrouter():
     assert asyncio.run(_route("simulate", model="deepseek/deepseek-v4-flash-0731")) == [
         ("openrouter", "deepseek/deepseek-v4-flash-0731")
     ]
-    assert asyncio.run(_route("simulate")) == [("openrouter", "z-ai/glm-5.2")]
+    assert asyncio.run(_route("simulate")) == [("openrouter", "z-ai/glm-5.3-flash")]
 
 
 def test_engy_transport_error_rescues_the_same_call_on_openrouter():
@@ -293,7 +365,7 @@ async def _rescued_call():
         result = await client.complete(
             model="deepseek/deepseek-v4-flash-0731",
             messages=[{"role": "user", "content": "x"}],
-            purpose="reference",
+            purpose="judge",
             eval_run_id="eval-1",
         )
     finally:
@@ -302,20 +374,42 @@ async def _rescued_call():
 
 
 def test_model_outside_engy_models_stays_on_openrouter():
-    hits = asyncio.run(_route("reference", model="deepseek/deepseek-v3.2"))
+    hits = asyncio.run(_route("judge", model="deepseek/deepseek-v3.2"))
     assert hits == [("openrouter", "deepseek/deepseek-v3.2")]
 
 
-async def _route(purpose, model="z-ai/glm-5.2"):
+async def _route(
+    purpose,
+    model="z-ai/glm-5.3-flash",
+    *,
+    want_logprobs=False,
+    engy_should_fail=False,
+    openrouter_should_fail=False,
+    hold_gate=False,
+    **overrides,
+):
     hits: list[tuple[str, str]] = []
-    settings, client = _engy_client(None)
+    SENT_ORDERS.clear()
+    settings, client = _engy_client(None, **overrides)
+    if hold_gate:
+        await client._engy_gate.acquire()
+        if hold_gate is True:
+            await client._engy_queue.acquire()
+        else:
+            asyncio.get_running_loop().call_later(hold_gate, client._engy_gate.release)
+    client._engy_should_fail, client._openrouter_should_fail = (
+        engy_should_fail,
+        openrouter_should_fail,
+    )
     await _swap_transports(client, settings, hits)
     try:
-        await client.complete(
+        call = client.score if want_logprobs else client.complete
+        await call(
             model=model,
             messages=[{"role": "user", "content": "x"}],
             purpose=purpose,
             eval_run_id="eval-1",
+            **({"want_logprobs": True} if want_logprobs else {}),
         )
     finally:
         await client.aclose()
@@ -344,9 +438,9 @@ async def _exhaust_engy_budget():
     try:
         for _ in range(4):
             await client.complete(
-                model="z-ai/glm-5.2",
+                model="z-ai/glm-5.3-flash",
                 messages=[{"role": "user", "content": "x"}],
-                purpose="reference",
+                purpose="judge",
                 eval_run_id="eval-1",
             )
     finally:
@@ -377,9 +471,9 @@ async def _interleaved_evals():
     try:
         for eval_id in ("eval-X", "eval-Y", "eval-X", "eval-Y"):
             await client.complete(
-                model="z-ai/glm-5.2",
+                model="z-ai/glm-5.3-flash",
                 messages=[{"role": "user", "content": "x"}],
-                purpose="reference",
+                purpose="judge",
                 eval_run_id=eval_id,
             )
     finally:
@@ -408,9 +502,9 @@ async def _budget_across_evals():
         for eval_id in ("eval-1", "eval-2"):
             for _ in range(2):
                 await client.complete(
-                    model="z-ai/glm-5.2",
+                    model="z-ai/glm-5.3-flash",
                     messages=[{"role": "user", "content": "x"}],
-                    purpose="reference",
+                    purpose="judge",
                     eval_run_id=eval_id,
                 )
     finally:
@@ -476,7 +570,7 @@ async def _content_failure(engy_body, accept=None):
         result = await client.complete(
             model="deepseek/deepseek-v4-flash-0731",
             messages=[{"role": "user", "content": "x"}],
-            purpose="reference",
+            purpose="judge",
             eval_run_id="eval-1",
             accept=accept,
         )
@@ -507,7 +601,7 @@ async def _empty_responses_exhaust():
             await client.complete(
                 model="deepseek/deepseek-v4-flash-0731",
                 messages=[{"role": "user", "content": "x"}],
-                purpose="reference",
+                purpose="judge",
                 eval_run_id="eval-1",
             )
     finally:
@@ -532,7 +626,7 @@ async def _rejections_never_exhaust():
             await client.complete(
                 model="deepseek/deepseek-v4-flash-0731",
                 messages=[{"role": "user", "content": "x"}],
-                purpose="reference",
+                purpose="judge",
                 eval_run_id="eval-1",
                 accept=lambda raw: raw == "ok",
             )
@@ -579,7 +673,7 @@ async def _rejection_across_parse_attempts():
         await client.complete(
             model="deepseek/deepseek-v4-flash-0731",
             messages=[{"role": "user", "content": "x"}],
-            purpose="reference",
+            purpose="judge",
             eval_run_id="eval-1",
             provider={"order": ["deepseek", "cloudflare"], "allow_fallbacks": False},
             parse_retries=2,
@@ -595,9 +689,9 @@ def test_engy_budgets_are_independent_per_model():
     hits = asyncio.run(_two_models_one_eval())
     # glm burns its own budget of 1, deepseek still gets its first engy try afterwards
     assert hits == [
-        ("engy", "glm-5.2"),
-        ("openrouter", "z-ai/glm-5.2"),
-        ("openrouter", "z-ai/glm-5.2"),
+        ("engy", "glm-5.3-flash"),
+        ("openrouter", "z-ai/glm-5.3-flash"),
+        ("openrouter", "z-ai/glm-5.3-flash"),
         ("engy", "deepseek-v4-flash-0731"),
         ("openrouter", "deepseek/deepseek-v4-flash-0731"),
     ]
@@ -611,15 +705,15 @@ async def _two_models_one_eval():
     try:
         for _ in range(2):
             await client.complete(
-                model="z-ai/glm-5.2",
+                model="z-ai/glm-5.3-flash",
                 messages=[{"role": "user", "content": "x"}],
-                purpose="reference",
+                purpose="judge",
                 eval_run_id="eval-1",
             )
         await client.complete(
             model="deepseek/deepseek-v4-flash-0731",
             messages=[{"role": "user", "content": "x"}],
-            purpose="reference",
+            purpose="judge",
             eval_run_id="eval-1",
         )
     finally:

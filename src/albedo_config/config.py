@@ -85,8 +85,11 @@ class JudgeSettings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api"
     engy_api_key: str = Field("", validation_alias=AliasChoices("ALBEDO_JUDGE_ENGY_API_KEY"))
     engy_base_url: str = "https://api.engy.ai"
+    jev_api_key: str = ""
     engy_models: str = ENGY_MODELS
     engy_max_errors: int = 150
+    engy_max_concurrency: int = 48
+    engy_queue_depth: int = 1
     request_timeout_seconds: float = 300.0
     stream_enabled: bool = True
     stream_stall_seconds: float = 90.0
@@ -224,7 +227,7 @@ class RemoteSettings(BaseSettings):
     scoring_backend: str = "websocket"
     scoring_base_url: str | None = None
     scoring_auth_token: str = ""
-    scoring_timeout_seconds: float = 1800.0
+    scoring_timeout_seconds: float = 3600.0
     scoring_batch_concurrency: int = 128
     scoring_retry_count: int = 5
     scoring_retry_backoff_seconds: float = 1.5

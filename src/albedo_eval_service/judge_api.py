@@ -18,6 +18,12 @@ from albedo_config import JudgeSettings, get_judge_settings
 from albedo_config.models import JUDGE_MODELS
 
 from .control.notifications import EvalErrorNotification, notify_eval_error
+from .evaluator.reference.jev_align import JevUnavailable, jev_clusters
+from .evaluator.reference.jev_questions import (
+    cross_milestone_duplicates,
+    question_clusters,
+    reference_scores,
+)
 from .evaluator.reference.prompt_ladder import (
     LADDER_MIN,
     build_ladder_messages,
@@ -342,9 +348,6 @@ class ReferenceTrajectoryService:
                 temperature=0.0,
                 eval_run_id=eval_run_id,
                 max_tokens=self.settings.sota_max_tokens,
-                provider=_evaluator_provider(self.settings)
-                if model == self.settings.evaluator_model
-                else None,
                 accept=lambda raw: bool(raw.strip()),
             )
             if response.error or not response.raw.strip():
@@ -390,7 +393,7 @@ class ReferenceTrajectoryService:
 
 
 # Fewest questions a WHOLE checklist can have
-QUESTION_FLOOR = 6
+QUESTION_FLOOR = 5
 
 
 def _reference_document(prefix: list[dict[str, str]] | None, turns: list[dict[str, Any]]) -> str:
@@ -451,14 +454,15 @@ class QuestionService:
         runs = await self.reference_service.generate_many(
             sample, self.settings.reference_runs, eval_run_id=eval_run_id
         )
-        return await self._prepare_once(sample, runs)
+        return await self._prepare_once(sample, runs, eval_run_id=eval_run_id)
 
     async def _extract_vector(
-        self, task: str, references: list[str], candidate_turns: int
+        self, task: str, references: list[str], candidate_turns: int, eval_run_id: str = ""
     ) -> tuple[list[dict[str, Any]], str]:
         """The runs, read against each other, become an ordered vector of milestones."""
         response = await self.client.complete(
             purpose="questions",
+            eval_run_id=eval_run_id,
             model=self.settings.evaluator_model,
             messages=build_extractor_messages(
                 task=task, references=references, candidate_turns=candidate_turns
@@ -483,6 +487,7 @@ class QuestionService:
         candidate_turns: int,
         trajectories: list[dict[str, Any]],
         problem: str = "",
+        eval_run_id: str = "",
     ) -> tuple[list[dict[str, Any]], list[dict[str, str]], str, int, int]:
         """`milestone_readings` independent readings of the same runs, merged by fact.
 
@@ -495,7 +500,9 @@ class QuestionService:
         async def read() -> tuple[
             list[dict[str, Any]], list[dict[str, Any]], list[dict[str, str]], str
         ]:
-            raw, provider = await self._extract_vector(task, references, candidate_turns)
+            raw, provider = await self._extract_vector(
+                task, references, candidate_turns, eval_run_id
+            )
             milestones, dropped = validate_vector(raw, trajectories, task)
             return raw, milestones, dropped, provider
 
@@ -518,27 +525,23 @@ class QuestionService:
         clusters = exact_groups(vectors)
         aligned = "exact"
         if needs_alignment(clusters, vectors):
-            response = await self.client.complete(
-                purpose="questions",
-                model=self.settings.evaluator_model,
-                messages=build_merge_messages(problem=problem or task[-1500:], readings=vectors),
-                temperature=self.settings.temperature,
-                max_tokens=4000,
-                provider=_evaluator_provider(self.settings),
-                response_schema=merge_schema(),
-            )
-            parsed = (
-                None
-                if response.error
-                else parse_clusters(
-                    extract_json(response.raw or "", prefer_keys=("clusters",)), vectors
+            try:
+                clusters = await jev_clusters(
+                    problem or task[-1500:],
+                    vectors,
+                    api_key=self.settings.jev_api_key,
                 )
-            )
-            if parsed is None:
-                logger.warning("milestone_alignment_unparseable readings={}", len(held))
-                aligned = "exact_fallback"
-            else:
-                clusters, aligned = parsed, "model"
+                aligned = "jev"
+            except JevUnavailable as exc:
+                logger.warning("milestone_alignment_failed readings={} error={}", len(held), exc)
+                clusters, aligned = await self._glm_clusters(
+                    build_merge_messages(problem=problem or task[-1500:], readings=vectors),
+                    vectors,
+                    clusters,
+                    4000,
+                    "milestone",
+                    eval_run_id,
+                )
         merged = merge_vectors(vectors, clusters)
         logger.info(
             "milestone_readings held={}/{} kept_per_reading={} merged={} alignment={}",
@@ -550,8 +553,44 @@ class QuestionService:
         )
         return merged, dropped, provider, len(held), emitted
 
+    async def _glm_clusters(
+        self,
+        messages: list[dict[str, str]],
+        readings: list[list[dict[str, Any]]],
+        exact: list[list[tuple[int, int]]],
+        max_tokens: int,
+        what: str,
+        eval_run_id: str,
+    ) -> tuple[list[list[tuple[int, int]]], str]:
+        """The GLM aligner, kept for when Jev is unavailable; the exact groups if it fails too."""
+        response = await self.client.complete(
+            purpose="questions",
+            eval_run_id=eval_run_id,
+            model=self.settings.evaluator_model,
+            messages=messages,
+            temperature=self.settings.temperature,
+            max_tokens=max_tokens,
+            provider=_evaluator_provider(self.settings),
+            response_schema=merge_schema(),
+        )
+        parsed = (
+            None
+            if response.error
+            else parse_clusters(
+                extract_json(response.raw or "", prefer_keys=("clusters",)), readings
+            )
+        )
+        if parsed is None:
+            logger.warning("{}_alignment_unparseable readings={}", what, len(readings))
+            return exact, "exact_fallback"
+        return parsed, "glm"
+
     async def _write_ladders(
-        self, milestones: list[dict[str, Any]], approach: dict[int, list[str]]
+        self,
+        milestones: list[dict[str, Any]],
+        approach: dict[int, list[str]],
+        problem: str,
+        eval_run_id: str,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         """`question_readings` calls for the whole vector, merged by what each question tests.
 
@@ -569,6 +608,7 @@ class QuestionService:
         async def ask(messages: list[dict[str, str]]) -> list[dict[str, Any]]:
             response = await self.client.complete(
                 purpose="questions",
+                eval_run_id=eval_run_id,
                 model=self.settings.evaluator_model,
                 messages=messages,
                 temperature=self.settings.temperature,
@@ -585,36 +625,38 @@ class QuestionService:
         )
         lists = [q for q in lists if q]
         clusters = exact_groups(lists)
+        aligned = "exact"
         if lists and needs_alignment(clusters, lists):
-            response = await self.client.complete(
-                purpose="questions",
-                model=self.settings.evaluator_model,
-                messages=build_question_merge_messages(lists),
-                temperature=self.settings.temperature,
-                max_tokens=6000,
-                provider=_evaluator_provider(self.settings),
-                response_schema=merge_schema(),
-            )
-            parsed = (
-                None
-                if response.error
-                else parse_clusters(
-                    extract_json(response.raw or "", prefer_keys=("clusters",)), lists
+            try:
+                clusters = await question_clusters(
+                    problem,
+                    milestones,
+                    lists,
+                    api_key=self.settings.jev_api_key,
                 )
-            )
-            if parsed is None:
-                logger.warning("question_alignment_unparseable readings={}", len(lists))
-            else:
-                clusters = parsed
+                aligned = "jev"
+            except JevUnavailable as exc:
+                logger.warning(
+                    "question_alignment_jev_failed readings={} error={}", len(lists), exc
+                )
+                clusters, aligned = await self._glm_clusters(
+                    build_question_merge_messages(lists),
+                    lists,
+                    clusters,
+                    6000,
+                    "question",
+                    eval_run_id,
+                )
         by_id = select_questions(lists, clusters, LADDER_MIN)
         thin = [i for i in order if len(by_id.get(i, [])) < LADDER_MIN]
         logger.info(
-            "question_readings held={}/{} per_reading={} kept={} thin={}",
+            "question_readings held={}/{} per_reading={} kept={} thin={} alignment={}",
             len(lists),
             readings,
             [len(q) for q in lists],
             sum(len(g) for g in by_id.values()),
             len(thin),
+            aligned,
         )
 
         tags = {str(m.get("id")): milestone_tag(str(m.get("category") or "")) for m in milestones}
@@ -626,12 +668,46 @@ class QuestionService:
         ]
         return merged, thin
 
+    async def _drop_cross_milestone_duplicates(
+        self,
+        problem: str,
+        milestones: list[dict[str, Any]],
+        questions: list[dict[str, Any]],
+        discarded: list[dict[str, str]],
+    ) -> list[dict[str, Any]]:
+        """A question that tests what one under an earlier milestone tests goes: J1 groups only
+        within a milestone, so it would otherwise count twice. Without Jev nothing is dropped."""
+        try:
+            dropped = await cross_milestone_duplicates(
+                problem,
+                milestones,
+                questions,
+                api_key=self.settings.jev_api_key,
+            )
+        except JevUnavailable as exc:
+            logger.warning(
+                "cross_milestone_dedup_failed questions={} error={}", len(questions), exc
+            )
+            return questions
+        for question in questions:
+            if question["id"] in dropped:
+                discarded.append(
+                    {
+                        "stage": "cross_milestone_duplicate",
+                        "reason": "same_test_as_earlier_milestone",
+                        "text": question.get("text", ""),
+                        "origin": "content",
+                    }
+                )
+        return [question for question in questions if question["id"] not in dropped]
+
     async def _prune_unreachable(
         self,
         questions: list[dict[str, Any]],
         runs: list[tuple[str, str, bool, list[dict[str, Any]]]],
         prefix: list[dict[str, str]] | None,
         discarded: list[dict[str, str]],
+        eval_run_id: str = "",
     ) -> tuple[list[dict[str, Any]], set[int]]:
         """Drop questions that no reference run can answer, stamping `scored_by` on every one.
 
@@ -643,24 +719,57 @@ class QuestionService:
         `scored_by` is the runs that earned the question, empty for one that is pruned. The second
         return value is the runs that came back readable at all, which is what separates a run that
         earned nothing from a run whose verdict could not be parsed.
+
+        A run Jev does not answer goes to the GLM judge, asked only the questions no Jev-judged run
+        earned.
         """
-        judges = [self.settings.evaluator_model]
+        documents = [_reference_document(prefix, turns) for _, _, _, turns in runs]
+        try:
+            scores = await reference_scores(
+                documents,
+                questions,
+                api_key=self.settings.jev_api_key,
+            )
+        except JevUnavailable as exc:
+            logger.warning("reference_prune_jev_unavailable runs={} error={}", len(runs), exc)
+            scores = [None] * len(runs)
+        earned: dict[str, list[int]] = {question["id"]: [] for question in questions}
+        readable: set[int] = set()
+        for run, answers in enumerate(scores, start=1):
+            if answers is None:
+                continue
+            readable.add(run)
+            for qid, score in answers.items():
+                if score >= PRUNE_EARNED_MIN and qid in earned:
+                    earned[qid].append(run)
+        open_questions = [question for question in questions if not earned[question["id"]]]
+        fallback = (
+            [run for run, answers in enumerate(scores, start=1) if answers is None]
+            if open_questions
+            else []
+        )
+        logger.info(
+            "reference_prune runs={} jev={} glm_fallback={} open_questions={}",
+            len(runs),
+            len(readable),
+            len(fallback),
+            len(open_questions),
+        )
         results = await asyncio.gather(
             *[
                 _judge_side(
                     client=self.client,
                     settings=self.settings,
-                    side=f"reference_{index}",
-                    response_text=_reference_document(prefix, turns),
-                    questions=questions,
-                    judge_models=judges,
+                    side=f"reference_{run}",
+                    response_text=documents[run - 1],
+                    questions=open_questions,
+                    judge_models=[self.settings.evaluator_model],
+                    eval_run_id=eval_run_id,
                 )
-                for index, (_, _, _, turns) in enumerate(runs, start=1)
+                for run in fallback
             ]
         )
-        earned: dict[str, list[int]] = {question["id"]: [] for question in questions}
-        readable: set[int] = set()
-        for run, (_, records) in enumerate(results, start=1):
+        for run, (_, records) in zip(fallback, results):
             for record in records:
                 if not record.get("parse_ok"):
                     continue
@@ -689,6 +798,7 @@ class QuestionService:
         self,
         sample: QuestionPrepSample | JudgeSample,
         runs: list[tuple[str, str, bool, list[dict[str, Any]]]],
+        eval_run_id: str = "",
     ) -> QuestionPrepResult:
         prefix = getattr(sample, "messages", None)
         phase = sample_phase(prefix)
@@ -697,6 +807,10 @@ class QuestionService:
         # a milestone whose evidence comes from it.
         task = "\n\n".join(str(m.get("content") or "") for m in (prefix or []))
         references = [text for text, _, _, _ in runs]
+        problem = (
+            next((str(m.get("content") or "") for m in prefix or [] if m.get("role") == "user"), "")
+            or task[-1500:]
+        )
         made_edit = any(edit for _, _, edit, _ in runs)
         discarded: list[dict[str, str]] = []
 
@@ -715,7 +829,8 @@ class QuestionService:
             references,
             int(getattr(sample, "assistant_turns", 0) or self.settings.sota_trajectory_turns),
             trajectories,
-            problem=str(getattr(sample, "prompt", "") or ""),
+            problem=problem,
+            eval_run_id=eval_run_id,
         )
         discarded.extend(dropped)
         if not milestones:
@@ -729,6 +844,8 @@ class QuestionService:
                 int(t["run"]): [str(step.get("assistant") or "") for step in t["steps"]]
                 for t in trajectories
             },
+            problem,
+            eval_run_id,
         )
         # build_judge_messages shows the judge id/tag/text/example_bad and nothing else, so the
         # near-miss has to arrive under the name it reads
@@ -737,10 +854,15 @@ class QuestionService:
 
         questions = filter_reference_leaks(questions, discards=discarded)
         questions, drops = enforce_question_labels(questions, discards=discarded)
+        questions = await self._drop_cross_milestone_duplicates(
+            problem, milestones, questions, discarded
+        )
         pruned_from = len(questions)
         readable: set[int] = set()
         if self.settings.reference_prune:
-            questions, readable = await self._prune_unreachable(questions, runs, prefix, discarded)
+            questions, readable = await self._prune_unreachable(
+                questions, runs, prefix, discarded, eval_run_id
+            )
         pruned_out = pruned_from - len(questions)
         if len(questions) < QUESTION_FLOOR:
             raise QuestionScoringUnavailable(
@@ -1031,7 +1153,7 @@ class ObservationSimulationService:
                 (primary, self.settings.simulation_loop_reruns + 1, rung, index > 0)
                 for index, rung in enumerate(rungs)
             ]
-            attempts.append((fallback_model, 1, _evaluator_provider(self.settings), True))
+            attempts.append((fallback_model, 1, None, False))
         else:
             attempts = [
                 (
@@ -1707,6 +1829,7 @@ async def _judge_side(
     questions: list[dict[str, str]],
     judge_models: list[str],
     repeats: int = 1,
+    eval_run_id: str = "",
 ) -> tuple[dict[str, dict[str, float | None]], list[dict[str, Any]]]:
     """Each judge model answers `repeats` times; a question's score is the mean expectation."""
     question_ids = [q["id"] for q in questions]
@@ -1723,6 +1846,7 @@ async def _judge_side(
                 max_tokens=settings.answer_max_tokens,
                 accept_response=lambda result: _reading_error(result, question_ids) is None,
                 want_logprobs=True,
+                eval_run_id=eval_run_id,
             )
             for model in judge_models
             for _ in range(repeats)
@@ -1759,6 +1883,7 @@ async def _judge_side(
             {
                 "side": side,
                 "judge_model": model,
+                "answered_by": first.model,
                 "provider": first.provider,
                 "answers": answers,
                 "scores": scores,
@@ -1889,6 +2014,7 @@ async def _score_samples(
                 questions=questions,
                 judge_models=request.judge_models,
                 repeats=int(getattr(settings, "judge_repeats", 1) or 1),
+                eval_run_id=request.eval_run_id,
             )
 
         (king_scores, king_recs), (chal_scores, chal_recs) = await asyncio.gather(

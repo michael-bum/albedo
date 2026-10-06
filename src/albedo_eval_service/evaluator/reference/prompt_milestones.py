@@ -251,6 +251,9 @@ demand may never materialise; an unreached milestone is not a defect in the acco
 simply outside what can be scored. Never reason "this would be necessary at some later step" and \
 then invent it.
 
+Be exhaustive: a task of this size usually grounds five to eight milestones across the runs. Emit \
+every fact, change, check or claim the runs establish, not only the central ones.
+
 ===== OUTPUT =====
 Output ONLY strict JSON, no prose, no code fences:
 {"milestones":[{"id":"m1","category":"claims|explore|action|verification","statement":"...",\
@@ -485,7 +488,10 @@ def validate_vector(
 
     surviving = {str(milestone["id"]) for milestone in kept}
     return [
-        {**milestone, "depends_on": [d for d in milestone["depends_on"] if d in surviving]}
+        {
+            **milestone,
+            "depends_on": [d for d in milestone.get("depends_on") or [] if d in surviving],
+        }
         for milestone in kept
     ], dropped
 

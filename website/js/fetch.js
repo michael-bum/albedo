@@ -7,12 +7,21 @@ const registrationCacheKey = "albedo.registrationHistory.v2";
 // on every poll instead.
 const NO_CACHE = { cache: "no-cache" };
 
+const firstFetch = url => { const early = window.__early?.[url]; delete window.__early?.[url]; return early || fetch(url, NO_CACHE); };
+
+// an unchanged feed returns the same parsed object: callers compare by identity and must not mutate it
+const parsedFeeds = new Map();
+
 async function fetchFirstJson(endpoints) {
   for (const url of endpoints) {
     try {
-      const r = await fetch(url, NO_CACHE);
+      const r = await firstFetch(url);
       if (!r.ok) continue;
-      return await r.json();
+      const etag = r.headers.get("etag"), last = parsedFeeds.get(url);
+      if (etag && last?.etag === etag) return last.data;
+      const data = await r.json();
+      parsedFeeds.set(url, { etag, data });
+      return data;
     } catch {}
   }
   return null;
@@ -32,10 +41,11 @@ export async function fetchBenchmarks() {
 
 // One score file per pulled suite, keyed by suite so callers never have to know
 // which file a suite came from.
+const NO_ROWS = [];
 export async function fetchPulledScores() {
   const entries = await Promise.all(PULLED_SUITES.map(async pulled => {
     const rows = await fetchFirstJson(pulled.scoreEndpoints);
-    return [pulled.suite, Array.isArray(rows) ? rows : []];
+    return [pulled.suite, Array.isArray(rows) ? rows : NO_ROWS];
   }));
   return new Map(entries);
 }
@@ -79,14 +89,10 @@ export async function fetchLlmsText() {
 }
 
 export async function fetchRegistrationHistory() {
-  for (const url of REGISTRATION_ENDPOINTS) {
-    try {
-      const r = await fetch(url, NO_CACHE);
-      if (!r.ok) continue;
-      const data = await r.json();
-      try { localStorage.setItem(registrationCacheKey, JSON.stringify(data)); } catch {}
-      return data;
-    } catch {}
+  const data = await fetchFirstJson(REGISTRATION_ENDPOINTS);
+  if (data) {
+    try { localStorage.setItem(registrationCacheKey, JSON.stringify(data)); } catch {}
+    return data;
   }
   try { return JSON.parse(localStorage.getItem(registrationCacheKey)); } catch { return null; }
 }

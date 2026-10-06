@@ -4,12 +4,33 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ALBEDO</title>
+<script>
+// feeds start loading before the modules (js/fetch.js takes them); must stay above the stylesheets
+window.__early = Object.fromEntries([
+  "./data/dashboard.json", "./data/state.json", "./data/benchmarks.json", "./data/model-scores.json",
+  "./data/rebench-scores.json", "./results/v1/manifest.json", "./datasets/manifest.meta.json", "./data/registrations_30d.json",
+].map(url => [url, fetch(url, { cache: "no-cache" })]));
+</script>
 <link rel="icon" type="image/svg+xml" href="css/favicon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="css/base.css">
 <link rel="stylesheet" href="css/components.css">
+<link rel="modulepreload" href="js/config.js">
+<link rel="modulepreload" href="js/fetch.js">
+<link rel="modulepreload" href="js/data.js">
+<link rel="modulepreload" href="js/dom.js">
+<link rel="modulepreload" href="js/format.js">
+<link rel="modulepreload" href="js/model.js">
+<link rel="modulepreload" href="js/results.js">
+<link rel="modulepreload" href="js/render/benchmarks.js">
+<link rel="modulepreload" href="js/render/reign.js">
+<link rel="modulepreload" href="js/render/datasets.js">
+<link rel="modulepreload" href="js/render/registrationChart.js">
+<link rel="modulepreload" href="js/render/pipeline.js">
+<link rel="modulepreload" href="js/render/heroChart.js">
+<link rel="modulepreload" href="js/render/history.js">
 </head>
 <body>
 
@@ -61,22 +82,22 @@
 
 <section class="section" id="benchmarks">
   <div class="head"><span class="label">benchmarks</span><span class="meta" id="benchmarks-meta"></span></div>
-  <div id="benchmarks-wrap"><div class="empty">loading…</div></div>
+  <div id="benchmarks-wrap"><div class="empty loading">loading…</div></div>
 </section>
 
 <section class="section" id="reign">
   <div class="head"><span class="label">reign · weight holders</span></div>
-  <div id="reign-wrap"><div class="empty">loading…</div></div>
+  <div id="reign-wrap"><div class="empty loading">loading…</div></div>
 </section>
 
 <section class="section" id="datasets">
   <div class="head"><span class="label">dataset mix</span><span class="meta" id="datasets-meta"></span></div>
-  <div id="datasets-wrap"><div class="empty">loading…</div></div>
+  <div id="datasets-wrap"><div class="empty loading">loading…</div></div>
 </section>
 <section class="section" id="pipeline">
   <div class="head"><span class="label">queue</span><span class="meta" id="pipeline-meta"></span></div>
-  <div class="registration-chart" id="registration-chart"><div class="empty">loading…</div></div>
-  <div id="pipeline-wrap"><div class="empty">loading…</div></div>
+  <div class="registration-chart" id="registration-chart"><div class="empty loading">loading…</div></div>
+  <div id="pipeline-wrap"><div class="empty loading">loading…</div></div>
 </section>
 
 <section class="section" id="history">
@@ -85,12 +106,12 @@
   <div class="filter-bar">
     <input id="filter-input" type="search" placeholder="filter by uid / hotkey / model…" autocomplete="off" spellcheck="false">
   </div>
-  <div class="data-table-wrap" id="history-wrap"><div class="empty">loading…</div></div>
+  <div class="data-table-wrap" id="history-wrap"><div class="empty loading">loading…</div></div>
 </section>
 
 <section class="section" id="fails">
   <div class="head"><span class="label">fails</span><span class="meta" id="fails-meta"></span></div>
-  <div class="data-table-wrap" id="fails-wrap"><div class="empty">loading…</div></div>
+  <div class="data-table-wrap" id="fails-wrap"><div class="empty loading">loading…</div></div>
 </section>
 
 </main>

@@ -49,7 +49,7 @@ export function judgeShortName(model) {
 export function judgeMeta(model) {
   if (JUDGE_META[model]) return JUDGE_META[model];
   const short = judgeShortName(model);
-  return { letter: short.charAt(0).toUpperCase(), label: short.toUpperCase().slice(0, 12) };
+  return { letter: short.charAt(0).toUpperCase(), label: short.split("-")[0].toUpperCase() };
 }
 
 // king_version is renumbered server-side (monitor.py) within the 35b lineage: the genesis

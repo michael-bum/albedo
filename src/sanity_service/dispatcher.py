@@ -1697,7 +1697,7 @@ def _command_only(text: str) -> str:
 
 
 def _evaluator_provider(settings: JudgeSettings) -> dict[str, Any]:
-    block: dict[str, Any] = {"allow_fallbacks": True, "quantizations": ["fp8"]}
+    block: dict[str, Any] = {"allow_fallbacks": True}
     order = [p.strip() for p in settings.evaluator_providers.split(",") if p.strip()]
     if order:
         block["order"] = order

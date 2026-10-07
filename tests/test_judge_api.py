@@ -182,16 +182,12 @@ def _reference_backed_service(settings, fake):
 _MESSAGES = [{"role": "user", "content": "fix the bug"}]
 
 
-def test_evaluator_provider_is_always_fp8():
+def test_evaluator_provider_pins_the_roster():
     settings = JudgeSettings(evaluator_providers="prov-a, prov-b")
     provider = _evaluator_provider(settings)
-    assert provider == {
-        "allow_fallbacks": False,
-        "quantizations": ["fp8"],
-        "order": ["prov-a", "prov-b"],
-    }
+    assert provider == {"allow_fallbacks": False, "order": ["prov-a", "prov-b"]}
     bare = _evaluator_provider(JudgeSettings(evaluator_providers=""))
-    assert bare == {"allow_fallbacks": True, "quantizations": ["fp8"]}
+    assert bare == {"allow_fallbacks": True}
 
 
 def test_simulation_transcript_uses_section_markers():

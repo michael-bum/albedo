@@ -76,6 +76,15 @@ def test_a_submit_of_a_patch_never_created_gets_the_shells_error():
     assert missing_patch_output(f"pytest -q && {SUBMIT}", []) == ""
 
 
+def test_a_code_block_in_the_reasoning_does_not_hide_the_patch_write():
+    content = (
+        "<think>\nThe fix:\n```python\nx = 1\n```\nThen write the patch.\n</think>\n\n"
+        "THOUGHT: fix and diff\n\n```bash\ngit diff -- f.py > patch.txt\n```"
+    )
+    history = [{"role": "assistant", "content": content}]
+    assert missing_patch_output(SUBMIT, issued_commands(history)) == ""
+
+
 def test_issued_commands_reads_only_the_agents_turns():
     messages = [
         {"role": "user", "content": "```bash\ngit diff > patch.txt\n```"},

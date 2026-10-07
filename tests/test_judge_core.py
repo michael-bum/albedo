@@ -27,7 +27,6 @@ def test_judge_pins_derive_from_the_provider_roster():
     for model, roster in PROVIDERS.items():
         assert JUDGE_PROVIDER_PINS[model] == {
             "allow_fallbacks": False,
-            "quantizations": ["fp8"],
             "order": list(roster),
         }
         assert JUDGE_LOGPROB_PROVIDER_PINS[model] == {

@@ -1,4 +1,6 @@
 .data-table-wrap.reign-table-wrap { max-height: none; }
+/* every dataset row stays in view (13 sources since fcf2b97): no scroll box, as for the reign table */
+#datasets-wrap > .data-table-wrap { max-height: none; }
 .reign-table tbody tr.reign-current td:first-child { box-shadow: inset 3px 0 0 var(--color-gold); }
 .reign-table tbody tr.reign-current td { background: rgba(243, 196, 73, 0.05); }
 .reign-table .rc-era {

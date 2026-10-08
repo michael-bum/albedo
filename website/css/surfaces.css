@@ -23,4 +23,4 @@ table.data-table thead { background: var(--color-surface); }
 @media (max-width: 760px) { #benchmarks-wrap > .loading { min-height: 1036px; } }
 @media (max-width: 520px) { #benchmarks-wrap > .loading { min-height: 1677px; } }
 #reign-wrap > .loading { min-height: 199px; }
-#datasets-wrap > .loading { min-height: 190px; }
+#datasets-wrap > .loading { min-height: 493px; }

@@ -11,29 +11,70 @@ For how the resulting trajectories are turned into a score, see [SCORING.md](SCO
 
 ## Corpora
 
-Four sources, declared in `prepare_datasets.SOURCES`. All are real agent trajectories on real
-repositories — never synthetic prompts.
+Thirteen sources, declared in `prepare_datasets.SOURCES` (the six below plus the seven Affine ones). All are real agent trajectories on real
+repositories — never synthetic prompts. Each source pins every upstream repo it reads to its own
+revision (`repos: {repo: revision}`), so two sources sharing a repo never move each other's
+snapshot; a render source sharing a repo also names its own `raw_dir`, so neither globs the
+other's files.
 
 | source | language | upstream | notes |
 |---|---|---|---|
 | `mini-coder` | python | `ricdomolm/mini-coder-trajs-400k` | mini-swe-agent format, used as-is |
 | `mini-coder-rs` | rust | `AlienKevin/SWE-smith-rs-*` (3 repos) | rendered; **named `mini-coder-*` deliberately** |
-| `open-swe-traces` | mixed | `nvidia/Open-SWE-Traces` | rendered; four upstream arms merged into ONE source so instance dedup sees full coverage |
+| `open-swe-traces-v1.0` | mixed | `nvidia/Open-SWE-Traces` @ `9c0e4579` | rendered; the four v1.0 arms (minimax-m2.5, qwen3.5 × openhands, swe-agent); SWE-rebench-V2 tasks only; pinned before upstream's 08/26 removal of git-hacking trajectories |
+| `open-swe-traces-v1.1` | mixed | `nvidia/Open-SWE-Traces` @ `f8fb5b3d` | rendered; qwen3.6-27b (openhands, swe-agent, mini-swe-agent) and deepseek-v4-flash (openhands); SWE-rebench-V2 and Scale-SWE tasks |
+| `open-swe-traces-v1.2` | mixed | `nvidia/Open-SWE-Traces` @ `f8fb5b3d` | rendered; qwen3.8-27b mini-swe-agent; SWE-rebench-V2 and Scale-SWE tasks |
 | `swe-hero` | python | `nvidia/SWE-Hero-openhands-trajectories` | rendered; `repo_cap: 200` (pandas alone was 37.9% of the pool) |
 
-Leaked instances are excluded at manifest-build time: `_MINI_CODER_LEAKS` and `_OPEN_SWE_LEAKS`
-(ids reaching the leaderboard union via the SWE-rebench-V2 leak), plus `exclude_upstream` for
-`swe-hero` (rebench is our benchmark).
+**Affine** (`dendriteholdings/<source>` on Hugging Face). Affine's corpus (`data.affine.io`, view
+`duel_turns@v4`) and SWE-Lego's transcripts, pre-converted in `affine-dedup` to mini-coder's returncode
+turns (no render step). One source per kind of machine, since the scaffold is the only thing that tells
+machines apart: `affine-openhands` (SWE-Lego), `affine-mswea` (mini-swe-agent text harness, dash),
+`affine-bash` (`bash -c`), `affine-tools` (claude_code, pi, kimi_code, hermes_agent; `/bin/bash -c`),
+and `mini-coder-affine-<machine>` for the swesmith tasks (their ids parse only under a `mini-coder*`
+name). Their machines differ from albedo's other sources for the same ids in two places, both in
+`repo_context_service.core`: an R2E fix-commit id resolves to its parent (as for `swe-hero`), and a
+swesmith id resolves to the branch head even for Rust (Affine's Rust machines did not sit at `Bug
+Patch`), so these sources cache resolved SHAs apart (`_OWN_SHA_CACHE`). Runs that got the fix from
+outside their own work (swesmith `Bug Patch` history, the task's own PR in `git log --all`, fetching
+upstream code) were dropped before conversion.
+
+Rendering keeps **every distinct rollout** of a task (upstream ships several per task: separate
+runs, models and harnesses); it drops only a rollout that renders identically to one already
+kept (`duplicate_trajectory`). Picking one rollout per task is the sampler's job:
+`_instance_pool` groups all rows of all sources by `instance_id` and draws one with the eval's
+seeded RNG, so a task is used at most once per eval, every task is equally likely whatever its
+rollout count, and different evals see different rollouts of it. `repo_cap` counts a repository's
+tasks, not its rows. The three Open-SWE sources share most tasks but no rollout (no
+`trajectory_id` repeats across versions).
+
+Benchmark leaks are excluded from every source (`prepare_datasets.LEAKS`, applied when rendering
+and again as `blocked` in the manifest), since the sampler pools all sources' rows by
+`instance_id`: a task leaked in one source would leak through another's copy of it. Plus
+`exclude_upstream` for `swe-hero` (rebench is our benchmark). The ids live in
+`scripts/benchmark_leaks.txt`, written by `scripts/benchmark_leaks.py --ids-out`, which matches
+every row against SWE-rebench (leaderboard), SWE-bench Verified, SWE-bench Multilingual,
+AACR-bench, Terminal-Bench 2.1 and Aider Polyglot on instance id, repository + PR number and
+problem-statement text. Rerun it over all sources whenever a source or a benchmark changes:
+Scale-SWE rewrites issue text and ships the same PR under another id (`owner_repo_pr<N>`), so only
+the repo + PR key catches its copies.
 
 ### Rendering normalizes actions, not observations
 
 `render_trajectories.py` converts every upstream tool call into a **bash block** — `_render_call`
 maps bash tools to ` ```bash `, editor `view` to `cat -n`, `create` to `cat > … <<'EOF'`,
 `str_replace` to a SEARCH/REPLACE block — and folds `think` calls into the next action's `THOUGHT:`.
+A turn that runs several tool calls at once becomes one turn per call, each followed by its own
+result (in order; upstream results do not name their calls), so no command and no result is
+dropped.
 
-Tool **observations** are copied through verbatim (`out.append({"role": "user", "content": observation})`).
-That asymmetry is the single most important fact about this data: **every trajectory keeps its
-upstream observation format all the way into eval.**
+Tool **observations** are copied through verbatim. That asymmetry is the single most important
+fact about this data: **every trajectory keeps its upstream observation format all the way into
+eval.** The one exception is mini-swe-agent's tool-calling harness (the Open-SWE v1.1/v1.2
+`minisweagent` arms), which reports each command as a JSON object; a row whose results are that
+JSON is rendered in mini-swe-agent's own text template, the `RETURNCODE` format `mini-coder` is
+recorded in (`<warning>`/`<output_head>`/`<elided_chars>`/`<output_tail>` for a clipped output,
+and an `<exception_info>` line for a command the harness killed).
 
 ---
 
@@ -43,9 +84,9 @@ Three formats survive in the corpora. `Observation:` (SWE-ZERO) was retired with
 
 | format id | shape | who writes it |
 |---|---|---|
-| `RETURNCODE` | `<returncode>N</returncode>` + `<output>…</output>` | `mini-coder`, `mini-coder-rs` |
-| `SWE_AGENT` | `OBSERVATION:` then the output | `open-swe-traces` — `sweagent` arms |
-| `OPENHANDS` | bare tool output; **bash** calls close with an exit-code trailer | `open-swe-traces` — `openhands` arms, `swe-hero` |
+| `RETURNCODE` | `<returncode>N</returncode>` + `<output>…</output>` | `mini-coder`, `mini-coder-rs`, `open-swe-traces-*` — `minisweagent` arms |
+| `SWE_AGENT` | `OBSERVATION:` then the output | `open-swe-traces-*` — `sweagent` arms |
+| `OPENHANDS` | bare tool output; **bash** calls close with an exit-code trailer | `open-swe-traces-*` — `openhands` arms, `swe-hero` |
 
 The OpenHands trailer is structured and must be reproduced:
 
@@ -60,7 +101,7 @@ Editor-style OpenHands observations carry no trailer — they open with
 
 ### Format is detected per sample, never from the source name
 
-`open-swe-traces` merges SWE-agent and OpenHands arms under one name, so the source name cannot
+`open-swe-traces-*` merges SWE-agent, OpenHands and mini-swe-agent arms under one name, so the source name cannot
 determine the format, and the manifest cannot carry it (manifest `rows_meta` only ever reaches the
 sampler, never the worker or judge API).
 
@@ -122,6 +163,21 @@ resolves each turn in this order:
      a `pr_<N>` task, when its subject names `#N`. `git remote -v` names the upstream repository.
    - `overlay.py` keeps an in-memory write overlay, so the candidate's *own* edits — including full
      `sed -i` emulation — are visible to its later reads.
+   - `core.py:SCAFFOLDS` records how each source's machines print what the snapshot cannot show:
+     `ls` widths, git ref decoration, short-hash length, the branch line of `git status`, the
+     shell's error wording. `scaffold_for(source, fmt, instance_id)` takes the most specific entry:
+     the source itself (`open-swe-traces-v1.2`) before its family (`open-swe-traces`, see
+     `source_family`), and the instance's task set before the source's default. Open-SWE's
+     machines differ by task set (`task_source`: `owner_repo_pr<N>` ids are Scale-SWE): SWE-rebench-V2
+     ones are at a detached HEAD git cannot name (`Not currently on any branch.`), Scale-SWE ones are
+     on the harness's `scaleswe` branch under openhands and v1.2's mini-swe-agent and at a named
+     detached HEAD (`HEAD detached at <short>`) under swe-agent.
+     mini-swe-agent runs commands in dash (`/bin/sh: 1: cd: can't cd to X`, exit 2), off a terminal
+     (one name per `ls` line, no ref decoration). Where one entry covers machines the id cannot
+     tell apart, it follows the most common one: v1.1's mini-swe-agent Scale-SWE rows are detached
+     at the commit (58%) or on `scaleswe`, v1.2's SWE-rebench-V2 rows detached (67%) or on `main`,
+     and Affine's PR tasks on the repository's own branch (SWE-Lego, 47%), detached at the commit
+     (R2E-Gym, Multi-SWE) or detached unnamed (SWE-rebench-V2).
 
    When this produces an exact result, the response carries `exact_output` + `exact_returncode` and
    **that is the observation** (wrapped in the trajectory's format). No LLM is involved at all. The

@@ -108,6 +108,8 @@ class Overlay:
     # what bash puts before its own error messages: `bash: line 1: ` when it runs the command
     # as a script (`bash -c`), `bash: ` in an interactive shell
     errors: str = "bash: "
+    # the shell running the commands: `dash` words its own errors differently
+    shell: str = "bash"
 
     def copy(self) -> Overlay:
         return replace(
@@ -581,6 +583,8 @@ def cd_outcome(overlay: Overlay, command: SimpleCommand, cwd: str | None) -> tup
     kind = overlay.kind(target)
     if kind == DIRECTORY:
         return "", 0
+    if overlay.shell == "dash" and (kind is None or kind == FILE):
+        return f"{overlay.errors}cd: can't cd to {words[0]}\n", 2
     if kind == FILE or (kind is None and _under_file(overlay, target)):
         return f"{overlay.errors}cd: {words[0]}: Not a directory\n", 1
     if kind is None:

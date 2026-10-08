@@ -29,6 +29,8 @@ class GitState:
     unknown: bool = False
     branch: str | None = None
     detached: bool = False
+    # the commit an observed `HEAD detached at <short>` named
+    detached_at: str | None = None
     abbrev: int | None = None
     head_short: str | None = None
     head_subject: str | None = None
@@ -53,6 +55,9 @@ class GitMeta:
     abbrev: int | None = DEFAULT_ABBREV
     branch: str = DEFAULT_BRANCH
     detached: bool = False
+    # a detached HEAD git says it is at the checked-out commit of (`HEAD detached at <short>`)
+    # rather than `Not currently on any branch.`
+    detached_at: bool = False
     # whether git names refs beside commits, as on a terminal; None when that is not known
     decorate: bool | None = False
     # the history is one local commit, whose hash and subject only an observation shows

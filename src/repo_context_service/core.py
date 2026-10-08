@@ -132,8 +132,11 @@ class Scaffold:
     `git status` says of the upstream after the branch line; `pycache` whether `__pycache__`
     directories may be there before the session runs Python; `editor` the note the openhands
     editor ends a clipped view with, when a `cat -n` of a file is that editor's view of it (see
-    `_editor_view`), "" when it is bash's own output; `errors` what bash puts before its own
-    error messages.
+    `_editor_view`), "" when it is bash's own output; `errors` what the shell puts before its
+    own error messages; `shell` which shell runs the commands (`bash`, or `dash` as `/bin/sh`);
+    `branch` the branch the harness checked out, when it names its own rather than the
+    repository's default; `detached_at` whether a detached HEAD is `HEAD detached at <short>`
+    rather than `Not currently on any branch.`.
     """
 
     columns: tuple[int, ...] | None = None
@@ -145,6 +148,9 @@ class Scaffold:
     pycache: bool = False
     editor: str = ""
     errors: str = "bash: "
+    shell: str = "bash"
+    branch: str = ""
+    detached_at: bool = False
 
 
 # a terminal at least as wide as the narrowest one these datasets were recorded on
@@ -156,7 +162,34 @@ _DIVERGED = (
     "and have 1 and 1 different commits each, respectively.\n"
     '  (use "git pull" to merge the remote branch into yours)'
 )
-SCAFFOLDS = {
+# a versioned source (`open-swe-traces-v1.1`) is recorded by its family's harnesses
+_SOURCE_VERSION = re.compile(r"-v\d+(?:\.\d+)*$")
+# dash, mini-swe-agent's `/bin/sh`, numbers the line of an error
+_DASH_ERRORS = "/bin/sh: 1: "
+# bash started by its path (`/bin/bash -c`) names itself by that path
+_BIN_BASH_ERRORS = "/bin/bash: line 1: "
+_SCALE_SWE = "scale-swe"
+
+
+def source_family(source: str) -> str:
+    return _SOURCE_VERSION.sub("", source)
+
+
+def task_source(instance_id: str) -> str:
+    """The upstream task set an instance comes from, where its machines differ: Scale-SWE
+    instances are `owner_repo_pr<N>`, SWE-rebench-V2 ones `owner__repo-<N>`."""
+    return _SCALE_SWE if _PULL_ID_RE.fullmatch(instance_id or "") else ""
+
+
+def scaffold_for(source: str, fmt: str, instance_id: str = "") -> Scaffold:
+    """The most specific scaffold recorded: an instance's own task set before the source's
+    default, the source itself before its family."""
+    names, task = (source, source_family(source)), task_source(instance_id)
+    keys = [(name, fmt, task) for name in names] + [(name, fmt) for name in names]
+    return next((SCAFFOLDS[key] for key in keys if key in SCAFFOLDS), Scaffold())
+
+
+SCAFFOLDS: dict[tuple[str, ...], Scaffold] = {
     ("mini-coder", RETURNCODE): Scaffold(errors=_SCRIPT_ERRORS),
     ("mini-coder-rs", RETURNCODE): Scaffold(
         squashed=True, tracking=_DIVERGED, errors=_SCRIPT_ERRORS
@@ -172,6 +205,31 @@ SCAFFOLDS = {
         abbrev=None,
         editor=_EDITOR_CLIPPED_TO_SAVE,
     ),
+    # mini-swe-agent runs each command in its own `/bin/sh -c`, off a terminal. The later third of
+    # v1.2's SWE-rebench-V2 rows is on `main` instead; the id does not tell them apart
+    ("open-swe-traces", RETURNCODE): Scaffold(
+        detached=True, abbrev=None, errors=_DASH_ERRORS, shell="dash"
+    ),
+    # Scale-SWE machines: openhands checks out the harness's own `scaleswe` branch, swe-agent
+    # leaves HEAD detached at the task's commit, v1.2's mini-swe-agent is on the branch. v1.1's
+    # mini-swe-agent is detached in its first 58% of rows and on the branch after
+    ("open-swe-traces", OPENHANDS, _SCALE_SWE): Scaffold(
+        columns=_ANY_WIDTH, decorate=True, abbrev=None, branch="scaleswe", editor=_EDITOR_CLIPPED
+    ),
+    ("open-swe-traces", SWE_AGENT, _SCALE_SWE): Scaffold(
+        columns=_ANY_WIDTH,
+        decorate=None,
+        detached=True,
+        detached_at=True,
+        abbrev=None,
+        editor=_EDITOR_CLIPPED_TO_SAVE,
+    ),
+    ("open-swe-traces", RETURNCODE, _SCALE_SWE): Scaffold(
+        detached=True, detached_at=True, abbrev=None, errors=_DASH_ERRORS, shell="dash"
+    ),
+    ("open-swe-traces-v1.2", RETURNCODE, _SCALE_SWE): Scaffold(
+        abbrev=None, branch="scaleswe", errors=_DASH_ERRORS, shell="dash"
+    ),
     ("swe-hero", OPENHANDS): Scaffold(
         columns=_ANY_WIDTH,
         decorate=True,
@@ -180,7 +238,31 @@ SCAFFOLDS = {
         pycache=True,
         editor=_EDITOR_CLIPPED,
     ),
+    # SWE-Lego's openhands transcripts, converted to returncode turns: an interactive terminal on
+    # the repository's own branch. Every action was rewritten as a bash command, so `cat -n` and a
+    # heredoc are bash's own and the editor is not emulated.
+    ("affine-openhands", RETURNCODE): Scaffold(columns=_ANY_WIDTH, decorate=True, abbrev=None),
 }
+
+# Affine's own machines (`affine-<machine>` for PR tasks, `mini-coder-affine-<machine>` for swesmith
+# ones), all converted to returncode turns and run off a terminal; they differ in the shell: the
+# mini-swe-agent text harness (`mswea`) runs commands in dash, its bash tool (`bash`) in `bash -c`,
+# and claude_code, pi, kimi_code and hermes_agent (`tools`) in `/bin/bash -c`. A PR task's machine
+# depends on its upstream task set, which its id does not show: SWE-Lego's (the most) are on the
+# repository's own branch, R2E-Gym's and Multi-SWE's detached at the commit, SWE-rebench-V2's
+# detached unnamed. A Scale-SWE task is on the harness's `scaleswe` branch like Open-SWE's.
+for _machine, _shell in (
+    ("mswea", {"errors": _DASH_ERRORS, "shell": "dash"}),
+    ("bash", {"errors": _SCRIPT_ERRORS}),
+    ("tools", {"errors": _BIN_BASH_ERRORS}),
+):
+    SCAFFOLDS[(f"affine-{_machine}", RETURNCODE)] = Scaffold(abbrev=None, **_shell)
+    SCAFFOLDS[(f"affine-{_machine}", RETURNCODE, _SCALE_SWE)] = Scaffold(
+        abbrev=None, branch="scaleswe", **_shell
+    )
+    SCAFFOLDS[(f"mini-coder-affine-{_machine}", RETURNCODE)] = Scaffold(**_shell)
+# the sources whose machines can sit elsewhere than another source's for the same instance id
+_OWN_SHA_CACHE = ("affine-", "mini-coder-affine-")
 
 
 # the commands a trajectory's editor views were converted to: a whole file, or a range of it
@@ -922,11 +1004,12 @@ class RepoContextService:
         overlay = build_overlay(
             messages, base, lambda rel: self._read_snapshot_file(snapshot, rel), root, recorded
         )
-        scaffold = SCAFFOLDS.get((source, fmt), Scaffold())
+        scaffold = scaffold_for(source, fmt, instance_id)
         overlay.columns = scaffold.columns
         overlay.pycache = overlay.pycache or scaffold.pycache
         overlay.editor = scaffold.editor
         overlay.errors = scaffold.errors
+        overlay.shell = scaffold.shell
         listing = overlay.listing()
         meta = self.git_meta(snapshot, source, owner, repo, sha, scaffold, instance_id)
         command = first_bash_block(assistant_output)
@@ -1046,7 +1129,11 @@ class RepoContextService:
 
     def _resolve_sha(self, ref: RepoRef) -> tuple[str, str, str] | None:
         ref = _smith_mirror(ref) or ref
-        cache_path = self._shas_dir / f"{_safe_name(ref.instance_id)}.json"
+        # Affine's Rust swesmith machines sat at the branch head where mini-coder-rs's sat at `Bug
+        # Patch`: the same instance id resolves apart, so neither serves the other's tree
+        own = ref.source.startswith(_OWN_SHA_CACHE)
+        cache_name = f"{_safe_name(ref.instance_id)}{'@affine' if own else ''}.json"
+        cache_path = self._shas_dir / cache_name
         cached = _read_cached_sha(cache_path)
         if cached is not None:
             if cached.get("sha"):
@@ -1119,10 +1206,12 @@ class RepoContextService:
             owner=shown_owner,
             repo=shown_repo,
             # a squashed history is a local repository on the branch its upstream is named for
-            branch=DEFAULT_BRANCH
-            if scaffold.squashed
-            else self._default_branch(snapshot, owner, repo),
+            branch=scaffold.branch
+            or (
+                DEFAULT_BRANCH if scaffold.squashed else self._default_branch(snapshot, owner, repo)
+            ),
             detached=scaffold.detached or _DETACHED_SOURCE.search(source or "") is not None,
+            detached_at=scaffold.detached_at,
             abbrev=scaffold.abbrev,
             decorate=scaffold.decorate,
             squashed=scaffold.squashed,
@@ -1297,7 +1386,9 @@ class RepoContextService:
             data = self._github_json(f"/repos/{owner}/{repo}/pulls/{ref.pr}")
             return data["base"]["sha"]
         data = self._github_json(f"/repos/{owner}/{repo}/commits/{ref.commit}")
-        if ref.source == "swe-hero":
+        # R2E-Gym ids (swe-hero, and Affine's PR sources) name the fix commit; the agent worked on
+        # its parent
+        if ref.source == "swe-hero" or ref.source.startswith("affine-"):
             return data["parents"][0]["sha"]
         if owner == _SMITH_MIRROR_OWNER and _smith_env_is_bug_patch(ref, data):
             return data["parents"][0]["sha"]

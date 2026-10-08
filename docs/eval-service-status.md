@@ -224,9 +224,12 @@ must equal the backend's `ALBEDO_EVAL_REMOTE_AUTH_TOKEN` *and* its
 `ALBEDO_SCORE_BRIDGE_REMOTE_AUTH_TOKEN` — both hit the same check on the remote API; an empty
 token on the box disables auth entirely.
 
-> The eval draws on **four** corpora — `mini-coder`, `mini-coder-rs`, `open-swe-traces` and
-> `swe-hero` (SWE-ZERO was retired). Samples are pooled one rollout per unique `instance_id` across
-> all four and stratified by phase x bug family, so there is no fixed per-source split any more; the
+> The eval draws on **thirteen** corpora — `mini-coder`, `mini-coder-rs`, `open-swe-traces-v1.0`,
+> `open-swe-traces-v1.1`, `open-swe-traces-v1.2`, `swe-hero` and the seven Affine ones (see
+> DATASETS.md; SWE-ZERO was retired). The
+> datasets keep every distinct rollout of a task; samples are pooled one rollout per unique
+> `instance_id` across all of them and stratified by phase x bug family, so there is no fixed
+> per-source split any more; the
 > per-source `weight` in the manifest only shapes the pool. `dataset_version` is
 > `mini-coder+open-swe+smith-rs+hero-v1`. The combined `manifest.json` (160 MB) is published at
 > `https://albedo.tech/datasets/manifest.json` (R2 bucket `albedo`, built/uploaded by

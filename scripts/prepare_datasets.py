@@ -15,69 +15,127 @@ from pathlib import Path
 log = logging.getLogger("prepare_datasets")
 
 
-_MINI_CODER_LEAKS = ("modin-project__modin.8c7799fd.pr_7434", "scrapy__scrapy.35212ec5.pr_6671")
-_OPEN_SWE_LEAKS = (
-    "agronholm__anyio-935",
-    "astropy__ccdproc-901",
-    "beeware__briefcase-2302",
-    "beeware__briefcase-2401",
-    "conan-io__conan-18327",
-    "conan-io__conan-18444",
-    "ethereum__web3.py-3690",
-    "geopandas__geopandas-3591",
-    "matthewwithanm__python-markdownify-230",
-    "pdm-project__pdm-3575",
-    "pydata__sparse-870",
-)
+# benchmark tasks (or the same repo + PR under another id) found in our sources by
+# scripts/benchmark_leaks.py; rerun it whenever a source or a benchmark changes. Excluded from every
+# source, since the sampler pools all sources' rows by instance id
+LEAKS = frozenset(Path(__file__).with_name("benchmark_leaks.txt").read_text().split())
 
+# every source pins each of its upstream repos to its own revision, so adding a source that
+# shares a repo (open-swe-traces-v1.1 vs -v1.0) never moves another source's snapshot
 SOURCES: dict[str, dict] = {
     "mini-coder": {
         "language": "python",
-        "repos": ["ricdomolm/mini-coder-trajs-400k"],
+        "repos": {"ricdomolm/mini-coder-trajs-400k": "c03c1fd5016d59be5f4acf6d4492d943d0633923"},
         "shard_glob": "data/train-*.parquet",
-        "exclude_ids": _MINI_CODER_LEAKS,
     },
-    "open-swe-traces": {
-        "repos": ["nvidia/Open-SWE-Traces"],
+    "open-swe-traces-v1.0": {
+        "repos": {"nvidia/Open-SWE-Traces": "9c0e4579a4ee0effa3e5f7a552494a045f29377d"},
         "shard_glob": "data/train-*.parquet",
         "raw_glob": "data/**/train-*.parquet",
         "render": True,
         "family": "pr",
-        "exclude_ids": _OPEN_SWE_LEAKS,
+    },
+    "open-swe-traces-v1.1": {
+        "repos": {"nvidia/Open-SWE-Traces": "f8fb5b3d2c787f85f8a00f5fe04fe3f1a11088ef"},
+        "shard_glob": "data/train-*.parquet",
+        "raw_glob": (
+            "data/*/qwen36_27b/*/train-*.parquet",
+            "data/*/deepseek_v4_flash/*/train-*.parquet",
+        ),
+        "raw_dir": "Open-SWE-Traces-v1.1",
+        "render": True,
+        "family": "pr",
+    },
+    "open-swe-traces-v1.2": {
+        "repos": {"nvidia/Open-SWE-Traces": "f8fb5b3d2c787f85f8a00f5fe04fe3f1a11088ef"},
+        "shard_glob": "data/train-*.parquet",
+        "raw_glob": ("data/*/qwen38_27b/*/train-*.parquet",),
+        "raw_dir": "Open-SWE-Traces-v1.2",
+        "render": True,
+        "family": "pr",
     },
     "mini-coder-rs": {
         "language": "rust",
-        "repos": [
-            "AlienKevin/SWE-smith-rs-minimax-m2.5-trajectories",
-            "AlienKevin/SWE-smith-rs-gpt-5-mini-trajectories",
-            "AlienKevin/SWE-smith-rs-gemini-3-flash-trajectories",
-        ],
+        "repos": {
+            "AlienKevin/SWE-smith-rs-minimax-m2.5-trajectories": (
+                "dfd98db8db1970d485d6897626648a90b54e453b"
+            ),
+            "AlienKevin/SWE-smith-rs-gpt-5-mini-trajectories": (
+                "d4c902a41c7a73b230613932827e1908e06d162d"
+            ),
+            "AlienKevin/SWE-smith-rs-gemini-3-flash-trajectories": (
+                "0b2f075e7f65670b5f284e5d4264c4eabe05d91e"
+            ),
+        },
         "shard_glob": "data/train-*.parquet",
         "render": True,
     },
     "swe-hero": {
         "language": "python",
-        "repos": ["nvidia/SWE-Hero-openhands-trajectories"],
+        "repos": {
+            "nvidia/SWE-Hero-openhands-trajectories": "150bc119e52c647216fce285fd801f16b6fd745b"
+        },
         "shard_glob": "data/train-*.parquet",
         "render": True,
         "family": "pr",
         "exclude_upstream": ("nebius/SWE-rebench",),
         "repo_cap": 200,
     },
-}
-
-REVISIONS: dict[str, str] = {
-    "ricdomolm/mini-coder-trajs-400k": "c03c1fd5016d59be5f4acf6d4492d943d0633923",
-    "nvidia/Open-SWE-Traces": "9c0e4579a4ee0effa3e5f7a552494a045f29377d",
-    "nvidia/SWE-Hero-openhands-trajectories": "150bc119e52c647216fce285fd801f16b6fd745b",
-    "AlienKevin/SWE-smith-rs-minimax-m2.5-trajectories": "dfd98db8db1970d485d6897626648a90b54e453b",
-    "AlienKevin/SWE-smith-rs-gpt-5-mini-trajectories": "d4c902a41c7a73b230613932827e1908e06d162d",
-    "AlienKevin/SWE-smith-rs-gemini-3-flash-trajectories": "0b2f075e7f65670b5f284e5d4264c4eabe05d91e",  # noqa: E501
+    # Affine's corpus (data.affine.io, epoch 84) and SWE-Lego's transcripts, pre-converted to
+    # mini-coder's returncode turns in affine-dedup (no render step), solution leaks already
+    # dropped. One source per kind of machine, since the scaffold is chosen by source name
+    # (see DATASETS.md); swesmith tasks sit under `mini-coder-affine-*`, the only names their ids
+    # parse under.
+    "affine-openhands": {
+        "repos": {"dendriteholdings/affine-openhands": "96acd3252883acd12920567b8c4b9055778dd679"},
+        "shard_glob": "data/train-*.parquet",
+    },
+    "affine-mswea": {
+        "repos": {"dendriteholdings/affine-mswea": "b3b887739c09a8c0e2aa9af090d3654ee3e9c396"},
+        "shard_glob": "data/train-*.parquet",
+    },
+    "affine-bash": {
+        "repos": {"dendriteholdings/affine-bash": "d3c630d9b2c7f46fe2aaab127f0a2d1313526872"},
+        "shard_glob": "data/train-*.parquet",
+    },
+    "affine-tools": {
+        "repos": {"dendriteholdings/affine-tools": "04da3db81f5cafaeec3e4702194d718ae557d25a"},
+        "shard_glob": "data/train-*.parquet",
+    },
+    "mini-coder-affine-mswea": {
+        "repos": {
+            "dendriteholdings/mini-coder-affine-mswea": "999978e2a610217a3e600585696986ff1115344f",
+        },
+        "shard_glob": "data/train-*.parquet",
+    },
+    "mini-coder-affine-bash": {
+        "repos": {
+            "dendriteholdings/mini-coder-affine-bash": "7b92128f54d8fe5cf7ba04dc2829d4ee4475178b",
+        },
+        "shard_glob": "data/train-*.parquet",
+    },
+    "mini-coder-affine-tools": {
+        "repos": {
+            "dendriteholdings/mini-coder-affine-tools": "3f65a975428b9f6b470313299504b47a07608335",
+        },
+        "shard_glob": "data/train-*.parquet",
+    },
 }
 
 
 def _repo_of(name: str) -> str:
-    return SOURCES[name]["repos"][0]
+    return next(iter(SOURCES[name]["repos"]))
+
+
+def raw_globs(spec: dict) -> tuple[str, ...]:
+    globs = spec.get("raw_glob", spec["shard_glob"])
+    return (globs,) if isinstance(globs, str) else tuple(globs)
+
+
+def raw_dir(spec: dict, repo_id: str) -> str:
+    """Where a render source's raw snapshot of `repo_id` lives under the raw root. A source that
+    shares its repo with another names its own directory, so neither globs the other's files."""
+    return spec.get("raw_dir") or repo_id.split("/")[-1]
 
 
 def _enable_fast_transfer() -> None:
@@ -87,21 +145,21 @@ def _enable_fast_transfer() -> None:
         os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
 
-def _expected_parquet_shards(repo_id: str, shard_glob: str, revision: str) -> set[str]:
+def _expected_parquet_shards(repo_id: str, globs: tuple[str, ...], revision: str) -> set[str]:
     from huggingface_hub import HfApi
 
     files = HfApi().list_repo_files(repo_id, repo_type="dataset", revision=revision)
-    return {f for f in files if fnmatch.fnmatch(f, shard_glob)}
+    return {f for f in files if any(fnmatch.fnmatch(f, g) for g in globs)}
 
 
-def _local_parquet_shards(dest: Path, shard_glob: str) -> set[str]:
-    return {p.relative_to(dest).as_posix() for p in dest.glob(shard_glob)}
+def _local_parquet_shards(dest: Path, globs: tuple[str, ...]) -> set[str]:
+    return {p.relative_to(dest).as_posix() for g in globs for p in dest.glob(g)}
 
 
 def download_source(
     name: str,
     repo_id: str,
-    shard_glob: str,
+    globs: tuple[str, ...],
     root: Path,
     *,
     revision: str,
@@ -113,10 +171,10 @@ def download_source(
 
     dest = root / (dest_name or name)
 
-    expected = _expected_parquet_shards(repo_id, shard_glob, revision)
+    expected = _expected_parquet_shards(repo_id, globs, revision)
     if not expected:
-        raise RuntimeError(f"{name}: no shards in repo {repo_id} matching {shard_glob!r}")
-    present = _local_parquet_shards(dest, shard_glob)
+        raise RuntimeError(f"{name}: no shards in repo {repo_id} matching {globs!r}")
+    present = _local_parquet_shards(dest, globs)
     to_fetch = sorted(expected) if force else sorted(expected - present)
 
     if not to_fetch:
@@ -155,7 +213,7 @@ def download_source(
             if done % 50 == 0 or done == len(to_fetch):
                 log.info("%s: %d/%d downloaded", name, done, len(to_fetch))
 
-    still_missing = expected - _local_parquet_shards(dest, shard_glob)
+    still_missing = expected - _local_parquet_shards(dest, globs)
     if still_missing:
         raise RuntimeError(
             f"{name}: {len(still_missing)} shard(s) still missing after download, "
@@ -262,17 +320,16 @@ def main() -> None:
 
     for name in names:
         meta = SOURCES[name]
-        glob = meta.get("raw_glob", meta["shard_glob"])
-        for repo_id in meta["repos"]:
+        for repo_id, revision in meta["repos"].items():
             download_source(
                 name,
                 repo_id,
-                glob,
+                raw_globs(meta),
                 Path(args.raw_root) if args.raw_root and meta.get("render") else root,
-                revision=REVISIONS[repo_id],
+                revision=revision,
                 force=args.force,
                 max_workers=args.max_workers,
-                dest_name=repo_id.split("/")[-1] if meta.get("render") else name,
+                dest_name=raw_dir(meta, repo_id) if meta.get("render") else name,
             )
         if meta.get("render"):
             from render_trajectories import render_source

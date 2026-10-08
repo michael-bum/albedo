@@ -4,6 +4,8 @@ import re
 
 BRANCH_HEADER = "On branch {branch}"
 DETACHED_HEADER = "Not currently on any branch."
+# a detached HEAD git still knows the commit of: the checkout named it
+DETACHED_AT_HEADER = "HEAD detached at {short}"
 DEFAULT_BRANCH = "main"
 STAGED_HEADER = "Changes to be committed:"
 STAGED_HINT = '  (use "git restore --staged <file>..." to unstage)'

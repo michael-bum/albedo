@@ -93,6 +93,43 @@ def test_status_on_a_rebench_image_reports_a_detached_head():
     assert result.output.startswith("Not currently on any branch.\n")
 
 
+def test_status_at_a_detached_head_git_knows_names_the_commit():
+    """Scale-SWE's swe-agent machines say `HEAD detached at <short>`; the short hash is only
+    printed once its length is known."""
+    meta = GitMeta(sha=META.sha, detached=True, detached_at=True)
+    result, _ = _run("git status", EDIT, meta=meta)
+    assert result.output.startswith("HEAD detached at a1b2c3d\n")
+    unknown = replace(meta, abbrev=None)
+    assert isinstance(_run("git status", EDIT, meta=unknown)[0], ParseFailure)
+    seen = _turn("git status", "HEAD detached at a1b2c3d4e\nnothing to commit, working tree clean")
+    result, _ = _run("git status", seen + EDIT, meta=unknown)
+    assert result.output.startswith("HEAD detached at a1b2c3d4e\n")
+
+
+def test_an_observed_detached_head_is_kept_whatever_the_machine_says():
+    """The commit an observation named wins over the checkout's: after the session moved HEAD,
+    and on a machine whose checkout is on a branch."""
+    moved = _turn("git status", "HEAD detached at 0f0f0f0f\nnothing to commit, working tree clean")
+    on_task = GitMeta(sha=META.sha, detached=True, detached_at=True)
+    assert _run("git status", moved + EDIT, meta=on_task)[0].output.startswith(
+        "HEAD detached at 0f0f0f0f\n"
+    )
+    on_branch = GitMeta(sha=META.sha, branch="scaleswe")
+    assert _run("git status", moved + EDIT, meta=on_branch)[0].output.startswith(
+        "HEAD detached at 0f0f0f0f\n"
+    )
+    assert _run("git branch", moved, on_branch)[0].output == "* (HEAD detached at 0f0f0f0f)"
+    back = _turn("git status", "On branch scaleswe\nnothing to commit, working tree clean")
+    assert _run("git status", moved + back + EDIT, meta=on_branch)[0].output.startswith(
+        "On branch scaleswe\n"
+    )
+
+
+def test_status_on_a_harness_branch_names_it():
+    result, _ = _run("git status", EDIT, meta=GitMeta(sha=META.sha, branch="scaleswe"))
+    assert result.output.startswith("On branch scaleswe\nChanges not staged for commit:\n")
+
+
 def test_a_staged_tree_drops_the_summary_line_and_keeps_the_trailing_blank():
     result, _ = _run("git status", EDIT + _turn("git add -A"))
     assert result.output.endswith("\tmodified:   src/app.py\n")
@@ -302,6 +339,12 @@ def test_git_branch_at_a_detached_head_is_no_branch_and_nothing_else_is_guessed(
     assert isinstance(_run("git branch", meta=META)[0], ParseFailure)
     made = _turn("git checkout -b fix")
     assert isinstance(_run("git branch", made, detached)[0], ParseFailure)
+
+
+def test_git_branch_at_a_detached_head_git_knows_names_the_commit():
+    detached = replace(META, detached=True, detached_at=True)
+    assert _run("git branch", meta=detached)[0].output == "* (HEAD detached at a1b2c3d)"
+    assert isinstance(_run("git branch", meta=replace(detached, abbrev=None))[0], ParseFailure)
 
 
 def test_a_log_whose_hash_length_is_unknown_is_still_shown_to_the_simulator():

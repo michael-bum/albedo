@@ -16,7 +16,7 @@ from albedo_eval_service.shared.sampling import _SHARD_RE, SAMPLING_ALGO
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_manifest_meta import write_meta
-from prepare_datasets import SOURCES
+from prepare_datasets import LEAKS, SOURCES
 
 DEFAULT_VERSION = "mini-coder+open-swe+smith-rs+hero-v1"
 
@@ -104,7 +104,7 @@ def _row_meta(path: Path, blocked: frozenset[str] = frozenset(), language: str =
 def _build_source(name: str, root: Path, *, max_workers: int = 8) -> dict:
     if name not in SOURCES:
         raise SystemExit(f"{name}: unknown source (not in prepare_datasets.SOURCES)")
-    repo = SOURCES[name]["repos"][0]
+    repo = next(iter(SOURCES[name]["repos"]))
     shard_glob = SOURCES[name]["shard_glob"]
     data_dir = root / name / "data"
     name_pattern = shard_glob.rsplit("/", 1)[-1]
@@ -120,9 +120,7 @@ def _build_source(name: str, root: Path, *, max_workers: int = 8) -> dict:
             raise SystemExit(
                 f"{name}: shard name {shard_path!r} is not a valid (<source>/)data/train-*.parquet"
             )
-        rows_meta = _row_meta(
-            path, frozenset(SOURCES[name].get("exclude_ids", ())), SOURCES[name].get("language", "")
-        )
+        rows_meta = _row_meta(path, LEAKS, SOURCES[name].get("language", ""))
         return {
             "path": shard_path,
             "rows": len(rows_meta),

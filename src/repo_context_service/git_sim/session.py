@@ -14,6 +14,7 @@ from .views import Views, in_scope, moved_files, normalize_paths, removed_files
 
 _BRANCH_LINE = re.compile(r"^On branch (\S+)$", re.M)
 _DETACHED_LINE = re.compile(r"^Not currently on any branch\.$", re.M)
+_DETACHED_AT_LINE = re.compile(r"^HEAD detached at ([0-9a-f]{4,40})$", re.M)
 _INDEX_LINE = re.compile(r"^index ([0-9a-f]{4,40})\.\.[0-9a-f]{4,40}", re.M)
 _WIP_LINE = re.compile(
     r"^Saved working directory and index state WIP on ([^:]+): ([0-9a-f]{4,40}) (.*)$", re.M
@@ -36,9 +37,12 @@ def learn_git_facts(state: GitState, observation: str, command: str = "") -> Non
         state.abbrev = len(match.group(1))
     if match := _BRANCH_LINE.search(text):
         state.branch = match.group(1)
-        state.detached = False
+        state.detached, state.detached_at = False, None
     elif _DETACHED_LINE.search(text):
-        state.detached = True
+        state.detached, state.detached_at = True, None
+    elif match := _DETACHED_AT_LINE.search(text):
+        state.detached, state.detached_at = True, match.group(1)
+        state.abbrev = len(match.group(1))
     if match := _WIP_LINE.search(text):
         branch, short, subject = match.groups()
         state.abbrev = len(short)
@@ -357,7 +361,7 @@ def apply_git_stage(
         state.record(turn, stage.strip(), effect)
         if "branch" in effect:
             # a branch made and switched to: HEAD is on it from here on
-            state.branch, state.detached = effect["branch"], False
+            state.branch, state.detached, state.detached_at = effect["branch"], False, None
 
 
 def _apply_unknown(plan: GitPlan, views: Views) -> None:

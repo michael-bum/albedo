@@ -9,7 +9,9 @@ from .patches import commit_header, filter_diff, parse_patch, reabbrev, retarget
 from .templates import (
     BRANCH_HEADER,
     CLEAN_TRAILER,
+    DEFAULT_ABBREV,
     DEFAULT_BRANCH,
+    DETACHED_AT_HEADER,
     DETACHED_HEADER,
     ENTRY_LABEL_WIDTH,
     EVIDENCE_LOG_LIMIT,
@@ -124,14 +126,32 @@ def _untracked_entries(views: Views, paths: list[str]) -> tuple[list[str], bool]
     return sorted(shown), doubtful
 
 
+def _is_detached(views: Views, meta: GitMeta) -> bool:
+    return views.state.detached or (meta.detached and not views.state.branch)
+
+
+def _names_detached_commit(views: Views, meta: GitMeta) -> bool:
+    """Whether git says which commit the detached HEAD is at: the session saw it say so, or the
+    machine's checkout names it."""
+    return views.state.detached_at is not None or (meta.detached_at and _is_detached(views, meta))
+
+
+def _detached_short(views: Views, meta: GitMeta) -> str | None:
+    """The short hash `HEAD detached at` names: the one an observation showed, else the checked-out
+    commit's; None when its length is not known."""
+    if views.state.detached_at:
+        return views.state.detached_at
+    abbrev = views.state.abbrev or meta.abbrev
+    return meta.sha[:abbrev] if meta.sha and abbrev else None
+
+
 def head_line(views: Views, meta: GitMeta) -> str:
-    if views.state.detached:
+    if _is_detached(views, meta):
+        if _names_detached_commit(views, meta):
+            short = _detached_short(views, meta) or meta.sha[:DEFAULT_ABBREV]
+            return DETACHED_AT_HEADER.format(short=short)
         return DETACHED_HEADER
-    if views.state.branch:
-        return BRANCH_HEADER.format(branch=views.state.branch)
-    if meta.detached:
-        return DETACHED_HEADER
-    return BRANCH_HEADER.format(branch=meta.branch or DEFAULT_BRANCH)
+    return BRANCH_HEADER.format(branch=views.state.branch or meta.branch or DEFAULT_BRANCH)
 
 
 def _render_status_long(views: Views, meta: GitMeta, scope: list[str]) -> list[str]:
@@ -220,6 +240,8 @@ def _run_status(plan: GitPlan, views: Views, meta: GitMeta) -> GitResult | Parse
     if {"-s", "--short", "--porcelain"} & plan.flags:
         lines = _render_status_short(views, scope)
     else:
+        if _names_detached_commit(views, meta) and not _detached_short(views, meta):
+            return ParseFailure("unsupported_form", "short hash of the detached HEAD unknown")
         lines = _render_status_long(views, meta, scope)
     lines = apply_pipeline(lines, plan.pipeline)
     return GitResult(output="\n".join(lines), empty=not lines)
@@ -573,7 +595,13 @@ def _run_branch(plan: GitPlan, views: Views, meta: GitMeta) -> GitResult | Parse
         return ParseFailure("unsupported_form", "branch form")
     if views.state.branch or not (views.state.detached or meta.detached):
         return ParseFailure("unsupported_form", "the branches of a checkout on one")
-    lines = apply_pipeline(["* (no branch)"], plan.pipeline)
+    current = "* (no branch)"
+    if _names_detached_commit(views, meta):
+        short = _detached_short(views, meta)
+        if short is None:
+            return ParseFailure("unsupported_form", "short hash of the detached HEAD unknown")
+        current = f"* (HEAD detached at {short})"
+    lines = apply_pipeline([current], plan.pipeline)
     return GitResult(output="\n".join(lines), empty=not lines)
 
 

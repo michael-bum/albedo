@@ -4,8 +4,8 @@
 > Miners fine-tune **Qwen3.6-35B-A3B** models (MoE — 256 experts, 8 active per token;
 > multimodal Qwen3VL architecture) and commit them on-chain; a backend pipeline ingests
 > commits, validates artifacts, runs a stability pre-eval, then duels each challenger
-> against the reigning king on coding trajectories from four datasets — mini-coder (400k),
-> mini-coder-rs, open-swe-traces and swe-hero — pooled one source trajectory per instance and stratified by
+> against the reigning king on coding trajectories from six datasets — mini-coder (400k),
+> mini-coder-rs, open-swe-traces v1.0, v1.1 and v1.2, and swe-hero — pooled one source trajectory per instance and stratified by
 > phase x bug family. Between turns, each model's shell command is answered by the
 > **repo-context service**, which checks out the real repository at the sampled commit and *executes*
 > the command against it — so `git`, `grep`, `find`, `sed` and friends return real output, and the
@@ -195,7 +195,7 @@ albedo/
 │   ├── MINING.md                   miner-facing guide for the `albedo` CLI
 │   ├── PRIVATE_UPLOADS.md          private R2 submissions: activate → upload → ready; retries are miner-claimed (`albedo activate` again) and the validator's plaintext status.json in the mailbox says why the last attempt failed
 │   ├── SCORING.md                  checklist construction, loop short-circuit, win margin, anti-gaming
-│   ├── DATASETS.md                 the four corpora, observation formats, grounding + simulator ladder, sampling, manifest pin
+│   ├── DATASETS.md                 the six corpora, observation formats, grounding + simulator ladder, sampling, manifest pin
 │   ├── eval-service-status.md      eval-stack runbook (services, ports, PM2, smoke mode)
 │   └── reign-and-weight-pm2.md     set-reign + weight-setter dev notes
 │
@@ -543,7 +543,7 @@ length ...]` or `<warning>`/`<output_head>` inside an observation is the environ
 command output, as the scaffold does (no effect). Full detail: docs/SCORING.md.
 
 **Deterministic sampling:** `shared/sampling.py` (`multi_source_manifest_sample_ids`) draws `sample_count`
-(100) **unique `instance_id`s** pooled across all four sources, one **random source trajectory** per instance,
+(100) **unique `instance_id`s** pooled across all six sources, one **random source trajectory** per instance (drawn from every rollout of it the datasets keep),
 stratified by `STEP_TRIM` phase (`cold` 65 / `pre_edit` 15 / `at_edit` 20, anchored on the
 instance's `first_edit`) x `FAMILY_MIX` bug family (`pr` 50 / `lm` 15 / `combine` 10 /
 `mechanical` 25), with `REPO_CAP` 2 per repo, 30% non-`python`, and prefixes over
@@ -733,7 +733,7 @@ Full reference in [.env.example](../.env.example) (backend + GPU host) and [.env
 | `ALBEDO_EVAL_DATABASE_URL` | DSN for the whole eval stack |
 | `ALBEDO_POSTGRES_*` | docker-compose local Postgres (a localhost-only port) |
 | `ALBEDO_EVAL_REMOTE_AUTH_TOKEN` | shared bearer for backend↔remote eval API |
-| `ALBEDO_EVAL_DATASET_MANIFEST_HASH` | sha256 pin of the four-source shard manifest (mini-coder, mini-coder-rs, open-swe-traces, swe-hero) |
+| `ALBEDO_EVAL_DATASET_MANIFEST_HASH` | sha256 pin of the six-source shard manifest (mini-coder, mini-coder-rs, open-swe-traces-v1.0/-v1.1/-v1.2, swe-hero) |
 | `ALBEDO_EVAL_SAMPLE_COUNT` | duel size — unique instances sampled per eval (default 100) |
 | `ALBEDO_EVAL_PREFETCH_NEXT_CHALLENGER` | pre-download the next queued challenger during the running eval (default true) |
 
@@ -880,10 +880,10 @@ uv run ruff check src/ && uv run ruff format src/                 # lint
 
 - **Dashboard:** static site in `website/`; reads `data/dashboard.json` + `data/state.json`, published to
   Hippius S3 by `website/monitor.py` (live, on-change) or `website/push_to_hippius.py` (one-shot)
-- **Datasets** (four sources, pooled one-source-trajectory-per-instance and stratified by phase x bug family — see docs/DATASETS.md):
+- **Datasets** (six sources, pooled one-source-trajectory-per-instance and stratified by phase x bug family — see docs/DATASETS.md):
   - mini-coder (400k, python): https://huggingface.co/datasets/ricdomolm/mini-coder-trajs-400k
   - mini-coder-rs (rust, SWE-smith-rs): https://huggingface.co/datasets/AlienKevin/SWE-smith-rs-gpt-5-mini-trajectories
-  - open-swe-traces (4 arms): https://huggingface.co/datasets/nvidia/Open-SWE-Traces
+  - open-swe-traces-v1.0 / -v1.1 / -v1.2 (one source per upstream release, each pinned to its own revision): https://huggingface.co/datasets/nvidia/Open-SWE-Traces
   - swe-hero (OpenHands): https://huggingface.co/datasets/nvidia/SWE-Hero-openhands-trajectories
   - shard manifest (per-source weights + sha256s): https://albedo.tech/datasets/manifest.json
 - **Mining guide:** [docs/MINING.md](../docs/MINING.md)

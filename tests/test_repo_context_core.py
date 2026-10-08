@@ -24,8 +24,10 @@ from repo_context_service.core import (
     _NEGATIVE_TTL_SECONDS,
     _SHA_RULE,
     _TRANSIENT_TTL_SECONDS,
+    SCAFFOLDS,
     GroundingContext,
     RepoContextService,
+    Scaffold,
     _data_words,
     _editor_view,
     _filter_listing,
@@ -36,6 +38,8 @@ from repo_context_service.core import (
     _smith_mirror,
     _SnapshotTooLarge,
     parse_instance,
+    scaffold_for,
+    source_family,
 )
 
 FULL_SHA = "abcdef1234567890abcdef1234567890abcdef12"
@@ -92,6 +96,56 @@ def test_parse_instance_formats():
     assert parse_instance("swe-zero", "owner__repo-notanumber") is None
     assert parse_instance("mini-coder", "noseparator") is None
     assert parse_instance("mini-coder", "owner__repo.ZZZZZZ") is None
+
+
+def test_scale_swe_machines_have_their_own_scaffold():
+    rebench, scale = "owner__repo-12", "owner_repo_pr12"
+    v10 = scaffold_for("open-swe-traces-v1.0", "openhands", rebench)
+    assert v10 is SCAFFOLDS[("open-swe-traces", "openhands")] and v10.detached
+    oh = scaffold_for("open-swe-traces-v1.1", "openhands", scale)
+    assert (oh.branch, oh.detached) == ("scaleswe", False)
+    assert scaffold_for("open-swe-traces-v1.1", "swe_agent", scale).detached_at
+    mswea = scaffold_for("open-swe-traces-v1.1", "returncode", rebench)
+    assert (mswea.shell, mswea.detached, mswea.detached_at) == ("dash", True, False)
+    assert scaffold_for("open-swe-traces-v1.1", "returncode", scale).detached_at
+    v12 = scaffold_for("open-swe-traces-v1.2", "returncode", scale)
+    assert (v12.branch, v12.detached) == ("scaleswe", False)
+    assert scaffold_for("mini-coder", "returncode", "a__b.1234567.pr_1").shell == "bash"
+    assert scaffold_for("unknown-source", "openhands") == Scaffold()
+
+
+def test_affine_machines_have_their_own_scaffolds():
+    rebench, scale, smith = "owner__repo-12", "owner_repo_pr12", "a__b.1234567.lm_modify__x"
+    oh = scaffold_for("affine-openhands", "returncode", rebench)
+    assert (oh.columns, oh.decorate, oh.detached, oh.editor) == (core._ANY_WIDTH, True, False, "")
+    shells = {
+        "mswea": ("/bin/sh: 1: ", "dash"),
+        "bash": ("bash: line 1: ", "bash"),
+        "tools": ("/bin/bash: line 1: ", "bash"),
+    }
+    for machine, (errors, shell) in shells.items():
+        pr = scaffold_for(f"affine-{machine}", "returncode", rebench)
+        assert (pr.errors, pr.shell, pr.detached, pr.branch) == (errors, shell, False, "")
+        on_branch = scaffold_for(f"affine-{machine}", "returncode", scale)
+        assert (on_branch.errors, on_branch.branch, on_branch.detached) == (
+            errors,
+            "scaleswe",
+            False,
+        )
+        mirror = scaffold_for(f"mini-coder-affine-{machine}", "returncode", smith)
+        assert (mirror.errors, mirror.shell) == (errors, shell)
+
+
+def test_a_versioned_source_shares_its_family_scaffold():
+    assert source_family("open-swe-traces-v1.0") == "open-swe-traces"
+    assert source_family("open-swe-traces-v1.2") == "open-swe-traces"
+    assert source_family("mini-coder-rs") == "mini-coder-rs"
+    assert source_family("swe-hero") == "swe-hero"
+    for fmt in ("openhands", "swe_agent"):
+        assert (
+            SCAFFOLDS.get((source_family("open-swe-traces-v1.1"), fmt))
+            is SCAFFOLDS[("open-swe-traces", fmt)]
+        )
 
 
 def test_grounding_and_the_replay_read_the_command_the_judge_reads(tmp_path, monkeypatch):
@@ -1253,6 +1307,18 @@ def test_a_cd_moves_the_stages_after_it(tmp_path, monkeypatch):
     assert failed.exact_returncode == 1
 
 
+def test_mini_swe_agent_commands_fail_in_dash_words(tmp_path, monkeypatch):
+    service = make_service(tmp_path)
+    make_snapshot(service, {"a.py": "alpha\n"})
+    monkeypatch.setattr(service, "_resolve_sha", lambda ref: ("o", "r", FULL_SHA))
+
+    failed = service.repo_context_for_instance(
+        "open-swe-traces-v1.2", "o__r-12", "```bash\ncd missing && cat a.py\n```", fmt="returncode"
+    )
+    assert failed.exact_output == "/bin/sh: 1: cd: can't cd to missing"
+    assert failed.exact_returncode == 2
+
+
 def test_a_missing_path_is_reported_unless_an_observation_showed_it(tmp_path, monkeypatch):
     service = make_service(tmp_path)
     make_snapshot(service, {"a.py": "alpha\n"})
@@ -1360,6 +1426,45 @@ def test_resolve_sha_swe_hero_uses_the_parent_of_the_fix_commit(tmp_path, monkey
     monkeypatch.setattr(service, "_github_json", fake_github_json)
     ref = parse_instance("swe-hero", f"pandas-dev__pandas-{fix}")
     assert service._resolve_sha(ref) == ("pandas-dev", "pandas", parent)
+
+
+def test_resolve_sha_affine_r2e_ids_use_the_parent_of_the_fix_commit(tmp_path, monkeypatch):
+    service = make_service(tmp_path)
+    fix, parent = "4a" * 20, "5b" * 20
+    monkeypatch.setattr(
+        service,
+        "_github_json",
+        lambda path: {"sha": fix, "commit": {"message": "x"}, "parents": [{"sha": parent}]},
+    )
+    ref = parse_instance("affine-mswea", f"pandas-dev__pandas-{fix}")
+    assert service._resolve_sha(ref) == ("pandas-dev", "pandas", parent)
+
+
+def test_resolve_sha_affine_smith_ids_are_cached_apart_from_mini_coder_rs(tmp_path, monkeypatch):
+    """Affine's Rust machines ran at the branch head, mini-coder-rs's at Bug Patch: one id, two
+    trees."""
+    service = make_service(tmp_path)
+    monkeypatch.setattr(
+        service,
+        "_github_json",
+        lambda path: _smith_head("Remove F2P Tests", "Bug Patch", "Initial commit"),
+    )
+    mirror = "BurntSushi__ripgrep.3b7fd442"
+    assert service._resolve_sha(parse_instance("mini-coder-rs", SMITH_ID)) == (
+        "swesmith",
+        mirror,
+        BUG_SHA,
+    )
+    assert service._resolve_sha(parse_instance("mini-coder-affine-tools", SMITH_ID)) == (
+        "swesmith",
+        mirror,
+        HEAD_SHA,
+    )
+    assert service._resolve_sha(parse_instance("mini-coder-rs", SMITH_ID)) == (
+        "swesmith",
+        mirror,
+        BUG_SHA,
+    )
 
 
 def test_resolve_sha_plain_commit_ids_keep_using_the_commit_itself(tmp_path, monkeypatch):

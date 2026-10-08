@@ -33,7 +33,8 @@ function renderHero(d) {
       ? (repoUrl ? el("a", { href: repoUrl, target: "_blank", rel: "noopener" }, kingTitleName(king.king_version))
                  : kingTitleName(king.king_version))
       : "ALBEDO");
-  mount($("hero-sub"), king ? (dendriteRepo(king.king_version) || modelRepo(king.model_uri)) : "");
+  const repo = king ? (dendriteRepo(king.king_version) || modelRepo(king.model_uri)) : "";
+  mount($("hero-sub"), repo && repoUrl ? el("a", { href: repoUrl, target: "_blank", rel: "noopener" }, repo) : repo);
 }
 
 function renderStats(d) {

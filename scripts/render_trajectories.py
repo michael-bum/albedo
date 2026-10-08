@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
 from collections import Counter
+from itertools import zip_longest
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +16,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from prepare_datasets import SOURCES
+from prepare_datasets import LEAKS, SOURCES, raw_dir, raw_globs
 
 from albedo_eval_service.simulator.prompt_simulator import COMPLETE_MARKER
 
@@ -113,16 +115,76 @@ def _thought(turn: dict) -> str:
     return ""
 
 
+_MSWEA_KEYS = {"returncode", "output", "output_head", "output_tail", "elided_chars", "warning"}
+
+
+def _mswea_observation(content: str) -> dict | None:
+    """mini-swe-agent's tool-calling harness reports a command as a JSON object."""
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict) or "returncode" not in data:
+        return None
+    if not set(data) - {"exception_info"} <= _MSWEA_KEYS:
+        return None
+    return data
+
+
+def _render_mswea(data: dict) -> str:
+    """The JSON as mini-swe-agent's text harness prints it (the `<returncode>` format mini-coder
+    is recorded in), so the eval's returncode simulation serves these samples too."""
+    head = f"<returncode>{data['returncode']}</returncode>\n"
+    if data.get("exception_info"):
+        head += f"<exception_info>{data['exception_info']}</exception_info>\n"
+    if "output_head" in data:
+        return (
+            f"{head}<warning>\n{data.get('warning') or ''}\n</warning>"
+            f"<output_head>\n{data['output_head']}\n</output_head>\n"
+            f"<elided_chars>\n{data.get('elided_chars')} characters elided\n</elided_chars>\n"
+            f"<output_tail>\n{data.get('output_tail') or ''}\n</output_tail>"
+        )
+    return f"{head}<output>\n{data.get('output') or ''}</output>"
+
+
+def _is_mswea(turns: list) -> bool:
+    for turn in turns:
+        if isinstance(turn, dict) and str(turn.get("role") or "").lower() == "tool":
+            content = str(turn.get("content") or "").strip()
+            if content:
+                return _mswea_observation(content) is not None
+    return False
+
+
+def _observation(turn: dict, mswea: bool) -> str:
+    observation = str(turn.get("content") or "").strip()
+    if mswea:
+        data = _mswea_observation(observation)
+        if data is not None:
+            return _render_mswea(data)
+    return observation
+
+
 def render_turns(turns: list, *, stats: Counter | None = None) -> tuple[list[dict], int]:
     stats = stats if stats is not None else Counter()
     out: list[dict] = []
     pending_thought = ""
     assistant_index = 0
     first_edit = 0
+    turns = [t for t in turns if isinstance(t, dict)]
+    mswea = _is_mswea(turns)
+    if mswea:
+        stats["mswea_rows"] += 1
 
-    for turn in turns:
-        if not isinstance(turn, dict):
-            continue
+    def observe(turn: dict) -> None:
+        observation = _observation(turn, mswea)
+        if observation and _THOUGHT_LOGGED not in observation.lower():
+            out.append({"role": "user", "content": observation})
+
+    index = 0
+    while index < len(turns):
+        turn = turns[index]
+        index += 1
         role = str(turn.get("role") or "").lower()
 
         if role in {"system", "user"}:
@@ -132,10 +194,7 @@ def render_turns(turns: list, *, stats: Counter | None = None) -> tuple[list[dic
             continue
 
         if role == "tool":
-            observation = str(turn.get("content") or "").strip()
-            if not observation or _THOUGHT_LOGGED in observation.lower():
-                continue
-            out.append({"role": "user", "content": observation})
+            observe(turn)
             continue
 
         if role != "assistant":
@@ -147,25 +206,40 @@ def render_turns(turns: list, *, stats: Counter | None = None) -> tuple[list[dic
             pending_thought = "\n\n".join(p for p in (pending_thought, thought) if p)
             continue
 
-        rendered, is_edit, kind = _render_call(calls[0])
-        if kind == "think":
-            pending_thought = "\n\n".join(p for p in (pending_thought, thought, rendered) if p)
-            stats["think_folded"] += 1
-            continue
-        if kind == "unknown" or not rendered:
-            stats["unknown_tool"] += 1
-            continue
-
-        full_thought = "\n\n".join(p for p in (pending_thought, thought) if p)
-        pending_thought = ""
-        body = f"THOUGHT: {full_thought}\n\n{rendered}" if full_thought else rendered
-        out.append({"role": "assistant", "content": body})
-        assistant_index += 1
-        if is_edit and not first_edit:
-            first_edit = assistant_index
-        stats[f"kind_{kind}"] += 1
+        # a turn that runs several commands at once becomes one turn per command, each followed
+        # by its own result, so no command or result of the turn is dropped
+        results: list[dict] = []
+        while index < len(turns) and str(turns[index].get("role") or "").lower() == "tool":
+            results.append(turns[index])
+            index += 1
         if len(calls) > 1:
-            stats["multi_call_truncated"] += 1
+            stats["multi_call_split"] += 1
+
+        for call, result in zip_longest(calls, results[: len(calls)]):
+            rendered, is_edit, kind = _render_call(call)
+            if kind == "think":
+                pending_thought = "\n\n".join(p for p in (pending_thought, thought, rendered) if p)
+                thought = ""
+                stats["think_folded"] += 1
+                continue
+            if kind == "unknown" or not rendered:
+                stats["unknown_tool"] += 1
+                if result is not None:
+                    observe(result)
+                continue
+
+            full_thought = "\n\n".join(p for p in (pending_thought, thought) if p)
+            pending_thought = thought = ""
+            body = f"THOUGHT: {full_thought}\n\n{rendered}" if full_thought else rendered
+            out.append({"role": "assistant", "content": body})
+            assistant_index += 1
+            if is_edit and not first_edit:
+                first_edit = assistant_index
+            stats[f"kind_{kind}"] += 1
+            if result is not None:
+                observe(result)
+        for result in results[len(calls) :]:
+            observe(result)
 
     return out, first_edit
 
@@ -187,23 +261,29 @@ def _repo_of(row: dict, instance_id: str) -> str:
     return instance_id.split(".")[0]
 
 
-def _keep(row: dict, instance_id: str, spec: dict, seen_repos: Counter) -> str | None:
-    if instance_id in spec.get("exclude_ids", ()):
+def _keep(row: dict, instance_id: str, spec: dict, repo_tasks: dict[str, set[str]]) -> str | None:
+    if instance_id in LEAKS:
         return "excluded_id"
     upstream = str(row.get("hf_dataset_name") or row.get("dataset") or "")
     if any(bad in upstream for bad in spec.get("exclude_upstream", ())):
         return "excluded_upstream"
+    # the cap counts a repository's tasks, so every rollout of a task already admitted is kept
     cap = spec.get("repo_cap")
-    if cap and seen_repos[_repo_of(row, instance_id)] >= cap:
+    tasks = repo_tasks.get(_repo_of(row, instance_id), set())
+    if cap and instance_id not in tasks and len(tasks) >= cap:
         return "repo_cap"
     return None
+
+
+def _trajectory_key(instance_id: str, messages: list[dict]) -> str:
+    return hashlib.sha256(json.dumps([instance_id, messages]).encode("utf-8")).hexdigest()
 
 
 def _raw_shards(raw_root: Path, spec: dict) -> list[Path]:
     files: list[Path] = []
     for repo in spec["repos"]:
-        base = raw_root / repo.split("/")[-1]
-        files.extend(sorted(base.glob(spec.get("raw_glob", "data/train-*.parquet"))))
+        base = raw_root / raw_dir(spec, repo)
+        files.extend(sorted({p for g in raw_globs(spec) for p in base.glob(g)}))
     return files
 
 
@@ -227,8 +307,10 @@ def render_source(
     out_dir = out_root / name / "data"
     out_dir.mkdir(parents=True, exist_ok=True)
     stats: Counter = Counter()
-    seen_repos: Counter = Counter()
-    seen_ids: set[str] = set()
+    # every rollout of a task is kept (the sampler draws one per task per eval); only a
+    # rollout that renders identically to one already kept is dropped
+    repo_tasks: dict[str, set[str]] = {}
+    seen_trajectories: set[str] = set()
     buffer: list[dict] = []
     written = 0
 
@@ -267,10 +349,7 @@ def render_source(
                 if not instance_id:
                     stats["no_instance_id"] += 1
                     continue
-                if instance_id in seen_ids:
-                    stats["duplicate_instance"] += 1
-                    continue
-                reason = _keep(row, instance_id, spec, seen_repos)
+                reason = _keep(row, instance_id, spec, repo_tasks)
                 if reason:
                     stats[reason] += 1
                     continue
@@ -282,9 +361,13 @@ def render_source(
                 if any(not m["content"] for m in messages):
                     stats["empty_content_dropped"] += 1
                     continue
+                key = _trajectory_key(instance_id, messages)
+                if key in seen_trajectories:
+                    stats["duplicate_trajectory"] += 1
+                    continue
+                seen_trajectories.add(key)
                 repo = _repo_of(row, instance_id)
-                seen_repos[repo] += 1
-                seen_ids.add(instance_id)
+                repo_tasks.setdefault(repo, set()).add(instance_id)
                 family = spec.get("family") or smith_family(instance_id)
                 buffer.append(
                     {

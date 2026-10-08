@@ -1,8 +1,8 @@
 import { el, mount } from "../dom.js";
 import { pct, fmtRelative } from "../format.js";
 import { modelRepo, kingTitleName } from "../model.js";
-import { PULLED_SUITES, PREDS_STALE_MS, REFERENCE_MODEL_URLS } from "../config.js";
-import { benchmarkRegistry, mergeDistributedResults, distributedRunFor, distributedProgress } from "../results.js";
+import { PULLED_SUITES, PREDS_STALE_MS, REFERENCE_MODEL_URLS, TILE_REFERENCE_REPOS } from "../config.js";
+import { benchmarkRegistry, mergeDistributedResults, distributedRunFor, distributedProgress, repoLabel } from "../results.js";
 
 const MODEL_SCORE_SUITE = "model_score";
 
@@ -406,7 +406,7 @@ function svgEl(tag, attrs = {}, ...children) {
 const SPARK_KINGS = 20;
 
 // `comparisons`: the non-king models (genesis, GLM 5.2, ...) listed under the king in the hover tip
-function renderSpark(sorted, suite, baselineScore = null, width = 360, comparisons = []) {
+function renderSpark(sorted, suite, baselineScore = null, width = 360, comparisons = [], baselineLabel = "genesis") {
   // a fixed window of the last SPARK_KINGS kings: a new king adds a slot even before it has a
   // score, so the line shifts left as reigns change instead of stretching over all history
   const slots = sorted.filter(model => !isGenesis(model)).slice(0, SPARK_KINGS).reverse();
@@ -447,7 +447,7 @@ function renderSpark(sorted, suite, baselineScore = null, width = 360, compariso
     svg.append(svgEl("line", {
       x1: 6, y1: by.toFixed(1), x2: width - 6, y2: by.toFixed(1),
       stroke: "var(--color-gold)", "stroke-width": 1, "stroke-dasharray": "3 3", opacity: 0.55,
-    }, svgEl("title", {}, `genesis ${panelScore(baselineScore)}`)));
+    }, svgEl("title", {}, `${baselineLabel} ${panelScore(baselineScore)}`)));
   }
   if (coords.length > 1) {
     svg.append(svgEl("polyline", {
@@ -498,17 +498,26 @@ function withSparkHover(svg, coords, width, bestIdx, { top, floor }, comparisons
     guide.setAttribute("x1", c.x.toFixed(1));
     guide.setAttribute("x2", c.x.toFixed(1));
     guide.setAttribute("visibility", "visible");
+    // two columns: names on the left, every percentage right-aligned in one column
     tip.replaceChildren(
+      el("span", { class: "spark-tip-king" }, c.point.label),
       el("b", { class: index === bestIdx ? "best" : "" }, panelScore(c.point.score)),
-      el("span", {}, c.point.label),
-      comparisons.length
-        ? el("div", { class: "spark-tip-refs" }, comparisons.map(({ label, score }) =>
-            el("span", {}, `${label} ${score == null ? "—" : panelScore(score)}`)))
-        : null);
+      ...(comparisons.length ? [el("i", { class: "spark-tip-rule" })] : []),
+      ...comparisons.flatMap(({ label, score }) => [
+        el("span", {}, label),
+        el("span", { class: "spark-tip-score" }, score == null ? "—" : panelScore(score)),
+      ]));
     tip.hidden = false;
-    const left = (c.x / width) * rect.width;
-    tip.style.left = `${left}px`;
-    tip.dataset.side = left > rect.width / 2 ? "left" : "right";
+    // beside the point, on the side facing the chart's middle unless only the other side fits
+    // on screen; failing both, pinned 8px inside the viewport
+    const x = (c.x / width) * rect.width;
+    const tipWidth = tip.offsetWidth;
+    const viewport = document.documentElement.clientWidth;
+    const fitsLeft = rect.left + x - 8 - tipWidth >= 8;
+    const fitsRight = rect.left + x + 8 + tipWidth <= viewport - 8;
+    const onLeft = x > rect.width / 2 ? fitsLeft || !fitsRight : fitsLeft && !fitsRight;
+    const wanted = onLeft ? x - 8 - tipWidth : x + 8;
+    tip.style.left = `${Math.max(8 - rect.left, Math.min(wanted, viewport - 8 - rect.left - tipWidth))}px`;
   });
   svg.addEventListener("pointerleave", hide);
   svg.addEventListener("pointercancel", hide);
@@ -536,7 +545,18 @@ function renderProgress(preds, label, neutral = false) {
     el("div", { class: "bench-tile-progress-note" }, [label, ...state].filter(Boolean).join(" · ")));
 }
 
-function renderTile(model, suite, sorted, baseline, activity, preds, backfills = [], references = []) {
+// The rows under a tile's chart, one grid so the columns line up: the role tag (genesis /
+// reference), the model's name, its score in a column of its own, the king's delta against it.
+function renderTileComparisons(rows) {
+  return el("div", { class: "bench-tile-compare" }, rows.flatMap(({ role, name, vs, title }) => [
+    el("span", { class: "bench-tile-role" }, role),
+    el("span", { class: "bench-tile-model", title: name }, name),
+    el("span", { class: "bench-tile-model-score" }, vs.value),
+    el("span", { class: `bench-delta ${vs.cls}`, title }, vs.delta),
+  ]));
+}
+
+function renderTile(model, suite, sorted, baseline, activity, preds, backfills = [], references = [], genesisName = "") {
   const entry = suiteScores(model)[suite];
   const distributed = distributedRunFor(model, suite);
   const scored = entry?.score != null;
@@ -566,7 +586,7 @@ function renderTile(model, suite, sorted, baseline, activity, preds, backfills =
     .map(ref => ({ ref, label: modelLabel(ref), entry: suiteScores(ref)[suite] }))
     .map(r => ({ ...r, entry: r.entry?.score != null ? r.entry : null }));
   const comparisons = [
-    { label: "genesis", score: baseline?.score ?? null },
+    { label: genesisName || "genesis", score: baseline?.score ?? null },
     ...referenceScores.map(r => ({ label: r.label, score: r.entry?.score ?? null })),
   ];
   const chartSvgElement = el("div", { class: "bench-tile-chart" });
@@ -575,7 +595,7 @@ function renderTile(model, suite, sorted, baseline, activity, preds, backfills =
     const w = Math.round(entries[0].contentRect.width);
     if (!w || w === chartWidth) return;
     chartWidth = w;
-    chartSvgElement.replaceChildren(renderSpark(sorted, suite, baseline?.score, w, comparisons));
+    chartSvgElement.replaceChildren(renderSpark(sorted, suite, baseline?.score, w, comparisons, genesisName || "genesis"));
   });
   chartObserver.observe(chartSvgElement);
 
@@ -586,8 +606,11 @@ function renderTile(model, suite, sorted, baseline, activity, preds, backfills =
   },
     el("div", { class: "bench-tile-head" },
       el("div", { class: "bench-tile-name" }, benchmarkLabel(suite)),
-      el("span", { class: live ? "bench-tile-activity live" : "bench-tile-activity" },
-        live ? "running" : backfilling.length ? "backfilling" : "idle")),
+      // an idle tile says nothing; only running and backfilling are worth a word
+      live || backfilling.length
+        ? el("span", { class: live ? "bench-tile-activity live" : "bench-tile-activity" },
+            live ? "running" : "backfilling")
+        : null),
     el("div", { class: "bench-tile-main" },
       el("div", { class: "bench-tile-score-wrap" },
         el(href ? "a" : "span", { class: "bench-tile-score", href },
@@ -602,15 +625,12 @@ function renderTile(model, suite, sorted, baseline, activity, preds, backfills =
         el("strong", {}, previous.delta),
         el("span", {}, "since last"))),
     chartSvgElement,
-    el("div", { class: "bench-tile-status" },
-      el("span", { class: "bench-genesis-value" }, `genesis ${genesis.value}`),
-      el("span", { class: `bench-delta ${genesis.cls}`, title: "delta vs genesis" }, genesis.delta)),
-    referenceScores.map(({ label, entry: refEntry }) => {
-      const vs = baselineComparison(entry, refEntry);
-      return el("div", { class: "bench-tile-status" },
-        el("span", { class: "bench-genesis-value" }, `${label} ${vs.value}`),
-        el("span", { class: `bench-delta ${vs.cls}`, title: `delta vs ${label}` }, vs.delta));
-    }),
+    renderTileComparisons([
+      { role: "genesis", name: genesisName, vs: genesis, title: "delta vs genesis" },
+      ...referenceScores.filter(({ ref }) => TILE_REFERENCE_REPOS.includes(ref.model_repo))
+        .map(({ label, entry: refEntry }) =>
+          ({ role: "reference", name: label, vs: baselineComparison(entry, refEntry), title: `delta vs ${label}` })),
+    ]),
     progress ? renderProgress(progress, progress.kingLabel || modelLabel(model))
       : backfillBars.length ? backfillBars
       : runNote ? el("div", { class: "bench-tile-run-note" }, runNote) : null);
@@ -868,7 +888,8 @@ export function renderBenchmarks(container, metaNode, data, scoresBySuite = null
     if (metaNode) metaNode.textContent = "no data";
     return;
   }
-  const baselineScores = suiteScores((data?.models || []).find(isGenesis));
+  const genesisModel = (data?.models || []).find(isGenesis);
+  const baselineScores = suiteScores(genesisModel);
   const activity = suiteActivity(data);
   const predsBySuite = new Map(PULLED_SUITES.map(pulled => {
     const live = liveBySuite?.get(pulled.suite) || null;
@@ -881,13 +902,11 @@ export function renderBenchmarks(container, metaNode, data, scoresBySuite = null
     return [pulled.suite, preds];
   }));
   const rerender = () => renderBenchmarks(container, metaNode, data, scoresBySuite, liveBySuite, resultsManifest);
-  const scores = suiteScores(selected);
-  const done = BENCHMARK_ORDER.filter(suite => scores[suite]?.score != null).length;
 
   mount(container,
     el("section", { class: "bench-panel" },
       el("div", { class: "bench-panel-head" },
-        el("span", {}, "benchmark panel"),
+        el("span", {}, modelLabel(selected)),
         el("div", { class: "bench-panel-tools" },
           el("button", { class: "bench-history-toggle", type: "button", onClick: () => {
             benchMode = benchMode === "top" ? "all" : "top";
@@ -898,12 +917,11 @@ export function renderBenchmarks(container, metaNode, data, scoresBySuite = null
               historySort = "#";
             }
             rerender();
-          } }, benchMode === "top" ? "show all kings" : "top 5"),
-          el("span", { class: "bench-panel-meta" },
-            `${done}/${BENCHMARK_ORDER.length} scores · ${modelLabel(selected)}`))),
+          } }, benchMode === "top" ? "show all kings" : "top 5"))),
       el("div", { class: "bench-tile-grid" }, BENCHMARK_ORDER.map(suite =>
         renderTile(selected, suite, sorted, baselineScores[suite], activity.get(suite),
-          predsBySuite.get(suite) || null, backfills.get(suite) || [], references))),
+          predsBySuite.get(suite) || null, backfills.get(suite) || [], references,
+          repoLabel(genesisModel?.model_repo)))),
       benchMode === "all"
         ? renderKingHistory(sorted, selected, rerender, references)
         : renderLeaderboard(sorted, selected, baselineScores, rerender, references)));

@@ -53,6 +53,9 @@ export const REFERENCE_MODEL_URLS = {
   "z-ai/glm-5.2": "https://huggingface.co/zai-org/GLM-5.2",
 };
 
+// The reference models listed under each benchmark tile's chart; the chart's hover tip keeps them all.
+export const TILE_REFERENCE_REPOS = ["z-ai/glm-5.3-flash"];
+
 export const LLMS_URLS = [
   "./llms.txt",
 ];

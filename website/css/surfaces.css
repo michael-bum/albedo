@@ -1,0 +1,26 @@
+:root {
+  --color-bg: #131313;          /* page (was #1c1c1c) */
+  --color-bg-deep: #171717;     /* tooltips, code wells, scrollbar tracks: between page and card */
+  --color-surface: #1c1c1c;     /* cards and panels: the old page color (was #1f1f1f) */
+  --color-card-border: rgba(255, 255, 255, 0.07);
+}
+
+.data-table-wrap, .bench-tile, .registration-chart, .queue-panel, .hero-chart {
+  background: var(--color-surface);
+  border: 1px solid var(--color-card-border);
+  border-radius: 4px;
+}
+.hero-chart { padding: 12px 14px 6px; }
+table.data-table thead { background: var(--color-surface); }
+.data-table-wrap table.data-table tbody tr:last-child { border-bottom: 0; }
+.registration-plot .reg-active { stroke: var(--color-surface); }
+.bench-panel { background: none; border: 0; border-radius: 0; padding: 0; }
+
+
+#hero-chart:empty { min-height: 220px; }
+#benchmarks-wrap > .loading { min-height: 865px; }
+@media (max-width: 1100px) { #benchmarks-wrap > .loading { min-height: 1059px; } }
+@media (max-width: 760px) { #benchmarks-wrap > .loading { min-height: 1036px; } }
+@media (max-width: 520px) { #benchmarks-wrap > .loading { min-height: 1677px; } }
+#reign-wrap > .loading { min-height: 199px; }
+#datasets-wrap > .loading { min-height: 190px; }

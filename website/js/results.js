@@ -49,8 +49,8 @@ const rowKey = row => (row.reign === 0 ? "genesis" : row.model_repo);
 // own slug. They are not kings: they join the data flagged `reference`, never matched to a king.
 const isReferenceRow = row => row.reign == null && !String(row.model_key || "").startsWith("king-");
 
-// "z-ai/glm-5.2" -> "GLM 5.2"
-function referenceLabel(repo) {
+// "z-ai/glm-5.2" -> "GLM 5.2", "Qwen/Qwen3.6-35B-A3B" -> "Qwen3.6 35B A3B"
+export function repoLabel(repo) {
   return String(repo || "").split("/").pop().split("-")
     .map(part => (/^[a-z]+$/i.test(part) ? part.toUpperCase() : part))
     .join(" ");
@@ -71,7 +71,7 @@ export function mergeDistributedResults(data, manifest) {
         if (nonetRepos.has(row.model_repo) && !row.model_key.endsWith("-nonet")) continue;
         const ref = references.get(row.model_key) || {
           id: `reference:${row.model_key}`,
-          label: referenceLabel(row.model_repo),
+          label: repoLabel(row.model_repo),
           model_repo: row.model_repo,
           reference: true,
           runs: [],

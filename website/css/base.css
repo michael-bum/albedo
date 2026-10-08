@@ -90,6 +90,8 @@ main {
 }
 .hero-king a { color: inherit; transition: filter 0.15s; }
 .hero-king a:hover { filter: brightness(1.15); }
+.hero-sub a { color: inherit; transition: color 0.15s; }
+.hero-sub a:hover { color: var(--color-fg); }
 .hero-sub {
   margin-top: 8px;
   font-family: var(--font-mono); font-size: 11px; color: var(--color-fg-2);
@@ -111,7 +113,7 @@ main {
 .hero-llms:disabled { opacity: 0.5; cursor: wait; }
 .hero-llms svg { flex-shrink: 0; opacity: 0.85; }
 .hero-llms.copied { color: var(--color-ok); }
-/* Header buttons (King Chat, Albedo agent): grey surface, grey border, white text.
+/* Header buttons (GitHub, Albedo agent, King Chat): grey surface, grey border, white text.
    Overrides the fixed 28x28 icon sizing of .top-header .links a. */
 .top-header .links a.header-chat {
   width: auto; height: 28px;

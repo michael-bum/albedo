@@ -1,0 +1,51 @@
+.bench-tile-chart svg text { font-size: 10px; }
+
+@container (max-width: 300px) {
+  .bench-tile-compare { grid-template-columns: minmax(0, 1fr) auto auto; row-gap: 3px; }
+  .bench-tile-role { grid-column: 1 / -1; justify-self: start; min-width: 8.5em; }
+  .bench-tile-model { white-space: normal; }
+  .bench-tile-role ~ .bench-tile-role { margin-top: 5px; }
+}
+
+#benchmarks-wrap > .loading { min-height: 871px; }
+@media (max-width: 1100px) { #benchmarks-wrap > .loading { min-height: 1068px; } }
+@media (max-width: 760px) { #benchmarks-wrap > .loading { min-height: 1045px; } }
+@media (max-width: 520px) { #benchmarks-wrap > .loading { min-height: 1696px; } }
+
+.hero-eyebrow { letter-spacing: 0.16em; }
+.hero-king { font-weight: 600; letter-spacing: 0.08em; }
+.top-header .links a.header-chat { letter-spacing: 0.16em; }
+.section .head .label { letter-spacing: 0.16em; }
+.section .head .meta { letter-spacing: 0.08em; }
+.pill { letter-spacing: 0.08em; }
+table.data-table th { letter-spacing: 0.08em; }
+.queue-status { letter-spacing: 0.08em; }
+.verdict-badge { letter-spacing: 0.08em; }
+.fail-code { letter-spacing: 0.08em; }
+.detail-back { letter-spacing: 0.08em; }
+.detail-head .eyebrow { letter-spacing: 0.16em; }
+.fail-panel .fp-code { letter-spacing: 0.08em; }
+.rollout-label { letter-spacing: 0.08em; }
+.sample-flag { font-size: 10px; letter-spacing: 0.08em; }
+.q-head { letter-spacing: 0.08em; }
+.detail-section > h2 { letter-spacing: 0.16em; }
+.q-stage-badge, .q-status { font-size: 10px; }
+@media (max-width: 760px) { .q-stage-badge, .q-status { letter-spacing: 0.08em; } }
+.bench-score { font-size: 14px; }
+.bench-run-tabs button { letter-spacing: 0.08em; }
+.bench-state { letter-spacing: 0.08em; }
+.bench-run-tabs a { letter-spacing: 0.08em; }
+.bench-panel-head { letter-spacing: 0.16em; }
+.bench-baseline-tag { font-size: 10px; letter-spacing: 0.08em; }
+.bench-tile-activity { font-size: 10px; }
+.bench-tile-pass-count { font-size: 10px; }
+.bench-tile-change span { font-size: 10px; }
+.bench-tile-progress-note { font-size: 10px; }
+.spark-tip { letter-spacing: 0.08em; }
+.bench-tile-role { letter-spacing: 0.08em; }
+.bench-tile-model { letter-spacing: 0.08em; }
+.bench-tile-run-note { font-size: 10px; }
+.bench-history .bench-king-col { letter-spacing: 0.08em; }
+.keys-card-title { letter-spacing: 0.16em; }
+.keys-btn { letter-spacing: 0.08em; }
+.keys-table th { letter-spacing: 0.08em; }

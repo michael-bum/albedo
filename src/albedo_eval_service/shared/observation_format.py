@@ -134,14 +134,20 @@ def stuttered_lines(raw: str) -> str:
 
 
 def leaked_turn(raw: str) -> bool:
-    """A transcript turn served as shell output: it opens with a role marker, or it is prose that
-    ends in a fenced command. A file view that merely contains a fence mid-way is not one."""
+    """A transcript turn served as shell output: it opens with a role marker, carries the model's
+    own tool-call markup, or it is prose that ends in a fenced command. A file view that merely
+    contains a fence mid-way is not one."""
     text = (raw or "").strip()
-    if _ROLE_MARKER.match(text):
+    if _ROLE_MARKER.match(text) or tool_call_markup(text):
         return True
     body = observation_body(raw, classify(raw))
     blocks = list(_ACTION_BLOCK_RE.finditer(body))
     return bool(blocks) and not body[blocks[-1].end() :].strip()
+
+
+def tool_call_markup(raw: str) -> bool:
+    """The model answered with its own tool-call syntax (`<｜｜DSML｜｜ calls>`), not the output."""
+    return "｜DSML｜" in (raw or "")
 
 
 def echoed_command(command: str, raw: str) -> bool:

@@ -315,13 +315,16 @@ class RemoteEvalWorker:
             tokenizer_path=tokenizer_path,
             enable_thinking=True,
         )
-        return apply_submit_protocol(
-            samples,
-            salt=str(request.dataset.sample_seed),
-            keep_original_ratio=self.settings.submit_keep_original_ratio,
-            tokenizer_path=tokenizer_path,
-            enable_thinking=True,
-        )
+        return [
+            replace(sample, shared_messages=len(sample.messages or []))
+            for sample in apply_submit_protocol(
+                samples,
+                salt=str(request.dataset.sample_seed),
+                keep_original_ratio=self.settings.submit_keep_original_ratio,
+                tokenizer_path=tokenizer_path,
+                enable_thinking=True,
+            )
+        ]
 
     def _model_for_side(self, request: EvalRequest, *, side: str) -> str:
         if side == "previous_king":

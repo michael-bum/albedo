@@ -642,6 +642,7 @@ def _grounding_state(command: str = "grep -n 'def clear' pkg/core.py"):
         prompt="prompt",
         messages=[{"role": "user", "content": "task"}],
         turns=[],
+        shared_messages=1,
     ), f"THOUGHT: look\n```bash\n{command}\n```"
 
 

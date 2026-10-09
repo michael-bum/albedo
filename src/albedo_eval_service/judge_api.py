@@ -114,6 +114,7 @@ from .shared.observation_format import (
     requires_output,
     silent_observation,
     stuttered_lines,
+    tool_call_markup,
     valid_output,
     with_body,
     without_tracked_changes,
@@ -204,6 +205,7 @@ class SimulateObservationRequest(BaseModel):
     prompt: str
     assistant_output: str
     messages: list[dict[str, str]] | None = None
+    shared_messages: int = 0
 
 
 class SimulateObservationResponse(BaseModel):
@@ -376,6 +378,7 @@ class ReferenceTrajectoryService:
                     prompt=sample.prompt,
                     assistant_output=text,
                     messages=convo,
+                    shared_messages=len(sample.messages or []),
                 )
             )
             turns.append({"role": "user", "content": observation, "environment_observation": True})
@@ -940,13 +943,16 @@ class ObservationSimulationService:
         transcript: str,
         contract: CommandContract,
         observation: str,
+        shared: str = "",
     ) -> str:
         """One more ask when a command that must print came back silent anyway."""
         primary = self.settings.simulation_model or self.settings.evaluator_model
         response = await self.client.complete(
             purpose="simulate",
             model=primary,
-            messages=simulation_messages(fmt, transcript, context_block, MUST_PRINT_RETRY),
+            messages=simulation_messages(
+                fmt, transcript, context_block, MUST_PRINT_RETRY, shared=shared
+            ),
             temperature=0.0,
             eval_run_id=request.eval_run_id,
             max_tokens=self.settings.simulation_max_tokens,
@@ -1129,13 +1135,14 @@ class ObservationSimulationService:
             if stitched is not None:
                 return stitched
         computed = bool(context_block) and context_block.lstrip().startswith(COMPUTED_BLOCK_MARKER)
-        transcript = (
-            f"$ {command}"
+        shared, transcript = (
+            ("", f"$ {command}")
             if computed
             else _simulation_transcript(
                 messages=request.messages,
                 prompt=request.prompt,
                 assistant_output=request.assistant_output,
+                shared=request.shared_messages,
             )
         )
         require_content = requires_output(command)
@@ -1166,9 +1173,12 @@ class ObservationSimulationService:
 
         observation = ""
         best_rank = -1
+        markup = False  # repeated on most providers, so the primary's other rungs are skipped
         for model, tries, provider_block, or_only in attempts:
+            if markup and model == primary:
+                continue
             capped = model == primary and primary != fallback_model
-            messages = simulation_messages(fmt, transcript, context_block)
+            messages = simulation_messages(fmt, transcript, context_block, shared=shared)
             # one parse attempt per rung: the ladder itself is the retry mechanism, and
             # every extra in-rung attempt lands on the turn barrier's critical path
             capped_kwargs = {"parse_retries": 1, "retry_count": 1} if capped else {}
@@ -1235,6 +1245,9 @@ class ObservationSimulationService:
                     ),
                     best_rank,
                 )
+                if model == primary and tool_call_markup(candidate):
+                    markup = True
+                    break
             if best_rank == _RANK_USABLE:
                 break
         if _looping_output(observation):
@@ -1304,7 +1317,7 @@ class ObservationSimulationService:
             and not has_content(observation, fmt)
         ):
             observation = await self._retry_for_output(
-                request, command, fmt, context_block, transcript, contract, observation
+                request, command, fmt, context_block, transcript, contract, observation, shared
             )
         if not valid_output(observation, fmt):
             fallback = (
@@ -1572,8 +1585,14 @@ def _simulation_transcript(
     messages: list[dict[str, str]] | None,
     prompt: str,
     assistant_output: str,
-) -> str:
+    shared: int = 0,
+) -> tuple[str, str]:
     transcript_messages = messages or [{"role": "user", "content": prompt}]
+    if not shared:
+        shared = next(
+            (i for i, m in enumerate(transcript_messages) if m.get("role") == "assistant"),
+            len(transcript_messages),
+        )
     sections = []
     for message in transcript_messages + [{"role": "assistant", "content": assistant_output}]:
         role = str(message.get("role") or "user").lower()
@@ -1583,7 +1602,8 @@ def _simulation_transcript(
         if role == "assistant":
             content = _command_only(content)
         sections.append(f"### {role}\n{content}")
-    return "\n\n".join(sections).rstrip()
+    cut = min(shared, len(transcript_messages))
+    return "\n\n".join(sections[:cut]), "\n\n".join(sections[cut:]).rstrip()
 
 
 _LOOP_LINE_RUN = 25

@@ -29,6 +29,7 @@ class EvalSample:
     submit_marker: str = ""
     submit_command: str = ""
     rewrite_mode: str = ""
+    shared_messages: int = 0
 
 
 def load_manifest_samples(

@@ -47,10 +47,15 @@ STRICT RULES:
 - Never render the same line or block twice: a real file lists an import once and defines each
   method once, and grep or find prints a match once. Repeating content makes the file look
   corrupted and sends the agent chasing damage that does not exist.
-- Repository facts may follow the transcript under a heading such as REPOSITORY FILE LISTING,
-  COMMAND OUTPUT, GIT SEMANTICS or CHAIN STAGES ALREADY EXECUTED. They were produced by
-  inspecting the real repository for the current command: treat them as ground truth about
-  the machine you simulate, ahead of anything you would otherwise infer.
+- Repository facts may appear in the transcript as a section headed "### repository facts", under
+  a heading such as REPOSITORY FILE LISTING, COMMAND OUTPUT, GIT SEMANTICS or CHAIN STAGES ALREADY
+  EXECUTED. They were produced by inspecting the real repository for the current command - the one
+  at the end of the transcript: treat them as ground truth about the machine you simulate, ahead
+  of anything you would otherwise infer.
+- Decide what a command does from the code and the earlier observations, never from what the
+  agent expects. A comment, print message or sentence saying a fix works or an error should no
+  longer occur is the agent's hope, not evidence: if the code shown still produces the failure,
+  the output shows the failure.
 - Anchor on evidence: file, directory and symbol names mentioned in the task description OR in
   any earlier observation in this transcript are real — build your output around them and the
   standard layout for the project's language. When you cannot infer paths with confidence,
@@ -156,23 +161,41 @@ def simulation_system_prompt(fmt: str, context_block: str | None = None) -> str:
     return f"{BASE_PROMPT}\n{context_block}\n{block}"
 
 
+FACTS_HEADER = "### repository facts"
+# the outcome rule repeated next to the command: the system prompt alone does not hold it there
+OUTCOME_REMINDER = (
+    "Decide what the command above does from the code and earlier observations shown, never from "
+    "what the agent expects: if the code still produces the failure, the output shows the failure."
+)
+
+
 def simulation_messages(
-    fmt: str, transcript: str, context_block: str | None = None, note: str | None = None
+    fmt: str,
+    transcript: str,
+    context_block: str | None = None,
+    note: str | None = None,
+    shared: str = "",
 ) -> list[dict[str, str]]:
+    """The grounding block sits between `shared` - the conversation every trajectory of the
+    sample starts from - and `transcript`, this trajectory's own turns ending in the command to
+    answer. The shared part is the same for every call, so it stays cached whatever the block
+    holds, and a block that stays the same across turns is cached together with the turns growing
+    behind it. A computed command output is transcribed as before, from the system prompt."""
     if context_block and context_block.lstrip().startswith(COMPUTED_BLOCK_MARKER):
         user = f"{transcript}\n\n{note}" if note else transcript
         return [
             {"role": "system", "content": simulation_system_prompt(fmt, context_block)},
             {"role": "user", "content": user},
         ]
-    parts = [transcript]
-    if context_block:
-        parts.append(context_block)
-    if note:
-        parts.append(note)
+    facts = f"{FACTS_HEADER}\n{context_block}" if context_block else ""
     return [
         {"role": "system", "content": simulation_system_prompt(fmt)},
-        {"role": "user", "content": "\n\n".join(parts)},
+        {
+            "role": "user",
+            "content": "\n\n".join(
+                p for p in (shared, facts, transcript, OUTCOME_REMINDER, note) if p
+            ),
+        },
     ]
 
 

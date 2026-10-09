@@ -204,7 +204,7 @@ ALBEDO_EVAL_WORKER_ID=eval-dispatcher-1
 ALBEDO_EVAL_REMOTE_AUTH_TOKEN=shared-remote-token
 ALBEDO_EVAL_DATASET_MANIFEST_URI=s3://albedo/datasets/manifest.json
 # optional — this is the code default in shared/dataset_manifest.py; set it only to override
-ALBEDO_EVAL_DATASET_MANIFEST_HASH=e3cff61772b0096811d4c5d8bbc8dee8dacbd9a069bc4557608adf1c1c2ddf40
+ALBEDO_EVAL_DATASET_MANIFEST_HASH=2662d2be0d34b1f9aebd25632a7d006d4d7fc45acadee170542dbcf96fba0c31
 ALBEDO_EVAL_JUDGE_CONFIG_HASH=sha256:replace-with-real-hash
 # optional — code default is s3://albedo/albedo-eval-service, which prod uses as-is
 ALBEDO_EVAL_ARTIFACT_PREFIX=s3://albedo/albedo-eval-service
@@ -231,10 +231,10 @@ token on the box disables auth entirely.
 > `instance_id` across all of them and stratified by phase x bug family, so there is no fixed
 > per-source split any more; the
 > per-source `weight` in the manifest only shapes the pool. `dataset_version` is
-> `mini-coder+open-swe+smith-rs+hero-v1`. The combined `manifest.json` (160 MB) is published at
+> `mini-coder+open-swe-v1.0-v1.2+smith-rs+hero+affine-v2`. The combined `manifest.json` (356 MB) is published at
 > `https://albedo.tech/datasets/manifest.json` (R2 bucket `albedo`, built/uploaded by
 > `scripts/prepare_datasets.py --upload`) and its sha256 is
-> `e3cff61772b0096811d4c5d8bbc8dee8dacbd9a069bc4557608adf1c1c2ddf40` — which is also
+> `2662d2be0d34b1f9aebd25632a7d006d4d7fc45acadee170542dbcf96fba0c31` — which is also
 > `DEFAULT_DATASET_MANIFEST_HASH` in `shared/dataset_manifest.py`, so prod does **not** set the env
 > var at all. After rebuilding, update that constant (and repin any box that overrides it).
 > Note the older `https://s3.hippius.com/albedo/datasets/manifest.json` still serves a stale 1.3 GB

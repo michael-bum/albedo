@@ -241,23 +241,34 @@ def _upload_manifest(manifest_path: Path, key: str) -> str:
         )
 
     body = manifest_path.read_bytes()
+    r2 = "r2.cloudflarestorage.com" in (hv.S3_ENDPOINT or "")
     client = boto3.client(
         "s3",
         endpoint_url=hv.S3_ENDPOINT,
         aws_access_key_id=hv.S3_ACCESS_KEY,
         aws_secret_access_key=hv.S3_SECRET_KEY,
-        region_name="decentralized",
+        # R2 refuses the legacy Hippius region name
+        region_name="auto" if r2 else "decentralized",
         config=Config(
             connect_timeout=15, read_timeout=60, retries={"mode": "adaptive", "max_attempts": 3}
         ),
     )
-    client.put_object(
+    put_args = dict(
         Bucket=hv.S3_BUCKET,
         Key=key,
         Body=body,
         ContentType="application/json",
+        CacheControl="no-cache, must-revalidate",
         ACL="public-read",
     )
+    try:
+        client.put_object(**put_args)
+    except Exception as exc:
+        # a store without object ACLs (R2) refuses the grant; its bucket is public as a whole
+        if "AccessControlListNotSupported" not in str(exc) and "NotImplemented" not in str(exc):
+            raise
+        put_args.pop("ACL")
+        client.put_object(**put_args)
     log.info("uploaded %s (%s) sha256 %s", key, hv.S3_ENDPOINT, hashlib.sha256(body).hexdigest())
     return f"s3://{hv.S3_BUCKET}/{key}"
 

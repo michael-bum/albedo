@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_manifest_meta import write_meta
 from prepare_datasets import LEAKS, SOURCES
 
-DEFAULT_VERSION = "mini-coder+open-swe+smith-rs+hero-v1"
+DEFAULT_VERSION = "mini-coder+open-swe-v1.0-v1.2+smith-rs+hero+affine-v2"
 
 
 def _parse_sources(raw: str) -> list[str]:
@@ -183,8 +183,7 @@ def print_manifest_summary(out_path: Path, manifest: dict, digest: str) -> None:
     print(f"  ALBEDO_EVAL_DATASET_MANIFEST_HASH={digest}")
     print(f"  SANITY_DISPATCH_DATASET_MANIFEST_HASH={digest}")
     print(f"  ALBEDO_EVAL_SAMPLING_ALGO={SAMPLING_ALGO}")
-    print("  src/albedo_eval_service/config.py  -> dataset_manifest_hash default")
-    print("  src/sanity_service/settings.py     -> dataset_manifest_hash default")
+    print("  src/albedo_eval_service/shared/dataset_manifest.py -> DEFAULT_DATASET_MANIFEST_HASH")
 
 
 def main() -> None:

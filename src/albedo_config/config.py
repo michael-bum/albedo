@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8080
 
-    dataset_version: str = "mini-coder+open-swe+smith-rs+hero-v1"
+    dataset_version: str = "mini-coder+open-swe-v1.0-v1.2+smith-rs+hero+affine-v2"
     dataset_manifest_uri: str
     dataset_manifest_hash: str = DEFAULT_DATASET_MANIFEST_HASH
     dataset_manifest_path: str | None = None

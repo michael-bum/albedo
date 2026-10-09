@@ -93,6 +93,7 @@ def test_simulate_observation_payload_carries_messages():
         "prompt": "formatted prompt",
         "messages": [{"role": "user", "content": "Fix it"}],
         "assistant_output": "THOUGHT...\n```bash\nls\n```",
+        "shared_messages": 0,
     }
 
 

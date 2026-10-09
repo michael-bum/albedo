@@ -134,6 +134,7 @@ class _TrajectoryState:
     prompt: str
     messages: list[dict[str, str]]
     turns: list[dict[str, Any]]
+    shared_messages: int = 0
     stopped: bool = False
     error: str = ""
     heuristic_reason: str = ""
@@ -740,6 +741,7 @@ def _trajectory_states(request: SanityRunRequest) -> list[_TrajectoryState]:
                     {"role": message["role"], "content": message["content"]}
                     for message in rewritten
                 ],
+                shared_messages=len(rewritten),
                 submit_clause=command,
                 submit_marker=marker,
                 rewrite_mode=rewrite_mode,
@@ -974,7 +976,7 @@ async def _confirm_silence(
     settings: JudgeSettings, state: _TrajectoryState, assistant_output: str
 ) -> str:
     fmt = detect_format(state.sample_id, state.messages)
-    transcript = _simulation_transcript(
+    _, transcript = _simulation_transcript(
         messages=state.messages, prompt=state.prompt, assistant_output=assistant_output
     )
     client = make_client(settings)
@@ -1376,11 +1378,14 @@ async def _simulate_observation_uncached(
     # to transcribe it against the bare command rather than improvise from the transcript
     context_block = resolved.context
     computed = bool(context_block) and context_block.lstrip().startswith(COMPUTED_BLOCK_MARKER)
-    transcript = (
-        f"$ {command}"
+    shared, transcript = (
+        ("", f"$ {command}")
         if computed
         else _simulation_transcript(
-            messages=messages, prompt=prompt, assistant_output=assistant_output
+            messages=messages,
+            prompt=prompt,
+            assistant_output=assistant_output,
+            shared=state.shared_messages,
         )
     )
     observation = ""
@@ -1391,7 +1396,11 @@ async def _simulate_observation_uncached(
             if rescue
             else (settings.simulation_model or settings.evaluator_model),
             messages=simulation_messages(
-                fmt, transcript, context_block, None if attempt == 0 else DEGENERATE_RETRY
+                fmt,
+                transcript,
+                context_block,
+                None if attempt == 0 else DEGENERATE_RETRY,
+                shared=shared,
             ),
             temperature=0.0 if attempt == 0 else _DEGENERATE_RETRY_TEMPERATURE,
             max_tokens=settings.simulation_max_tokens,
@@ -1511,6 +1520,7 @@ async def _simulate_observation_uncached(
             transcript=transcript,
             command=command,
             observation=observation,
+            shared=shared,
         )
     return observation
 
@@ -1574,6 +1584,7 @@ async def _retry_for_output(
     transcript: str,
     command: str,
     observation: str,
+    shared: str,
 ) -> str:
     def usable(raw: str) -> bool:
         text = repair_output(raw, fmt)
@@ -1594,7 +1605,7 @@ async def _retry_for_output(
     ):
         response = await client.complete(
             model=model,
-            messages=simulation_messages(fmt, transcript, None, MUST_PRINT_RETRY),
+            messages=simulation_messages(fmt, transcript, None, MUST_PRINT_RETRY, shared=shared),
             temperature=0.0,
             max_tokens=settings.simulation_max_tokens,
             provider=provider,
@@ -1675,7 +1686,8 @@ def _simulation_transcript(
     messages: list[dict[str, str]] | None,
     prompt: str,
     assistant_output: str,
-) -> str:
+    shared: int = 0,
+) -> tuple[str, str]:
     transcript_messages = messages or [{"role": "user", "content": prompt}]
     sections = []
     for message in transcript_messages + [{"role": "assistant", "content": assistant_output}]:
@@ -1686,7 +1698,8 @@ def _simulation_transcript(
         if role == "assistant":
             content = _command_only(content)
         sections.append(f"### {role}\n{content}")
-    return "\n\n".join(sections).rstrip()
+    cut = min(shared, len(transcript_messages))
+    return "\n\n".join(sections[:cut]), "\n\n".join(sections[cut:]).rstrip()
 
 
 def _command_only(text: str) -> str:

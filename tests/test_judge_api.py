@@ -47,6 +47,7 @@ from albedo_eval_service.simulator.prompt_simulator import (
     FORMAT_OPENHANDS,
     FORMAT_SWE_AGENT,
     MUST_PRINT_RETRY,
+    OUTCOME_REMINDER,
     simulation_messages,
     simulation_system_prompt,
 )
@@ -191,7 +192,7 @@ def test_evaluator_provider_pins_the_roster():
 
 
 def test_simulation_transcript_uses_section_markers():
-    transcript = _simulation_transcript(
+    shared, own = _simulation_transcript(
         messages=[
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "task"},
@@ -200,7 +201,21 @@ def test_simulation_transcript_uses_section_markers():
         assistant_output="```bash\nls\n```",
     )
 
-    assert transcript == "### system\nsys\n\n### user\ntask\n\n### assistant\n```bash\nls\n```"
+    assert shared == "### system\nsys\n\n### user\ntask"
+    assert own == "### assistant\n```bash\nls\n```"
+
+    # an eval sample starts mid-trajectory: its whole history is shared, not just the task
+    history = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "```bash\nls\n```"},
+        {"role": "user", "content": "a.py"},
+    ]
+    assert _simulation_transcript(
+        messages=history, prompt="unused", assistant_output="```bash\ncat a.py\n```", shared=3
+    ) == (
+        "### user\ntask\n\n### assistant\n```bash\nls\n```\n\n### user\na.py",
+        "### assistant\n```bash\ncat a.py\n```",
+    )
 
 
 def test_simulation_system_prompt_carries_the_formats_block():
@@ -1179,17 +1194,19 @@ def test_prepare_raises_when_sample_has_no_messages():
 def test_simulation_transcript_strips_thought_from_assistant_turns():
     from albedo_eval_service.judge_api import _simulation_transcript
 
-    transcript = _simulation_transcript(
-        messages=[
-            {"role": "user", "content": "fix the bug"},
-            {
-                "role": "assistant",
-                "content": "THOUGHT: files X and Y were already shown\n\n```bash\ncat a.py\n```",
-            },
-            {"role": "user", "content": "Observation: ..."},
-        ],
-        prompt="fix the bug",
-        assistant_output="THOUGHT: the fix is verified and tests pass\n\n```bash\nsed -n '1,5p' a.py\n```",  # noqa: E501
+    transcript = "\n\n".join(
+        _simulation_transcript(
+            messages=[
+                {"role": "user", "content": "fix the bug"},
+                {
+                    "role": "assistant",
+                    "content": "THOUGHT: files X and Y were already shown\n\n```bash\ncat a.py\n```",  # noqa: E501
+                },
+                {"role": "user", "content": "Observation: ..."},
+            ],
+            prompt="fix the bug",
+            assistant_output="THOUGHT: the fix is verified and tests pass\n\n```bash\nsed -n '1,5p' a.py\n```",  # noqa: E501
+        )
     )
     assert "already shown" not in transcript
     assert "tests pass" not in transcript
@@ -1205,10 +1222,12 @@ def test_simulation_transcript_shows_the_command_not_prose_after_a_non_bash_snip
         "So the test file does not match. Let me run the tests.</think>```bash\n"
         "cd /workspace/fulcio && go test ./pkg/certmaker/... 2>&1 | head -50\n```"
     )
-    transcript = _simulation_transcript(
-        messages=[{"role": "user", "content": "task"}, {"role": "assistant", "content": turn}],
-        prompt="task",
-        assistant_output=turn,
+    transcript = "\n\n".join(
+        _simulation_transcript(
+            messages=[{"role": "user", "content": "task"}, {"role": "assistant", "content": turn}],
+            prompt="task",
+            assistant_output=turn,
+        )
     )
 
     command = "```bash\ncd /workspace/fulcio && go test ./pkg/certmaker/... 2>&1 | head -50\n```"
@@ -1219,10 +1238,12 @@ def test_simulation_transcript_shows_the_command_not_prose_after_a_non_bash_snip
 def test_simulation_transcript_keeps_text_without_command_block():
     from albedo_eval_service.judge_api import _simulation_transcript
 
-    transcript = _simulation_transcript(
-        messages=None,
-        prompt="task",
-        assistant_output="no fenced block here",
+    transcript = "\n\n".join(
+        _simulation_transcript(
+            messages=None,
+            prompt="task",
+            assistant_output="no fenced block here",
+        )
     )
     assert "no fenced block here" in transcript
 
@@ -1270,9 +1291,12 @@ def test_observation_simulation_uses_repo_context_when_available():
 
     ctx = FakeRepoContext("REAL LISTING")
     system_prompt, user = (m["content"] for m in asyncio.run(run(ctx)))
-    assert "REAL LISTING" in user and user.endswith("\n\nREAL LISTING")
-    assert "REAL LISTING" not in system_prompt
     assert system_prompt == f"{BASE_PROMPT}\n{FORMAT_OPENHANDS}"
+    assert (
+        user
+        == "### user\ntask\n\n### repository facts\nREAL LISTING\n\n### assistant\n```bash\nls\n```"
+        f"\n\n{OUTCOME_REMINDER}"
+    )
     assert ctx.calls == [("swe-zero/x:0:0", "```bash\nls\n```")]
 
     ungrounded, _ = (m["content"] for m in asyncio.run(run(FakeRepoContext(None))))
@@ -1429,6 +1453,59 @@ def test_simulation_primary_model_falls_back_to_evaluator():
         )
     )
     assert solo.calls == ["z-ai/glm-5.2"]
+
+
+def test_tool_call_markup_goes_straight_to_the_fallback_and_is_never_served():
+    markup = (
+        '<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name="bash">\n'
+        '<｜｜DSML｜｜ parameter name="command" string="true">cargo test 2>&1'
+        "</｜｜DSML｜｜ parameter>\n"
+        "</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>"
+    )
+    fragment = "src/lib.rs:12: fn parse()\nmon｜｜DSML｜｜: No such file or directory"
+
+    class Scripted:
+        def __init__(self, by_model):
+            self.by_model = by_model
+            self.calls = []
+
+        async def complete(self, **kw):
+            self.calls.append(kw["model"])
+            raw = self.by_model[kw["model"]]
+            return JudgeRawResponse(model=kw["model"], provider="fake", raw=raw)
+
+    settings = JudgeSettings(
+        evaluator_model="z-ai/glm-5.2",
+        simulation_model="deepseek/deepseek-v4.1-flash",
+        simulation_loop_reruns=1,
+        simulation_providers="streamlake,atlas-cloud,deepinfra,deepseek",
+    )
+
+    def run(client):
+        return asyncio.run(
+            ObservationSimulationService(settings, client).simulate(
+                SimulateObservationRequest(
+                    eval_run_id="run",
+                    sample_id="swe-zero/x:0:0",
+                    prompt="task",
+                    messages=[{"role": "user", "content": "task"}],
+                    assistant_output="```bash\ncargo test 2>&1\n```",
+                )
+            )
+        )
+
+    # four providers with two tries each would be eight primary calls; markup skips all but one
+    primary, fallback = "deepseek/deepseek-v4.1-flash", "z-ai/glm-5.2"
+    rescued = Scripted({primary: markup, fallback: "test result: ok"})
+    assert run(rescued) == "test result: ok"
+    assert rescued.calls == [primary, fallback]
+
+    corrupted = Scripted({primary: fragment, fallback: "test result: ok"})
+    assert run(corrupted) == "test result: ok"
+    assert corrupted.calls == [primary, fallback]
+
+    unanimous = Scripted({primary: markup, fallback: markup})
+    assert "DSML" not in run(unanimous)
 
 
 def test_role_violation_detection():
@@ -1778,26 +1855,33 @@ def test_a_leaked_turn_is_not_memoised_on_the_eval_side():
     assert client.calls > calls_after_first, "the identical read was asked again, not replayed"
 
 
-def test_simulation_messages_keep_the_system_prompt_stable_across_turns():
-    """The grounding block changes every turn; it must not sit in the cached prefix."""
-    turn_one = simulation_messages(OPENHANDS, "### user\ntask\n\n### assistant\nls", "LISTING A")
-    longer = "### user\ntask\n\n### assistant\nls\n\n### user\nout\n\n### assistant\ncat x"
-    turn_two = simulation_messages(OPENHANDS, longer, "LISTING B")
+def test_simulation_messages_keep_the_shared_conversation_cached_whatever_the_block():
+    """The shared conversation must lead every prompt, and an unchanged block must keep the
+    previous turn's whole prompt as a prefix of the next."""
+    shared = "### system\nsys\n\n### user\ntask"
+    turn_one = simulation_messages(OPENHANDS, "### assistant\nls", "LISTING", shared=shared)
+    longer = "### assistant\nls\n\n### user\nout\n\n### assistant\ncat x"
+    turn_two = simulation_messages(OPENHANDS, longer, "LISTING", shared=shared)
+    changed = simulation_messages(OPENHANDS, longer, "OTHER LISTING", shared=shared)
     system = {"role": "system", "content": simulation_system_prompt(OPENHANDS)}
-    assert turn_one[0] == turn_two[0] == system
-    assert [m["role"] for m in turn_two] == ["system", "user"]
-    assert turn_two[1]["content"].startswith("### user\ntask")
-    assert turn_two[1]["content"].endswith("\n\nLISTING B")
-    assert turn_two[1]["content"].startswith(turn_one[1]["content"].split("\n\nLISTING A")[0])
+    assert turn_one[0] == turn_two[0] == changed[0] == system
+    assert turn_two[1]["content"].startswith(turn_one[1]["content"].removesuffix(OUTCOME_REMINDER))
+    assert changed[1]["content"].startswith(shared + "\n\n### repository facts\n")
+    assert turn_two[1]["content"] == (
+        f"{shared}\n\n### repository facts\nLISTING\n\n{longer}\n\n{OUTCOME_REMINDER}"
+    )
 
 
-def test_simulation_messages_put_the_retry_note_after_the_block():
+def test_simulation_messages_put_the_retry_note_after_the_transcript():
     messages = simulation_messages(RETURNCODE, "### assistant\ncat x", "LISTING", "RETRY NOTE")
-    assert messages[1]["content"] == "### assistant\ncat x\n\nLISTING\n\nRETRY NOTE"
+    assert messages[0]["content"] == simulation_system_prompt(RETURNCODE)
+    assert (
+        messages[1]["content"] == "### repository facts\nLISTING\n\n### assistant\ncat x\n\n"
+        f"{OUTCOME_REMINDER}\n\nRETRY NOTE"
+    )
     plain = simulation_messages(RETURNCODE, "### assistant\ncat x")
-    assert plain[1]["content"] == "### assistant\ncat x"
-    noted = simulation_messages(RETURNCODE, "### assistant\ncat x", None, "NOTE")
-    assert noted[1]["content"] == "### assistant\ncat x\n\nNOTE"
+    assert plain[0]["content"] == simulation_system_prompt(RETURNCODE)
+    assert plain[1]["content"] == f"### assistant\ncat x\n\n{OUTCOME_REMINDER}"
 
 
 def test_simulation_messages_transcribe_a_computed_output_the_old_way():

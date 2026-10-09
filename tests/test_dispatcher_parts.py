@@ -46,6 +46,7 @@ def _simulate(command: str, client, repo: Repo, monkeypatch) -> str:
         prompt="fix the bug",
         messages=[{"role": "user", "content": "fix the bug"}],
         turns=[],
+        shared_messages=1,
     )
     return asyncio.run(
         D._simulate_observation_uncached(
@@ -69,6 +70,10 @@ def test_a_gap_is_simulated_alone_and_the_exact_parts_are_set_around_it(monkeypa
     assert len(client.calls) == 1
     asked = "\n".join(m["content"] for m in client.calls[0]["messages"])
     assert "GAP CONTEXT" in asked and "WHOLE COMMAND CONTEXT" not in asked
+    # the eval's layout: the sample's messages, then the facts, then the trajectory's own turns
+    assert client.calls[0]["messages"][1]["content"].startswith(
+        "### user\nfix the bug\n\n### repository facts\nGAP CONTEXT\n\n### assistant\n"
+    )
 
 
 def test_a_failing_gap_skips_its_and_branch_and_runs_its_or_branch(monkeypatch):

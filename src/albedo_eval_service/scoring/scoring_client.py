@@ -324,6 +324,7 @@ def _simulate_observation_payload(
         "prompt": sample.prompt,
         "messages": sample.messages,
         "assistant_output": assistant_output,
+        "shared_messages": sample.shared_messages,
     }
 
 

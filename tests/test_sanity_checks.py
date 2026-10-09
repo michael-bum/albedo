@@ -428,7 +428,7 @@ def test_run_prompts_keeps_the_reasoning_the_way_eval_stores_it(monkeypatch):
 
 
 def test_simulator_transcript_shows_assistant_turns_as_their_command_like_eval():
-    transcript = sanity_dispatcher._simulation_transcript(
+    shared, transcript = sanity_dispatcher._simulation_transcript(
         messages=[
             {"role": "user", "content": "task"},
             {
@@ -439,7 +439,9 @@ def test_simulator_transcript_shows_assistant_turns_as_their_command_like_eval()
         ],
         prompt="task",
         assistant_output="more weighing\n</think>\n\nTHOUGHT: b\n```bash\ncat a.py\n```",
+        shared=1,
     )
+    assert shared == "### user\ntask"
     assert "weighing" not in transcript and "THOUGHT" not in transcript
     assert "### assistant\n```bash\nls\n```" in transcript
     assert transcript.endswith("### assistant\n```bash\ncat a.py\n```")

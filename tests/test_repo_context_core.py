@@ -1536,6 +1536,23 @@ def test_a_gap_is_simulated_with_the_modules_its_program_imports(tmp_path, monke
     assert "--- ./pkg/app.py ---\nSIZE = 1" not in gap["context"]
 
 
+def test_a_gap_after_a_heredoc_edit_is_told_the_file_changed(tmp_path, monkeypatch):
+    """A heredoc script edits the file in a way this cannot replay: the read after it is not shown
+    the old text as the file's current content, and a gap after an answered stage is told which
+    unanswered stages ran before it, not left to reprint what an earlier turn showed."""
+    service = make_service(tmp_path)
+    make_snapshot(service, {"pkg/app.py": "SIZE = 1\n"})
+    monkeypatch.setattr(service, "_resolve_sha", lambda ref: ("o", "r", FULL_SHA))
+    edit = "python3 - <<'EOF'\np = 'pkg/app.py'\nopen(p, 'w').write('SIZE = 5\\n')\nEOF"
+
+    result = _chain_result(service, f"{edit}\nsed -n 1p pkg/app.py && echo M && cat pkg/app.py")
+    first, last = [part for part in result.parts if part["kind"] == "gap"]
+    assert first["command"] == f"{edit}\nsed -n 1p pkg/app.py"
+    assert "--- ./pkg/app.py ---\nSIZE = 1" not in first["context"]
+    assert f"$ {edit}\n{core.PRIOR_GAP_STAGE}" in last["context"]
+    assert f"$ sed -n 1p pkg/app.py\n{core.PRIOR_GAP_STAGE}" in last["context"]
+
+
 MB_FILE = ("x" * 99 + "\n") * 10486  # just over 1 MB
 
 

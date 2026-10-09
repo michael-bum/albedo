@@ -28,6 +28,13 @@ def test_git_diff_redirect_and_tee_are_fine():
     assert final_submit_issue([f"git diff -- a.py > patch.txt && {SUBMIT}"], M) == ""
 
 
+def test_git_c_diff_after_a_heredoc_edit_is_not_a_hand_written_patch():
+    # uid 153 / uid 60: the python heredoc made the command read as a hand-written patch
+    edit = "python3 - <<'EOF'\nopen('a.py', 'w').write('a = 2\\n')\nEOF"
+    cmds = [f"{edit}\ngit -C /workspace/repo diff -- a.py > /workspace/repo/patch.txt", SUBMIT]
+    assert final_submit_issue(cmds, M) == ""
+
+
 def test_submitting_a_patch_that_was_never_written_is_flagged():
     cmds = ["sed -i 's/a/b/' src/foo.py", "cat -n src/foo.py", SUBMIT]
     assert final_submit_issue(cmds, M) == "submits a patch file it never created"

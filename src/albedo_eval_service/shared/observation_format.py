@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ast
 import re
+import shlex
+import warnings
 from collections import Counter
 from dataclasses import dataclass
 
@@ -851,6 +854,83 @@ def impossible_success(raw: str, fmt: str, command: str) -> bool:
         return False
     first = next((line for line in observation_body(raw, fmt).splitlines() if line.strip()), "")
     return bool(_SHELL_DIAGNOSTIC_RE.match(first.strip()))
+
+
+def _printed_literals(code: str) -> list[str]:
+    """The string literals a python script's top-level `print` calls write, up to the first
+    statement that may end the script early."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            tree = ast.parse(code)
+        except (SyntaxError, ValueError):
+            return []
+    literals: list[str] = []
+    for node in tree.body:
+        calls = [n.func for n in ast.walk(node) if isinstance(n, ast.Call)]
+        if isinstance(node, ast.Raise) or any(
+            getattr(f, "id", getattr(f, "attr", "")) in ("exit", "quit", "_exit") for f in calls
+        ):
+            break
+        call = node.value if isinstance(node, ast.Expr) else None
+        if not (isinstance(call, ast.Call) and getattr(call.func, "id", "") == "print"):
+            continue
+        if not call.args or any(keyword.arg == "file" for keyword in call.keywords):
+            continue
+        first = call.args[0]
+        parts = first.values if isinstance(first, ast.JoinedStr) else [first]
+        literals += [p.value for p in parts if isinstance(getattr(p, "value", None), str)]
+    return literals
+
+
+def _stage_literals(stage: str) -> list[str]:
+    """The literal text an `echo` or `python -c` stage writes, as far as it can be read off."""
+    try:
+        words = shlex.split(stage, comments=True)
+    except ValueError:
+        return []
+    while words and re.match(r"\w+=", words[0]):
+        words = words[1:]
+    if words[:1] == ["echo"]:
+        args = [w for w in words[1:] if not re.fullmatch(r"-[neE]+", w)]
+        return [w for w in args if not re.search(r"[$`\\*?\[~]", w)]
+    if words and re.fullmatch(r"(?:\S*/)?python[\d.]*", words[0]) and "-c" in words[1:-1]:
+        flag = words.index("-c")
+        if all(w.startswith("-") for w in words[1:flag]):
+            return _printed_literals(words[flag + 1])
+    return []
+
+
+def missing_printed_text(command: str, raw: str, fmt: str) -> str:
+    """Text the command certainly printed that a successful observation leaves out, or "".
+
+    An `echo LABEL` or a top-level `print('LABEL', ...)` in `python -c` writes its literal
+    whatever else happens, so an answer with returncode 0 that lacks it was not produced by this
+    command: the simulator served an earlier answer again or dropped stages. Only stages certain
+    to have run count - each stage of the last `&&` run, and an echo opening a `;` run - and only
+    when nothing between them and the terminal can swallow the text (a pipe, a redirect, `||`,
+    `exit`, a compound command). Pre-eval hands its gate the command with line breaks collapsed,
+    so it is read that way on both sides, and a heredoc, unreadable once collapsed, is skipped.
+    """
+    command = " ".join((command or "").split())
+    if "<<" in command or observed_returncode(raw) != 0 or is_scaffold_truncated(raw):
+        return ""
+    chain = flat_chain(command)
+    if not chain or any(glue == "||" or stage.split()[0] == "exit" for glue, stage in chain):
+        return ""
+    last = max((i for i, (glue, _) in enumerate(chain) if glue != "&&"), default=0)
+    body = " ".join(observation_body(raw, fmt).split())
+    for index, (glue, stage) in enumerate(chain):
+        bare = _unquoted(stage)
+        if index < last and (glue == "&&" or not stage.startswith("echo")):
+            continue
+        if "|" in bare or _REDIRECTS_TO_FILE.search(bare):
+            continue
+        for literal in _stage_literals(stage):
+            text = " ".join(literal.split())
+            if len(text) >= 3 and text not in body:
+                return text
+    return ""
 
 
 def absent_tool_output(command: str) -> tuple[str, int] | None:

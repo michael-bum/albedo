@@ -38,6 +38,7 @@ from albedo_eval_service.shared.observation_format import (
     has_content,
     impossible_success,
     leaked_turn,
+    missing_printed_text,
     narrated_observation,
     observation_body,
     observed_returncode,
@@ -1298,6 +1299,8 @@ def _unusable_observation_reason(raw: str, fmt: str, command: str) -> str:
         return "fabricated_sed_error"
     if fabricated_pip_error(command, raw):
         return "fabricated_pip_error"
+    if missing := missing_printed_text(command, raw, fmt):
+        return f"missing_printed_text: {missing[:40]}"
     return "ok"
 
 

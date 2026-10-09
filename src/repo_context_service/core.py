@@ -452,6 +452,10 @@ PRIOR_STAGES_HEADER = """EARLIER STAGES OF THIS COMMAND — the command you are 
 These stages ran before it, in this order, with this output; the repository below is as they left
 it. Do not repeat their output: answer only the command shown to you:
 """
+PRIOR_GAP_STAGE = (
+    "(its output was simulated apart and is not shown here — derive from the command itself what"
+    " it changed in the repository)"
+)
 CHAIN_MAYBE_RUN = (
     "(this is what it prints if it runs; it runs only if the stage before it ended the way its"
     " `&&` or `||` requires)"
@@ -633,13 +637,17 @@ def _gap_groups(executed: list[_Ran]) -> list[list[_Ran]]:
 
 
 def _joined_text(stages: list[Stage]) -> str:
-    """Stages as one command, each joined to the one before by its own `&&`, `||` or `;`. A stage
-    spanning several lines (a heredoc) is grouped in braces, so what follows can join it."""
+    """Stages as one command, each joined to the one before by its own `&&`, `||` or `;`. A `;`
+    after a stage spanning several lines (a heredoc) is a line break, as a script writes it, so the
+    text still parses; only a stage an `&&` or `||` joins to is grouped in braces."""
     text = ""
     for position, stage in enumerate(stages):
         if position:
-            text += f" {stage.separator} " if stage.separator in (AND, OR) else "; "
-        text += f"{{ {stage.text}\n}}" if "\n" in stage.text else stage.text
+            gated = stage.separator in (AND, OR)
+            text += f" {stage.separator} " if gated else "\n" if "\n" in text else "; "
+        following = stages[position + 1].separator if position + 1 < len(stages) else ""
+        braced = "\n" in stage.text and following in (AND, OR)
+        text += f"{{ {stage.text}\n}}" if braced else stage.text
     return text
 
 
@@ -1703,9 +1711,9 @@ class RepoContextService:
                 snapshot_dir, ran.before.listing(), text, ran.before, fmt, meta, root, attested
             )[0]
             earlier = [
-                f"$ {p.stage.text}\n" + p.answer[0].removesuffix("\n")
+                f"$ {p.stage.text}\n"
+                + (p.answer[0].removesuffix("\n") if p.answer else PRIOR_GAP_STAGE)
                 for p in executed[:position]
-                if p.answer
             ]
             if earlier:
                 context = PRIOR_STAGES_HEADER + "\n" + "\n\n".join(earlier) + "\n\n" + context

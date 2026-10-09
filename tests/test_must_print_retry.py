@@ -899,3 +899,13 @@ def test_a_leaked_turn_is_never_memoised():
     first = run("cat -n a.yml")
     assert first == empty_output("returncode") or "```" not in first
     assert run("cat -n a.yml") == real, "the second identical read was asked again, not replayed"
+
+
+def test_an_answer_missing_what_the_command_printed_is_re_asked():
+    # pre-eval 76a74a14 (uid 84): checks printing 'tags:' kept getting an earlier turn's `[1, 2]`
+    copied = "<returncode>0</returncode>\n<output>\n[1, 2]\n</output>"
+    real = "<returncode>0</returncode>\n<output>\ntags: ['bar', 'foo']\ncompare: True\n</output>"
+    client = _Client(copied, real)
+    command = "python -c \"t=load(); print('tags:', t.tags); print('compare:', t.same())\""
+    assert _simulate(client, command) == real
+    assert len(client.calls) == 2

@@ -101,6 +101,7 @@ from .shared.observation_format import (
     is_file_read,
     is_truncated,
     leaked_turn,
+    missing_printed_text,
     narrated_observation,
     no_output_notice,
     observation_body,
@@ -1212,7 +1213,11 @@ class ObservationSimulationService:
                     command,
                 )
                 rank = _candidate_rank(
-                    candidate, fmt, require_content=require_content, contract=contract
+                    candidate,
+                    fmt,
+                    require_content=require_content,
+                    contract=contract,
+                    command=command,
                 )
                 if rank > best_rank:
                     best_rank, observation = rank, candidate
@@ -1690,6 +1695,7 @@ def _candidate_rank(
     *,
     require_content: bool = False,
     contract: CommandContract | None = None,
+    command: str = "",
 ) -> int:
     """How good an attempt is, so escalation keeps the best one rather than the last.
 
@@ -1699,7 +1705,9 @@ def _candidate_rank(
     """
     if not valid_output(raw, fmt):
         return _RANK_INVALID
-    if _usable_simulation_output(raw, fmt, require_content=require_content, contract=contract):
+    if _usable_simulation_output(
+        raw, fmt, require_content=require_content, contract=contract, command=command
+    ):
         return _RANK_USABLE
     if has_content(raw, fmt):
         return _RANK_HAS_CONTENT
@@ -1725,6 +1733,7 @@ def _usable_simulation_output(
         and not stuttered_lines(raw)
         and not (command and fabricated_sed_error(command, raw))
         and not (command and fabricated_pip_error(command, raw))
+        and not (command and missing_printed_text(command, raw, fmt))
         and (not require_content or has_content(raw, fmt))
         and (contract is None or contract_violation(raw, fmt, contract) is None)
     )
@@ -1758,6 +1767,8 @@ def _unusable_reason(
         return "fabricated_sed_error"
     if command and fabricated_pip_error(command, raw):
         return "fabricated_pip_error"
+    if command and (missing := missing_printed_text(command, raw, fmt)):
+        return f"missing_printed_text: {missing[:40]}"
     if require_content and not has_content(raw, fmt):
         return "no_content_for_read"
     if contract is not None and (breach := contract_violation(raw, fmt, contract)):

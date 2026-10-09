@@ -227,12 +227,13 @@ def _is_patchlike(path: str) -> bool:
 
 def _creations(commands: list[str], path: str) -> list[tuple[str, str]]:
     base = re.escape(path.rsplit("/", 1)[-1])
+    git_diff = r"git\s+(?:(?:-C|-c)\s+\S+\s+|--no-pager\s+)*diff"
     found = []
     for c in commands:
         if not re.search(rf"(^|/|\s){base}(\s|$|['\"])", c):
             continue
-        if re.search(rf"git\s+diff[^|;]*>>?\s*\S*{base}", c) or re.search(
-            rf"git\s+diff[^|;]*\|\s*tee\s+(-a\s+)?\S*{base}", c
+        if re.search(rf"{git_diff}[^|;]*>>?\s*\S*{base}", c) or re.search(
+            rf"{git_diff}[^|;]*\|\s*tee\s+(-a\s+)?\S*{base}", c
         ):
             found.append(("git-diff", c))
         elif "<<" in c and re.search(rf"(>|tee\s+(-a\s+)?)\s*\S*{base}", c):

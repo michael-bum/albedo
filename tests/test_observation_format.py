@@ -588,3 +588,33 @@ def test_a_reply_with_more_than_one_command_is_unusable_like_the_bench():
     assert "found 2 bash commands" in unusable_turn(drafted)
     tagged = one + "\n<mswea_bash_command>pwd</mswea_bash_command>"
     assert "found 2 bash commands" in unusable_turn(tagged)
+
+
+def test_an_answer_missing_text_the_command_printed_is_unusable():
+    """Pre-eval 76a74a14 (uid 84): fourteen different `python -c` checks, each printing its own
+    labels, were all answered with an earlier turn's `[1, 2]`; the eval ladder must re-ask too."""
+    from albedo_eval_service.judge_api import _candidate_rank, _usable_simulation_output
+    from albedo_eval_service.shared.observation_format import missing_printed_text
+
+    command = "cd /r && python -c \"t=load(); print('tags:', t.tags)\" && echo ---DONE---"
+    copied = wrap("[1, 2]", RETURNCODE)
+    real = wrap("tags: ['bar', 'foo']\n---DONE---", RETURNCODE)
+    assert missing_printed_text(command, copied, RETURNCODE) == "tags:"
+    assert missing_printed_text(" ".join(command.split()), real, RETURNCODE) == ""
+    assert not _usable_simulation_output(copied, RETURNCODE, command=command)
+    assert _candidate_rank(copied, RETURNCODE, command=command) < _candidate_rank(
+        real, RETURNCODE, command=command
+    )
+    # nothing guarantees the text reached the terminal: left alone
+    for undecided, body, returncode in (
+        ("python -c \"print('tags:', 1)\" | tail -1", "1", 0),
+        ("echo DONE > log.txt", "", 0),
+        ("make || echo FAILED", "ok", 0),
+        ("false && echo SKIPPED; echo RAN", "RAN", 0),
+        ("python -c \"print('ok')\"", "Traceback (most recent call last):", 1),
+        ("python -c \"print('PASS' if ok else 'FAIL')\"", "FAIL", 0),
+        ("python3 - <<'EOF'\nprint('done')\nEOF", "", 0),
+        ("git diff > patch.txt && cat patch.txt", "diff --git a/x b/x", 0),
+    ):
+        observation = wrap(body, RETURNCODE, returncode=returncode)
+        assert missing_printed_text(undecided, observation, RETURNCODE) == "", undecided
